@@ -31,13 +31,14 @@ WORKDIR /app/vggt-space
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir -r requirements_demo.txt && \
-    pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles boto3 open3d gdown
+    pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles boto3 open3d gdown runpod
 
 # 5. Tải trước trọng số model VGGT-1B từ Hugging Face và lưu vào cache (không load vào RAM để tránh OOM)
 RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/VGGT-1B')"
 
-# 6. Copy file API Server chính vào thư mục space
+# 6. Copy file API Server chính và handler vào thư mục space
 COPY backend_api_extended_manhattan.py /app/vggt-space/backend_api_extended_manhattan.py
+COPY handler.py /app/vggt-space/handler.py
 
 # 7. Tạo thư mục để lưu các jobs tạm thời
 RUN mkdir -p /app/vggt_room3d_jobs && chmod -R 777 /app/vggt_room3d_jobs
@@ -45,5 +46,5 @@ RUN mkdir -p /app/vggt_room3d_jobs && chmod -R 777 /app/vggt_room3d_jobs
 # Mở port 8000 của API
 EXPOSE 8000
 
-# 8. Khởi chạy uvicorn server
-CMD ["uvicorn", "backend_api_extended_manhattan:app", "--host", "0.0.0.0", "--port", "8000"]
+# 8. Khởi chạy RunPod handler
+CMD ["python", "-u", "handler.py"]
