@@ -31,7 +31,7 @@ WORKDIR /app/vggt-space
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir -r requirements_demo.txt && \
-    pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles boto3 open3d
+    pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles boto3 open3d gdown
 
 # 5. Tải trước trọng số model VGGT-1B từ Hugging Face và lưu vào cache (không load vào RAM để tránh OOM)
 RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/VGGT-1B')"

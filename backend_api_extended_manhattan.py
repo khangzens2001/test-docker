@@ -8,12 +8,15 @@ from pathlib import Path
 from typing import List, Optional
 
 import boto3
+import gdown
 import numpy as np
 import open3d as o3d
+import requests
 import torch
 from botocore.config import Config
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -436,6 +439,150 @@ def health():
     return {"status": "ok", "device": device, "model_loaded": model is not None}
 
 
+def download_and_extract_zip(url: str, job_dir: str, dest_dir: str) -> List[str]:
+    zip_path = os.path.join(job_dir, "temp_images.zip")
+    
+    # 1. Download the file
+    print(f"Downloading ZIP from: {url}")
+    if "drive.google.com" in url or "docs.google.com" in url:
+        gdown.download(url, zip_path, quiet=True)
+    else:
+        response = requests.get(url, stream=True, timeout=600)
+        response.raise_for_status()
+        with open(zip_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    
+    if not os.path.exists(zip_path) or os.path.getsize(zip_path) == 0:
+        raise RuntimeError(f"Failed to download zip file from URL: {url}")
+        
+    # 2. Extract the file
+    print(f"Extracting ZIP to: {dest_dir}")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(dest_dir)
+        
+    # Clean up the downloaded ZIP
+    try:
+        os.remove(zip_path)
+    except OSError:
+        pass
+        
+    # 3. Find image paths
+    image_extensions = (".jpg", ".jpeg", ".png", ".webp")
+    image_paths = []
+    
+    for root, _, files in os.walk(dest_dir):
+        for file in files:
+            full_path = os.path.join(root, file)
+            ext = os.path.splitext(file)[1].lower()
+            if ext in image_extensions:
+                image_paths.append(full_path)
+            
+    return sorted(image_paths)
+
+
+def run_inference_pipeline(
+    image_paths: List[str],
+    batch_id: str,
+    metadata: list,
+    conf_threshold: float,
+    max_points: int,
+    hard_max_points: int,
+    max_images: Optional[int],
+    clean_voxel: float,
+    clean_stat_neighbors: int,
+    clean_stat_std: float,
+    job_id: str,
+    job_dir: str,
+    img_dir: str,
+    out_dir: str
+) -> dict:
+    image_paths = sorted(image_paths)
+    if max_images is not None and max_images > 0:
+        image_paths = image_paths[:max_images]
+    if not image_paths:
+        raise RuntimeError("No valid images found for processing")
+
+    with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    m = get_model()
+    images = load_and_preprocess_images(image_paths).to(device)
+    with torch.no_grad():
+        if device == "cuda":
+            with torch.cuda.amp.autocast(dtype=dtype):
+                predictions = m(images)
+        else:
+            predictions = m(images)
+
+    torch.save(predictions, os.path.join(out_dir, "predictions.pt"))
+    image_names = [os.path.basename(p) for p in image_paths]
+    cloud_info = export_point_cloud(predictions, image_names, out_dir, conf_threshold, max_points, hard_max_points)
+    clean_dir = os.path.join(out_dir, "clean")
+    clean_info = clean_ply_file(
+        cloud_info["ply_path"],
+        clean_dir,
+        clean_voxel,
+        clean_stat_neighbors,
+        clean_stat_std,
+    )
+
+    alignment_info = align_clean_ply_to_manhattan(clean_info["output"])
+
+    object_prefix = f"{safe_object_part(batch_id)}/{job_id}"
+    clean_r2 = upload_to_r2(clean_info["output"], f"ply_clean/{object_prefix}/project_point_cloud_clean.ply")
+    try:
+        os.remove(cloud_info["ply_path"])
+    except OSError:
+        pass
+
+    meta = {
+        "status": "success",
+        "job_id": job_id,
+        "batch_id": batch_id,
+        "num_images": len(image_paths),
+        "image_names": image_names,
+        "device": device,
+        "dtype": str(dtype),
+        "model_id": MODEL_ID,
+        "conf_threshold": float(conf_threshold),
+        "point_cloud": {
+            "num_points": cloud_info["num_points"],
+            "max_points": cloud_info["max_points"],
+            "files": ["output/clean/project_point_cloud_clean.ply"],
+        },
+        "cleaning": {
+            "mode": clean_info["mode"],
+            "original_points": clean_info["original_points"],
+            "after_voxel_points": clean_info["after_voxel_points"],
+            "output_points": clean_info["output_points"],
+            "settings": clean_info["settings"],
+        },
+        "alignment": alignment_info,
+        "storage": {
+            "provider": "cloudflare_r2",
+            "bucket": R2_BUCKET,
+            "endpoint": R2_ENDPOINT_URL,
+            "expires_in": R2_PRESIGN_EXPIRES,
+            "expires_days": round(R2_PRESIGN_EXPIRES / 86400, 2),
+        },
+        "clean_ply": clean_r2,
+        "prediction_keys": list(predictions.keys()),
+        "shape_info": prediction_shapes(predictions),
+        "download_url": f"/download/{job_id}",
+        "npz_url": f"/download_npz/{job_id}",
+        "job_url": f"/jobs/{job_id}",
+    }
+    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    zip_job(job_dir, job_id)
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return meta
+
+
 @app.post("/predict_project_batch")
 async def predict_project_batch(
     files: List[UploadFile] = File(...),
@@ -468,88 +615,132 @@ async def predict_project_batch(
                 shutil.copyfileobj(f.file, buffer)
             image_paths.append(path)
 
-        image_paths = sorted(image_paths)
-        if max_images is not None and max_images > 0:
-            image_paths = image_paths[:max_images]
         if not image_paths:
             return JSONResponse(status_code=400, content={"status": "error", "error": "No valid images uploaded"})
 
-        with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
-
-        m = get_model()
-        images = load_and_preprocess_images(image_paths).to(device)
-        with torch.no_grad():
-            if device == "cuda":
-                with torch.cuda.amp.autocast(dtype=dtype):
-                    predictions = m(images)
-            else:
-                predictions = m(images)
-
-        torch.save(predictions, os.path.join(out_dir, "predictions.pt"))
-        image_names = [os.path.basename(p) for p in image_paths]
-        cloud_info = export_point_cloud(predictions, image_names, out_dir, conf_threshold, max_points, hard_max_points)
-        clean_dir = os.path.join(out_dir, "clean")
-        clean_info = clean_ply_file(
-            cloud_info["ply_path"],
-            clean_dir,
-            clean_voxel,
-            clean_stat_neighbors,
-            clean_stat_std,
+        meta = run_inference_pipeline(
+            image_paths=image_paths,
+            batch_id=batch_id,
+            metadata=metadata,
+            conf_threshold=conf_threshold,
+            max_points=max_points,
+            hard_max_points=hard_max_points,
+            max_images=max_images,
+            clean_voxel=clean_voxel,
+            clean_stat_neighbors=clean_stat_neighbors,
+            clean_stat_std=clean_stat_std,
+            job_id=job_id,
+            job_dir=job_dir,
+            img_dir=img_dir,
+            out_dir=out_dir
         )
-
-        alignment_info = align_clean_ply_to_manhattan(clean_info["output"])
-
-        object_prefix = f"{safe_object_part(batch_id)}/{job_id}"
-        clean_r2 = upload_to_r2(clean_info["output"], f"ply_clean/{object_prefix}/project_point_cloud_clean.ply")
-        try:
-            os.remove(cloud_info["ply_path"])
-        except OSError:
-            pass
-
-        meta = {
-            "status": "success",
-            "job_id": job_id,
-            "batch_id": batch_id,
-            "num_images": len(image_paths),
-            "image_names": image_names,
-            "device": device,
-            "dtype": str(dtype),
-            "model_id": MODEL_ID,
-            "conf_threshold": float(conf_threshold),
-            "point_cloud": {
-                "num_points": cloud_info["num_points"],
-                "max_points": cloud_info["max_points"],
-                "files": ["output/clean/project_point_cloud_clean.ply"],
-            },
-            "cleaning": {
-                "mode": clean_info["mode"],
-                "original_points": clean_info["original_points"],
-                "after_voxel_points": clean_info["after_voxel_points"],
-                "output_points": clean_info["output_points"],
-                "settings": clean_info["settings"],
-            },
-            "alignment": alignment_info,
-            "storage": {
-                "provider": "cloudflare_r2",
-                "bucket": R2_BUCKET,
-                "endpoint": R2_ENDPOINT_URL,
-                "expires_in": R2_PRESIGN_EXPIRES,
-                "expires_days": round(R2_PRESIGN_EXPIRES / 86400, 2),
-            },
-            "clean_ply": clean_r2,
-            "prediction_keys": list(predictions.keys()),
-            "shape_info": prediction_shapes(predictions),
-            "download_url": f"/download/{job_id}",
-            "npz_url": f"/download_npz/{job_id}",
-            "job_url": f"/jobs/{job_id}",
-        }
-        with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
-
-        zip_job(job_dir, job_id)
+        return meta
+    except Exception as e:
         if device == "cuda":
             torch.cuda.empty_cache()
+        error_text = traceback.format_exc()
+        with open(os.path.join(out_dir, "error.txt"), "w", encoding="utf-8") as f:
+            f.write(error_text)
+        zip_job(job_dir, job_id)
+        return JSONResponse(status_code=500, content={"status": "error", "job_id": job_id, "error": str(e), "download_url": f"/download/{job_id}"})
+
+
+class ZipUrlRequest(BaseModel):
+    zip_url: str
+    batch_id: str = "batch"
+    metadata: list = []
+    conf_threshold: float = 1.0
+    max_points: int = 3000000
+    hard_max_points: int = DEFAULT_HARD_MAX_POINTS
+    max_images: Optional[int] = None
+    clean_voxel: float = DEFAULT_CLEAN_VOXEL
+    clean_stat_neighbors: int = DEFAULT_CLEAN_STAT_NEIGHBORS
+    clean_stat_std: float = DEFAULT_CLEAN_STAT_STD
+
+
+@app.post("/predict_zip_url")
+async def predict_zip_url(req: ZipUrlRequest):
+    job_id = str(uuid.uuid4())[:8]
+    job_dir = os.path.join(BASE_DIR, job_id)
+    img_dir = os.path.join(job_dir, "images")
+    out_dir = os.path.join(job_dir, "output")
+    os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    try:
+        image_paths = download_and_extract_zip(req.zip_url, job_dir, img_dir)
+        if not image_paths:
+            return JSONResponse(status_code=400, content={"status": "error", "error": "No valid images found in the zip file"})
+
+        meta = run_inference_pipeline(
+            image_paths=image_paths,
+            batch_id=req.batch_id,
+            metadata=req.metadata,
+            conf_threshold=req.conf_threshold,
+            max_points=req.max_points,
+            hard_max_points=req.hard_max_points,
+            max_images=req.max_images,
+            clean_voxel=req.clean_voxel,
+            clean_stat_neighbors=req.clean_stat_neighbors,
+            clean_stat_std=req.clean_stat_std,
+            job_id=job_id,
+            job_dir=job_dir,
+            img_dir=img_dir,
+            out_dir=out_dir
+        )
+        return meta
+    except Exception as e:
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        error_text = traceback.format_exc()
+        with open(os.path.join(out_dir, "error.txt"), "w", encoding="utf-8") as f:
+            f.write(error_text)
+        zip_job(job_dir, job_id)
+        return JSONResponse(status_code=500, content={"status": "error", "job_id": job_id, "error": str(e), "download_url": f"/download/{job_id}"})
+
+
+@app.post("/predict_zip_url_form")
+async def predict_zip_url_form(
+    zip_url: str = Form(...),
+    batch_id: str = Form("batch"),
+    metadata_json: str = Form("[]"),
+    conf_threshold: float = Form(1.0),
+    max_points: int = Form(3_000_000),
+    hard_max_points: int = Form(DEFAULT_HARD_MAX_POINTS),
+    max_images: Optional[int] = Form(None),
+    clean_voxel: float = Form(DEFAULT_CLEAN_VOXEL),
+    clean_stat_neighbors: int = Form(DEFAULT_CLEAN_STAT_NEIGHBORS),
+    clean_stat_std: float = Form(DEFAULT_CLEAN_STAT_STD),
+):
+    job_id = str(uuid.uuid4())[:8]
+    job_dir = os.path.join(BASE_DIR, job_id)
+    img_dir = os.path.join(job_dir, "images")
+    out_dir = os.path.join(job_dir, "output")
+    os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    try:
+        metadata = json.loads(metadata_json) if metadata_json else []
+        image_paths = download_and_extract_zip(zip_url, job_dir, img_dir)
+        if not image_paths:
+            return JSONResponse(status_code=400, content={"status": "error", "error": "No valid images found in the zip file"})
+
+        meta = run_inference_pipeline(
+            image_paths=image_paths,
+            batch_id=batch_id,
+            metadata=metadata,
+            conf_threshold=conf_threshold,
+            max_points=max_points,
+            hard_max_points=hard_max_points,
+            max_images=max_images,
+            clean_voxel=clean_voxel,
+            clean_stat_neighbors=clean_stat_neighbors,
+            clean_stat_std=clean_stat_std,
+            job_id=job_id,
+            job_dir=job_dir,
+            img_dir=img_dir,
+            out_dir=out_dir
+        )
         return meta
     except Exception as e:
         if device == "cuda":
