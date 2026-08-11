@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  vggt-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: roomlayout-vggt-server:latest
+    container_name: vggt-server
+    environment:
+      - BASE_DIR=/app/vggt_room3d_jobs
+      - R2_BUCKET=${R2_BUCKET:-3d-ply}
+      - R2_ACCOUNT_ID=${R2_ACCOUNT_ID}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+      - R2_ENDPOINT_URL=${R2_ENDPOINT_URL}
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    volumes:
+      - vggt-jobs-data:/app/vggt_room3d_jobs
+
+volumes:
+  vggt-jobs-data:
+    name: vggt-jobs-data
