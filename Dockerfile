@@ -31,7 +31,7 @@ WORKDIR /app/vggt-space
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir -r requirements_demo.txt && \
-    pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles boto3 open3d gdown runpod
+    pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles boto3 open3d gdown runpod huggingface-hub==0.24.0 safetensors
 
 # 5. Tải trước trọng số model VGGT-1B từ Hugging Face và lưu vào cache (không load vào RAM để tránh OOM)
 ARG HF_TOKEN
