@@ -32,6 +32,8 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
+          build-args: |
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
           tags: |
             khangzens/vggt-1b:latest
             khangzens/vggt-1b:${{ github.ref_name }}
