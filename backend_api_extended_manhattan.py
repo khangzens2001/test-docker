@@ -16,6 +16,7 @@ import torch
 from botocore.config import Config
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from vggt.models.vggt import VGGT
@@ -36,6 +37,14 @@ DEFAULT_CLEAN_STAT_STD = 2.8
 
 os.makedirs(BASE_DIR, exist_ok=True)
 app = FastAPI(title=APP_NAME)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if device == "cuda":
