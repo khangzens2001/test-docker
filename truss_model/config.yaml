@@ -1,0 +1,54 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/basetenlabs/truss/main/truss/config.schema.json
+model_name: vggt-1b-baseten
+python_version: py311
+
+requirements:
+  - torch==2.4.0
+  - torchvision==0.19.0
+  - timm
+  - numpy==1.26.4
+  - scikit-learn
+  - open3d==0.18.0
+  - trimesh
+  - pillow
+  - gdown
+  - huggingface-hub==0.24.0
+  - safetensors
+  - plyfile
+  - pypng
+  - boto3
+  - fastapi
+  - uvicorn
+  - python-multipart
+  - aiofiles
+  - requests
+
+system_packages:
+  - libgl1-mesa-glx
+  - libglib2.0-0
+  - libgomp1
+  - git
+  - curl
+
+build_commands:
+  - git clone https://huggingface.co/spaces/JianyuanWang/VGGT /app/vggt-space
+
+resources:
+  cpu: "4"
+  memory: 16Gi
+  accelerator: L4
+
+secrets:
+  HF_TOKEN: null
+  R2_ACCOUNT_ID: null
+  R2_ENDPOINT_URL: null
+  R2_ACCESS_KEY_ID: null
+  R2_SECRET_ACCESS_KEY: null
+  R2_BUCKET: null
+
+model_cache:
+  - repo_id: "facebook/VGGT-1B"
+    revision: "main"
+    use_volume: true
+    volume_folder: "vggt_weights"
+
