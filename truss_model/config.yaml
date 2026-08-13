@@ -34,9 +34,10 @@ build_commands:
   - git clone https://huggingface.co/spaces/JianyuanWang/VGGT /app/vggt-space
 
 resources:
-  cpu: "4"
-  memory: 16Gi
+  cpu: "8"
+  memory: 64Gi
   accelerator: L4
+
 
 secrets:
   HF_TOKEN: null
@@ -46,9 +47,4 @@ secrets:
   R2_SECRET_ACCESS_KEY: null
   R2_BUCKET: null
 
-model_cache:
-  - repo_id: "facebook/VGGT-1B"
-    revision: "main"
-    use_volume: true
-    volume_folder: "vggt_weights"
 

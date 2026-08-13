@@ -13,9 +13,23 @@ class Model:
 
     def load(self):
         # 1. Map Truss secrets to environment variables so that backend_api can read them
-        for key, val in self._secrets.items():
-            if val:
-                os.environ[key] = str(val)
+        secret_keys = [
+            "HF_TOKEN",
+            "R2_ACCOUNT_ID",
+            "R2_ENDPOINT_URL",
+            "R2_ACCESS_KEY_ID",
+            "R2_SECRET_ACCESS_KEY",
+            "R2_BUCKET"
+        ]
+        for key in secret_keys:
+            try:
+                val = self._secrets[key]
+                if val:
+                    os.environ[key] = str(val)
+                    if key == "HF_TOKEN":
+                        os.environ["HUGGING_FACE_HUB_TOKEN"] = str(val)
+            except KeyError:
+                pass
 
         # 2. Add vggt-space to sys.path so we can import from vggt
         vggt_space_path = "/app/vggt-space"
@@ -23,8 +37,6 @@ class Model:
             sys.path.append(vggt_space_path)
 
         os.environ["PYTHONPATH"] = vggt_space_path
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
         os.environ["BASE_DIR"] = "/app/vggt_room3d_jobs"
         os.makedirs(os.environ["BASE_DIR"], exist_ok=True)
 
@@ -39,18 +51,25 @@ class Model:
         self.device = device
         self.dtype = dtype
 
-        from vggt.models.vggt import VGGT
-        self._model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
-        self._model.eval()
+        try:
+            print("--> Importing VGGT and loading checkpoints...", flush=True)
+            from vggt.models.vggt import VGGT
+            self._model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+            self._model.eval()
 
-        # 4. Inject model and device/dtype into backend_api
-        from model import backend_api_extended_manhattan
-        backend_api_extended_manhattan.model = self._model
-        backend_api_extended_manhattan.device = self.device
-        backend_api_extended_manhattan.dtype = self.dtype
-        
-        self.backend = backend_api_extended_manhattan
-        print("--> Model loaded successfully!", flush=True)
+            # 4. Inject model and device/dtype into backend_api
+            from model import backend_api_extended_manhattan
+            backend_api_extended_manhattan.model = self._model
+            backend_api_extended_manhattan.device = self.device
+            backend_api_extended_manhattan.dtype = self.dtype
+            
+            self.backend = backend_api_extended_manhattan
+            print("--> Model loaded successfully!", flush=True)
+        except Exception as e:
+            print(f"--> ERROR IN MODEL LOAD: {e}", flush=True)
+            traceback.print_exc(file=sys.stdout)
+            sys.stdout.flush()
+            raise e
 
     def predict(self, model_input):
         """
