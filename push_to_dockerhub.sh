@@ -30,7 +30,7 @@ if ! command -v docker &> /dev/null; then
   fi
 fi
 
-IMAGE_NAME="roomlayout-vggt-server"
+IMAGE_NAME="vggt-1b"
 TARGET_IMAGE="$DOCKER_USER/$IMAGE_NAME"
 
 echo "================================================================="
@@ -54,12 +54,18 @@ $DOCKER_BIN build --platform linux/amd64 -t $IMAGE_NAME:latest -f Dockerfile .
 # 3. Tag Image
 echo "🏷️  Tagging Image..."
 $DOCKER_BIN tag $IMAGE_NAME:latest $TARGET_IMAGE:$TAG
-$DOCKER_BIN tag $IMAGE_NAME:latest $TARGET_IMAGE:latest
+if [ "$TAG" != "latest" ]; then
+  echo "ℹ️  Không ghi đè tag 'latest' để bảo vệ môi trường chạy RunPod hiện tại."
+else
+  $DOCKER_BIN tag $IMAGE_NAME:latest $TARGET_IMAGE:latest
+fi
 
 # 4. Push Image
-echo "📤 Pushing Image ($TARGET_IMAGE:$TAG & latest)..."
+echo "📤 Pushing Image ($TARGET_IMAGE:$TAG)..."
 $DOCKER_BIN push $TARGET_IMAGE:$TAG
-$DOCKER_BIN push $TARGET_IMAGE:latest
+if [ "$TAG" == "latest" ]; then
+  $DOCKER_BIN push $TARGET_IMAGE:latest
+fi
 
 echo ""
 echo "================================================================="

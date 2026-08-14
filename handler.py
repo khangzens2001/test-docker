@@ -113,5 +113,16 @@ def handler(job):
         return {"status": "error", "job_id": job_id, "error": str(e)}
 
 if __name__ == "__main__":
-    print("Starting RunPod Serverless Worker...", flush=True)
-    runpod.serverless.start({"handler": handler})
+    # Check if we should run in FastAPI web server mode (Vast.ai, Docker Compose, or local)
+    # We run RunPod serverless if RUNPOD_IAU_HOST or RUNPOD_POD_ID is present,
+    # or if the user explicitly set PROVIDER=runpod.
+    run_on_runpod = os.getenv("RUNPOD_POD_ID") is not None or os.getenv("RUNPOD_IAU_HOST") is not None or os.getenv("PROVIDER") == "runpod"
+    
+    if run_on_runpod:
+        print("Starting RunPod Serverless Worker...", flush=True)
+        runpod.serverless.start({"handler": handler})
+    else:
+        print("Starting FastAPI Web Server (for Vast.ai, Compose, or Local)...", flush=True)
+        import uvicorn
+        uvicorn.run(backend_api_extended_manhattan.app, host="0.0.0.0", port=8000)
+
