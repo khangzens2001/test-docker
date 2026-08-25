@@ -35,7 +35,7 @@ RUN pip install --upgrade pip && \
 
 # 5. Tải trước trọng số model VGGT-1B từ Hugging Face và lưu vào cache (không load vào RAM để tránh OOM)
 ARG HF_TOKEN
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/VGGT-1B', token='${HF_TOKEN}')"
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/VGGT-1B-Commercial', token='${HF_TOKEN}')"
 
 # 6. Copy file API Server chính và handler vào thư mục space
 COPY backend_api_extended_manhattan.py /app/vggt-space/backend_api_extended_manhattan.py

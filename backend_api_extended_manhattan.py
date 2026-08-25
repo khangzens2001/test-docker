@@ -24,7 +24,7 @@ from vggt.utils.load_fn import load_and_preprocess_images
 
 APP_NAME = "VGGT Room3D Extended Backend"
 BASE_DIR = os.getenv("BASE_DIR", "/app/vggt_room3d_jobs")
-MODEL_ID = "facebook/VGGT-1B"
+MODEL_ID = "facebook/VGGT-1B-Commercial"
 DEFAULT_HARD_MAX_POINTS = 300_000_000
 R2_BUCKET = os.getenv("R2_BUCKET", "3d-ply")
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
