@@ -33,9 +33,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 RUN git clone https://huggingface.co/spaces/JianyuanWang/VGGT /app/vggt-space
 
-# 4. Cài đặt các thư viện Python
+# 4. Cài đặt các thư viện Python & nâng cấp libstdc++ cho Open3D
 WORKDIR /app/vggt-space
-RUN pip install --upgrade pip && \
+RUN conda install -y -c conda-forge libstdcxx-ng && \
+    pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir -r requirements_demo.txt && \
     pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles boto3 open3d gdown runpod huggingface-hub==0.24.0 safetensors opencv-python-headless scipy matplotlib shapely
