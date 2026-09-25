@@ -21,9 +21,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     libgomp1 \
+    libusb-1.0-0 \
     libsm6 \
+    libice6 \
     libxext6 \
     libxrender1 \
+    libx11-6 \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. Clone repo VGGT của Hugging Face
