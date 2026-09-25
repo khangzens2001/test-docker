@@ -537,10 +537,54 @@ def run_inference_pipeline(
     except OSError:
         pass
 
+    # ── 3D to 2D Floorplan & Room Metrics Extraction ──
+    room_metrics = None
+    floorplan_files = {}
+    try:
+        from floorplan_generator.main import generate_floorplan_from_ply
+        fp_result = generate_floorplan_from_ply(
+            pointcloud_path=clean_info["output"],
+            output_dir=clean_dir,
+            project_name=safe_object_part(batch_id),
+            sheet_size="A3",
+            no_wall_slice=True,
+            projection_view="xy_pos_z",
+            alignment_mode="off",
+        )
+        room_metrics = fp_result.get("metrics")
+        fp_files = fp_result.get("files", {})
+
+        # Upload 2D outputs to R2 alongside 3D PLY if files exist
+        if fp_files.get("floorplan_png") and os.path.exists(fp_files["floorplan_png"]):
+            floorplan_files["floorplan_png"] = upload_to_r2(
+                fp_files["floorplan_png"], f"ply_clean/{object_prefix}/floorplan.png"
+            )
+        if fp_files.get("floorplan_pdf") and os.path.exists(fp_files["floorplan_pdf"]):
+            floorplan_files["floorplan_pdf"] = upload_to_r2(
+                fp_files["floorplan_pdf"], f"ply_clean/{object_prefix}/floorplan.pdf"
+            )
+        if fp_files.get("wall_elevation_png") and os.path.exists(fp_files["wall_elevation_png"]):
+            floorplan_files["wall_elevation_png"] = upload_to_r2(
+                fp_files["wall_elevation_png"], f"ply_clean/{object_prefix}/walls.png"
+            )
+        if fp_files.get("debug_topdown_png") and os.path.exists(fp_files["debug_topdown_png"]):
+            floorplan_files["debug_topdown_png"] = upload_to_r2(
+                fp_files["debug_topdown_png"], f"ply_clean/{object_prefix}/debug_topdown.png"
+            )
+        if fp_files.get("metrics_json") and os.path.exists(fp_files["metrics_json"]):
+            floorplan_files["metrics_json"] = upload_to_r2(
+                fp_files["metrics_json"], f"ply_clean/{object_prefix}/metrics.json"
+            )
+    except Exception as exc:
+        print(f"Warning: Failed to extract 2D floorplan metrics on AI server: {exc}")
+        traceback.print_exc()
+
     meta = {
         "status": "success",
         "job_id": job_id,
         "batch_id": batch_id,
+        "room_metrics": room_metrics,
+        "floorplan_files": floorplan_files,
         "num_images": len(image_paths),
         "image_names": image_names,
         "device": device,

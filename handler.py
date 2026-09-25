@@ -97,7 +97,10 @@ def handler(job):
             "clean_ply": {
                 "presigned_url": presigned_url,
                 "r2_key": r2_key
-            }
+            },
+            "room_metrics": meta.get("room_metrics"),
+            "floorplan_files": meta.get("floorplan_files", {}),
+            "alignment": meta.get("alignment")
         }
 
     except Exception as e:
