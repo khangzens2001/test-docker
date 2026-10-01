@@ -482,6 +482,89 @@ def download_and_extract_zip(url: str, job_dir: str, dest_dir: str) -> List[str]
     return sorted(image_paths)
 
 
+def find_multisensor_session_dir(root_dir: str) -> Optional[str]:
+    """Detect if directory contains multi-sensor LiDAR/odometry scan files."""
+    indicators = ("manifest.json", "camera_matrix.csv", "odometry.csv", "lidar.csv")
+    for dirpath, _, filenames in os.walk(root_dir):
+        if any(f in filenames for f in indicators):
+            return dirpath
+    return None
+
+
+def run_multisensor_pipeline(session_dir: str, batch_id: str, job_id: str, out_dir: str) -> dict:
+    from app.pipeline.runner import run_pipeline
+    from app.services.cad.contract import layout_to_metrics_mm
+
+    result = run_pipeline(session_dir)
+    if not result.success:
+        raise RuntimeError(f"Multi-sensor pipeline execution failed: {result.error_message}")
+
+    object_prefix = f"{safe_object_part(batch_id)}/{job_id}"
+
+    clean_ply_candidates = [
+        os.path.join(session_dir, "reconstructed_visual.ply"),
+        os.path.join(session_dir, "whiteflat.ply"),
+        os.path.join(session_dir, "reconstructed.ply"),
+    ]
+    clean_ply_path = next((p for p in clean_ply_candidates if os.path.isfile(p)), None)
+    clean_ply_r2 = {}
+    if clean_ply_path:
+        clean_ply_r2 = upload_to_r2(
+            clean_ply_path, f"ply_clean/{object_prefix}/project_point_cloud_clean.ply"
+        )
+
+    floorplan_files = {}
+    file_candidates = [
+        ("floorplan_png", ["floorplan.png", "ISO_A3_Floorplan.png", "ISO_A4_Floorplan.png"]),
+        ("floorplan_pdf", ["floorplan.pdf", "ISO_A3_Floorplan.pdf", "ISO_A4_Floorplan.pdf"]),
+        ("wall_elevation_png", ["Walls.png", "walls.png"]),
+        ("debug_topdown_png", ["debug_topdown.png"]),
+        ("room_model_glb", ["room_model.glb", "room_model_texture.glb", "reconstructed.glb"]),
+        ("metrics_json", ["metrics.json"]),
+    ]
+    for file_key, cands in file_candidates:
+        for c in cands:
+            p = os.path.join(session_dir, c)
+            if os.path.isfile(p):
+                target_name = "walls.png" if "wall" in file_key else c
+                floorplan_files[file_key] = upload_to_r2(
+                    p, f"ply_clean/{object_prefix}/{target_name}"
+                )
+                break
+
+    room_metrics = None
+    metrics_json_path = os.path.join(session_dir, "metrics.json")
+    if os.path.isfile(metrics_json_path):
+        try:
+            with open(metrics_json_path, "r", encoding="utf-8") as f:
+                room_metrics = json.load(f)
+        except Exception:
+            room_metrics = None
+    if room_metrics is None and result.floorplan:
+        room_metrics = layout_to_metrics_mm(result.floorplan)
+
+    presigned_url = clean_ply_r2.get("presigned_url") or floorplan_files.get("floorplan_png", {}).get("presigned_url")
+    r2_key = clean_ply_r2.get("key")
+
+    meta = {
+        "status": "success",
+        "job_id": job_id,
+        "batch_id": batch_id,
+        "mode": "multisensor_lidar",
+        "download_url": presigned_url,
+        "clean_ply": {
+            "presigned_url": presigned_url,
+            "r2_key": r2_key,
+        },
+        "room_metrics": room_metrics,
+        "floorplan_files": floorplan_files,
+        "timings": result.metrics.timings if hasattr(result.metrics, "timings") else {},
+    }
+    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return meta
+
+
 def run_inference_pipeline(
     image_paths: List[str],
     batch_id: str,
@@ -713,8 +796,14 @@ async def predict_zip_url(req: ZipUrlRequest):
 
     try:
         image_paths = download_and_extract_zip(req.zip_url, job_dir, img_dir)
+        session_dir = find_multisensor_session_dir(img_dir) or find_multisensor_session_dir(job_dir)
+        if session_dir is not None:
+            meta = run_multisensor_pipeline(session_dir, req.batch_id, job_id, out_dir)
+            zip_job(job_dir, job_id)
+            return meta
+
         if not image_paths:
-            return JSONResponse(status_code=400, content={"status": "error", "error": "No valid images found in the zip file"})
+            return JSONResponse(status_code=400, content={"status": "error", "error": "No valid images or sensor data found in the zip file"})
 
         meta = run_inference_pipeline(
             image_paths=image_paths,
@@ -766,8 +855,14 @@ async def predict_zip_url_form(
     try:
         metadata = json.loads(metadata_json) if metadata_json else []
         image_paths = download_and_extract_zip(zip_url, job_dir, img_dir)
+        session_dir = find_multisensor_session_dir(img_dir) or find_multisensor_session_dir(job_dir)
+        if session_dir is not None:
+            meta = run_multisensor_pipeline(session_dir, batch_id, job_id, out_dir)
+            zip_job(job_dir, job_id)
+            return meta
+
         if not image_paths:
-            return JSONResponse(status_code=400, content={"status": "error", "error": "No valid images found in the zip file"})
+            return JSONResponse(status_code=400, content={"status": "error", "error": "No valid images or sensor data found in the zip file"})
 
         meta = run_inference_pipeline(
             image_paths=image_paths,
