@@ -1,9 +1,6 @@
 import hashlib
-from datetime import datetime, timedelta, timezone
-
-import jwt
-
-from app.core.config import settings
+import os
+import struct
 
 
 def verify_weight_integrity(model_bytes: bytes, expected_sha: str | None = None) -> bool:
@@ -18,39 +15,7 @@ def verify_weight_integrity(model_bytes: bytes, expected_sha: str | None = None)
     return computed_sha == expected_sha
 
 
-
-def create_access_token(subject: str, expires_delta: int | None = None) -> str:
-    now = datetime.now(timezone.utc)
-    if expires_delta is not None:
-        expire = now + timedelta(seconds=expires_delta)
-    else:
-        expire = now + timedelta(minutes=60)
-
-    to_encode = {
-        "exp": expire,
-        "iat": now,
-        "nbf": now,
-        "sub": str(subject),
-    }
-    return jwt.encode(
-        to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM
-    )
-
-
-def verify_access_token(token: str) -> str:
-    """Return `sub` claim on success; raise `jwt.PyJWTError` on any failure."""
-    payload = jwt.decode(
-        token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
-    )
-    user_id = payload.get("sub")
-    if user_id is None:
-        raise jwt.InvalidTokenError("Subject ('sub') claim is missing.")
-    return str(user_id)
-
-
-# --- Image header verification (appended in Task 5; do NOT remove JWT helpers above) ---
-import os
-import struct
+# --- Image header verification ---
 
 # Cap how many bytes we scan while walking JPEG markers to bound worst case work.
 _JPEG_MAX_SCAN_BYTES = 256 * 1024

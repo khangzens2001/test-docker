@@ -40,7 +40,7 @@ RUN conda install -y -c conda-forge libstdcxx-ng && \
     pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir -r requirements_demo.txt && \
-    pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles boto3 open3d gdown runpod huggingface-hub==0.24.0 safetensors opencv-python-headless scipy matplotlib shapely pandas trimesh ezdxf pypdf Pillow onnxruntime pyarrow pydantic-settings
+    pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles boto3 open3d gdown runpod huggingface-hub==0.24.0 safetensors opencv-python-headless scipy matplotlib shapely pandas trimesh ezdxf pypdf Pillow onnxruntime pyarrow pydantic-settings cachetools numba requests
 
 # 5. Tải trước trọng số model VGGT-1B từ Hugging Face và lưu vào cache (không load vào RAM để tránh OOM)
 ARG HF_TOKEN=""

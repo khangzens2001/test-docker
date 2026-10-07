@@ -21,13 +21,7 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
 
     DEBUG: bool = False
-    # ENV_MODE defaults to "local" so a bare `Settings()` on a fresh checkout
-    # does NOT crash at import time. Production deployments MUST set
-    # ENV_MODE=production explicitly via env var, at which point the
-    # `_fill_paths_and_validate` model_validator enforces a strong secret.
     ENV_MODE: str = "local"
-    JWT_SECRET_KEY: str = "change_me_in_production"
-    JWT_ALGORITHM: str = "HS256"
 
     CORS_ORIGINS: List[str] = Field(default_factory=list)
     # Trusted proxy hosts for ProxyHeadersMiddleware (empty = do not trust
@@ -86,14 +80,6 @@ class Settings(BaseSettings):
             if os.path.exists(abs_weights):
                 self.MODEL_WEIGHTS_PATH = abs_weights
 
-        if self.ENV_MODE == "production":
-            if self.JWT_SECRET_KEY in {"", "change_me_in_production"} or len(
-                self.JWT_SECRET_KEY
-            ) < 32:
-                raise ValueError(
-                    "JWT_SECRET_KEY must be set to a strong value (>= 32 chars) "
-                    "when ENV_MODE=production."
-                )
         if not self.CELERY_BROKER_URL:
             if self.REDIS_URL:
                 self.CELERY_BROKER_URL = self.REDIS_URL
