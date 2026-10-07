@@ -43,14 +43,16 @@ RUN conda install -y -c conda-forge libstdcxx-ng && \
     pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles boto3 open3d gdown runpod huggingface-hub==0.24.0 safetensors opencv-python-headless scipy matplotlib shapely pandas trimesh ezdxf pypdf Pillow onnxruntime pyarrow pydantic-settings
 
 # 5. Tải trước trọng số model VGGT-1B từ Hugging Face và lưu vào cache (không load vào RAM để tránh OOM)
-ARG HF_TOKEN
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/VGGT-1B-Commercial', token='${HF_TOKEN}')"
+ARG HF_TOKEN=""
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/VGGT-1B', token='${HF_TOKEN}' if '${HF_TOKEN}' else None)"
 
-# 6. Copy core modules, app, weights, floorplan generator, icons, file API Server chính và handler vào thư mục space
+# 6. Copy core modules, app, weights, floorplan generator, icons, scripts, file API Server chính và handler vào thư mục space
 COPY app /app/vggt-space/app
 COPY weights /app/vggt-space/weights
 COPY floorplan_generator /app/vggt-space/floorplan_generator
 COPY icon /app/vggt-space/icon
+COPY scripts /app/vggt-space/scripts
+COPY run_pipeline_url.py /app/vggt-space/run_pipeline_url.py
 COPY backend_api_extended_manhattan.py /app/vggt-space/backend_api_extended_manhattan.py
 COPY handler.py /app/vggt-space/handler.py
 

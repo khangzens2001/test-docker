@@ -1156,6 +1156,16 @@ def run_3d_reconstruction(
     reconstruction_service = ReconstructionService()
     mesh = reconstruction_service.integrate_tsdf(depths, poses, k, colors)
     del depths, poses, colors
+    if "depth_service" in locals():
+        del depth_service
+    try:
+        from app.services.depth_completion import DepthorModelManager
+        DepthorModelManager.release()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
     gc.collect()
 
     if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
@@ -1163,20 +1173,41 @@ def run_3d_reconstruction(
 
     reconstruction_service.export_mesh_artifacts(mesh, session_dir)
 
-    vggt_result = load_vggt_prior(session_dir)
+    enable_vggt = (os.getenv("ENABLE_VGGT", "1") != "0")
+    vggt_prior = None
+    if enable_vggt:
+        try:
+            from app.services.vggt_runner import run_vggt_inference
+            force_vggt = (pose_df.attrs.get("pose_source") == "server_vio")
+            run_vggt_inference(session_dir, force_recompute=force_vggt)
+        except Exception:
+            logger.exception("VGGT inference attempt failed; falling back to standard reconstruction")
+
+        vggt_result = load_vggt_prior(session_dir)
+        vggt_prior = vggt_result.prior
+    else:
+        from app.services.vggt_prior import VggtPriorResult
+        vggt_result = VggtPriorResult(prior=None, skip_reason="disabled_by_config")
+
     try:
         layout, whiteflat_pcd = reconstruction_service.segment_planes(
-            mesh, gravity_vector, trajectory=trajectory, vggt_prior=vggt_result.prior
+            mesh,
+            gravity_vector,
+            trajectory=trajectory,
+            vggt_prior=vggt_result.prior,
+            session_dir=session_dir,
         )
     except TypeError as err:
-        if "trajectory" in str(err):
+        if "trajectory" in str(err) or "session_dir" in str(err):
             layout, whiteflat_pcd = reconstruction_service.segment_planes(mesh, gravity_vector)
         else:
             raise
 
     attach_vggt_diagnostics(layout, vggt_result)
     reconstruction_service.export_whiteflat_ply(whiteflat_pcd, session_dir)
-    reconstruction_service.export_visual_artifacts(mesh, layout, gravity_vector, session_dir)
+    reconstruction_service.export_visual_artifacts(
+        mesh, layout, gravity_vector, session_dir, vggt_prior=vggt_result.prior
+    )
 
     export_room_model_glb(layout, session_dir)
     try:

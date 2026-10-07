@@ -245,13 +245,217 @@ def write_visual_ply(
                 pass
 
 
+def get_metric_vggt_cloud(
+    vggt_prior,
+    layout: dict | None = None,
+    gravity: np.ndarray | None = None,
+    reference_points: np.ndarray | None = None,
+) -> tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud]:
+    """Transform VGGT prediction point cloud to metric real-world coordinates.
+
+    Returns:
+        (pcd_room, pcd_vio):
+            - pcd_room: aligned to room canonical coordinates (floor at z=0, walls along axes)
+            - pcd_vio: aligned to VIO metric coordinate system
+    """
+    empty = o3d.geometry.PointCloud()
+    if vggt_prior is None or not hasattr(vggt_prior, "points") or len(vggt_prior.points) == 0:
+        return empty, empty
+
+    pts_vggt = np.asarray(vggt_prior.points, dtype=float)
+    if len(pts_vggt) == 0:
+        return empty, empty
+
+    # Colors
+    cols = getattr(vggt_prior, "colors", None)
+    if cols is not None and len(cols) == len(pts_vggt):
+        cols_arr = np.asarray(cols, dtype=float)
+        if cols_arr.max() > 1.0 or np.issubdtype(cols.dtype, np.integer):
+            cols_arr = np.clip(cols_arr / 255.0, 0.0, 1.0)
+    else:
+        cols_arr = np.full((len(pts_vggt), 3), 0.85, dtype=float)
+
+    # 1. Determine Sim(3) registration parameters (s, R, t)
+    s_use, R_use, t_use = None, None, None
+    if isinstance(layout, dict):
+        diag_vggt = layout.get("diagnostics", {}).get("vggt_prior", {})
+        if (
+            diag_vggt.get("sim3_s") is not None
+            and diag_vggt.get("sim3_R") is not None
+            and diag_vggt.get("sim3_t") is not None
+        ):
+            try:
+                s_use = float(diag_vggt["sim3_s"])
+                R_use = np.asarray(diag_vggt["sim3_R"], dtype=float).reshape(3, 3)
+                t_use = np.asarray(diag_vggt["sim3_t"], dtype=float).reshape(3)
+            except Exception:
+                s_use, R_use, t_use = None, None, None
+
+    if s_use is None or R_use is None or t_use is None:
+        from app.services.vggt_prior import (
+            RobustVggtPointcloudRegistrar,
+            estimate_sim3_camera_centers,
+        )
+        c_vggt = getattr(vggt_prior, "C_vggt", None)
+        t_vio = getattr(vggt_prior, "t_vio", None)
+        if c_vggt is not None and t_vio is not None and len(c_vggt) >= 3 and len(t_vio) >= 3:
+            sim3 = estimate_sim3_camera_centers(c_vggt, t_vio)
+            init_R = (
+                sim3.R
+                if (sim3.R is not None and np.all(np.isfinite(sim3.R)))
+                else getattr(vggt_prior, "R0", np.eye(3))
+            )
+            init_s = (
+                sim3.s
+                if (sim3.s is not None and np.isfinite(sim3.s))
+                else None
+            )
+        else:
+            sim3 = None
+            init_R = getattr(vggt_prior, "R0", np.eye(3))
+            init_s = None
+
+        h_room = layout_height_m(layout) if layout else 2.23
+        reg = RobustVggtPointcloudRegistrar()
+        ref_pts = (
+            np.asarray(reference_points, dtype=float)
+            if reference_points is not None and len(reference_points)
+            else np.zeros((0, 3))
+        )
+        ok_reg, s_reg, R_reg, t_reg, rmse_reg = reg.register(
+            pts_vggt,
+            ref_pts,
+            initial_R=init_R,
+            initial_s=init_s,
+            height_m=h_room,
+            camera_centers=t_vio,
+        )
+        use_pointcloud_reg = ok_reg and (not (sim3 and sim3.ok) or (rmse_reg is not None and sim3.rmse is not None and rmse_reg < sim3.rmse - 0.01))
+        if use_pointcloud_reg:
+            s_use, R_use, t_use = s_reg, R_reg, t_reg
+        elif sim3 and sim3.ok:
+            s_use, R_use, t_use = sim3.s, sim3.R, sim3.t
+        else:
+            s_use, R_use, t_use = 1.0, np.eye(3), np.zeros(3)
+
+    from app.services.vggt_prior import apply_sim3
+    p_vio = apply_sim3(pts_vggt, s_use, R_use, t_use)
+
+    pcd_vio = o3d.geometry.PointCloud()
+    pcd_vio.points = o3d.utility.Vector3dVector(p_vio)
+    pcd_vio.colors = o3d.utility.Vector3dVector(cols_arr)
+
+    # 2. Transform to room canonical coordinates
+    if isinstance(layout, dict):
+        pcd_room = apply_layout_frames(pcd_vio, layout, gravity)
+        pts_r = np.asarray(pcd_room.points).copy()
+        if len(pts_r) > 100:
+            z_floor = float(np.percentile(pts_r[:, 2], 0.5))
+            pts_r[:, 2] -= z_floor
+            pcd_room.points = o3d.utility.Vector3dVector(pts_r)
+    else:
+        pcd_room = o3d.geometry.PointCloud(pcd_vio)
+
+    return pcd_room, pcd_vio
+
+
+def build_poisson_mesh_from_cloud(
+    pcd: o3d.geometry.PointCloud,
+    layout: dict | None = None,
+    depth: int = 8,
+) -> o3d.geometry.TriangleMesh:
+    """Build a watertight triangle mesh using Poisson Surface Reconstruction."""
+    empty = o3d.geometry.TriangleMesh()
+    if len(pcd.points) < 100:
+        return empty
+
+    # Voxel downsample to uniform density (~1.5cm)
+    pcd_ds = pcd.voxel_down_sample(0.015)
+    if len(pcd_ds.points) < 50:
+        pcd_ds = o3d.geometry.PointCloud(pcd)
+
+    # Estimate normals
+    pcd_ds.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.08, max_nn=30)
+    )
+
+    # Orient normals towards room center if layout is known
+    xy = layout_xy_polygon(layout) if isinstance(layout, dict) else np.zeros((0, 2))
+    h = float(layout_height_m(layout)) if isinstance(layout, dict) else 2.23
+    if len(xy) >= 4:
+        center = np.array([float(np.mean(xy[:, 0])), float(np.mean(xy[:, 1])), h / 2.0])
+        pcd_ds.orient_normals_towards_camera_location(center)
+    elif isinstance(layout, dict) and "room" in layout:
+        w = float(layout.get("room", {}).get("width_m", 2.0))
+        d = float(layout.get("room", {}).get("depth_m", 1.5))
+        center = np.array([w / 2.0, d / 2.0, h / 2.0])
+        pcd_ds.orient_normals_towards_camera_location(center)
+    else:
+        pcd_ds.orient_normals_consistent_tangent_plane(k=15)
+
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd_ds, depth=depth
+    )
+    if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+        return empty
+
+    # Density trimming: remove vertices with low density (lowest 5%)
+    densities = np.asarray(densities)
+    if len(densities) == len(mesh.vertices):
+        density_thresh = float(np.quantile(densities, 0.05))
+        mesh.remove_vertices_by_mask(densities < density_thresh)
+
+    # Crop to room bounding box with margin
+    margin = float(ROOM_CROP_MARGIN_M)
+    if len(xy) >= 4:
+        min_b = np.array([float(xy[:, 0].min()) - margin, float(xy[:, 1].min()) - margin, -0.05])
+        max_b = np.array([float(xy[:, 0].max()) + margin, float(xy[:, 1].max()) + margin, h + 0.05])
+        bbox = o3d.geometry.AxisAlignedBoundingBox(min_bound=min_b, max_bound=max_b)
+        mesh = mesh.crop(bbox)
+    elif isinstance(layout, dict) and "room" in layout:
+        w = float(layout.get("room", {}).get("width_m", 2.0))
+        d = float(layout.get("room", {}).get("depth_m", 1.5))
+        min_b = np.array([-margin, -margin, -0.05])
+        max_b = np.array([w + margin, d + margin, h + 0.05])
+        bbox = o3d.geometry.AxisAlignedBoundingBox(min_bound=min_b, max_bound=max_b)
+        mesh = mesh.crop(bbox)
+
+    # Clean degenerate artifacts
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+
+    # Ensure vertex normals are computed
+    if not mesh.has_vertex_normals():
+        mesh.compute_vertex_normals()
+
+    # If triangle count exceeds 150,000, simplify down to 120,000 to keep it lightweight (> 80,000)
+    if len(mesh.triangles) > 150000:
+        mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=120000)
+        mesh.compute_vertex_normals()
+
+    return mesh
+
+
 def build_visual_clouds(
     mesh: o3d.geometry.TriangleMesh,
     layout: dict,
     gravity: np.ndarray | None,
     number_of_points: int | None = None,
+    vggt_prior=None,
 ) -> tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud]:
     empty = o3d.geometry.PointCloud()
+    if vggt_prior is not None and hasattr(vggt_prior, "points") and len(vggt_prior.points) >= 50:
+        ref_pts = np.asarray(mesh.vertices) if len(mesh.vertices) else None
+        pcd_room, _ = get_metric_vggt_cloud(
+            vggt_prior, layout, gravity, reference_points=ref_pts
+        )
+        if len(pcd_room.points) > 0:
+            cleaned = remove_visual_outliers(pcd_room)
+            cropped = crop_to_layout_polygon(cleaned, layout)
+            doll = cut_ceiling(cropped, layout_height_m(layout))
+            return cropped, doll
+
     sampled = sample_visual_cloud(mesh, number_of_points=number_of_points)
     if len(sampled.points) == 0:
         return empty, empty

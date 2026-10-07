@@ -10,7 +10,7 @@ from vggt.models.vggt import VGGT
 
 # Define global constants matching backend
 MODEL_ID = "facebook/VGGT-1B-Commercial"
-BASE_DIR = os.getenv("BASE_DIR", "/app/vggt_room3d_jobs")
+BASE_DIR = os.getenv("BASE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "vggt_room3d_jobs"))
 DEFAULT_HARD_MAX_POINTS = 300_000_000
 
 # 1. Khởi tạo & Warm-up Model (Global Scope)
@@ -107,11 +107,11 @@ def handler(job):
             # 2. Floorplan & CAD files upload
             floorplan_files = {}
             file_candidates = [
-                ("floorplan_png", ["floorplan.png", "ISO_A3_Floorplan.png", "ISO_A4_Floorplan.png"]),
-                ("floorplan_pdf", ["floorplan.pdf", "ISO_A3_Floorplan.pdf", "ISO_A4_Floorplan.pdf"]),
+                ("floorplan_png", ["FloorPlan_A3.png", "FloorPlan_A4.png", "floorplan.png", "ISO_A3_Floorplan.png", "ISO_A4_Floorplan.png"]),
+                ("floorplan_pdf", ["FloorPlan_A3.pdf", "FloorPlan_A4.pdf", "floorplan.pdf", "ISO_A3_Floorplan.pdf", "ISO_A4_Floorplan.pdf"]),
                 ("wall_elevation_png", ["Walls.png", "walls.png"]),
                 ("debug_topdown_png", ["debug_topdown.png"]),
-                ("room_model_glb", ["room_model.glb", "room_model_texture.glb", "reconstructed.glb"]),
+                ("room_model_glb", ["room_model_texture.glb", "room_model.glb", "reconstructed.glb"]),
                 ("metrics_json", ["metrics.json"]),
             ]
             for file_key, cands in file_candidates:

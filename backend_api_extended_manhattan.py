@@ -23,8 +23,8 @@ from vggt.utils.load_fn import load_and_preprocess_images
 
 
 APP_NAME = "VGGT Room3D Extended Backend"
-BASE_DIR = os.getenv("BASE_DIR", "/app/vggt_room3d_jobs")
-MODEL_ID = "facebook/VGGT-1B-Commercial"
+BASE_DIR = os.getenv("BASE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "vggt_room3d_jobs"))
+MODEL_ID = os.getenv("VGGT_MODEL_ID", "facebook/VGGT-1B")
 DEFAULT_HARD_MAX_POINTS = 300_000_000
 R2_BUCKET = os.getenv("R2_BUCKET", "3d-ply")
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
@@ -93,6 +93,18 @@ def get_r2_client():
 
 
 def upload_to_r2(local_path: str, key: str) -> dict:
+    access_key = os.getenv("R2_ACCESS_KEY_ID")
+    secret_key = os.getenv("R2_SECRET_ACCESS_KEY")
+    if not R2_ENDPOINT_URL or not access_key or not secret_key:
+        return {
+            "bucket": "local",
+            "key": key,
+            "size": os.path.getsize(local_path) if os.path.exists(local_path) else 0,
+            "etag": "local",
+            "presigned_url": f"file://{os.path.abspath(local_path)}",
+            "expires_in": 0,
+            "local_path": os.path.abspath(local_path),
+        }
     client = get_r2_client()
     with open(local_path, "rb") as f:
         client.put_object(
@@ -444,8 +456,11 @@ def download_and_extract_zip(url: str, job_dir: str, dest_dir: str) -> List[str]
     
     # 1. Download the file
     print(f"Downloading ZIP from: {url}")
-    if "drive.google.com" in url or "docs.google.com" in url:
-        gdown.download(url, zip_path, quiet=True)
+    if os.path.exists(url) and os.path.isfile(url):
+        import shutil
+        shutil.copy2(url, zip_path)
+    elif "drive.google.com" in url or "docs.google.com" in url:
+        gdown.download(url, zip_path, quiet=False)
     else:
         response = requests.get(url, stream=True, timeout=600)
         response.raise_for_status()
@@ -515,11 +530,11 @@ def run_multisensor_pipeline(session_dir: str, batch_id: str, job_id: str, out_d
 
     floorplan_files = {}
     file_candidates = [
-        ("floorplan_png", ["floorplan.png", "ISO_A3_Floorplan.png", "ISO_A4_Floorplan.png"]),
-        ("floorplan_pdf", ["floorplan.pdf", "ISO_A3_Floorplan.pdf", "ISO_A4_Floorplan.pdf"]),
+        ("floorplan_png", ["FloorPlan_A3.png", "FloorPlan_A4.png", "floorplan.png", "ISO_A3_Floorplan.png", "ISO_A4_Floorplan.png"]),
+        ("floorplan_pdf", ["FloorPlan_A3.pdf", "FloorPlan_A4.pdf", "floorplan.pdf", "ISO_A3_Floorplan.pdf", "ISO_A4_Floorplan.pdf"]),
         ("wall_elevation_png", ["Walls.png", "walls.png"]),
         ("debug_topdown_png", ["debug_topdown.png"]),
-        ("room_model_glb", ["room_model.glb", "room_model_texture.glb", "reconstructed.glb"]),
+        ("room_model_glb", ["room_model_texture.glb", "room_model.glb", "reconstructed.glb"]),
         ("metrics_json", ["metrics.json"]),
     ]
     for file_key, cands in file_candidates:

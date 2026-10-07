@@ -74,10 +74,15 @@ def slice_wall_band(points: np.ndarray, height_m: float) -> np.ndarray:
     band = pts[(pts[:, 2] >= 0.3) & (pts[:, 2] <= z_hi)]
     if len(band) >= SLICE_MIN_POINTS:
         return band
+    band = pts[(pts[:, 2] >= 0.15) & (pts[:, 2] <= z_hi)]
+    if len(band) >= SLICE_MIN_POINTS:
+        return band
     return np.zeros((0, 3), dtype=float)
 
 
-def keep_largest_occupancy_component(points_xyz: np.ndarray) -> np.ndarray:
+def keep_largest_occupancy_component(
+    points_xyz: np.ndarray, trajectory: np.ndarray | None = None
+) -> np.ndarray:
     pts = np.asarray(points_xyz, dtype=float)
     if pts.ndim != 2 or len(pts) == 0:
         return np.zeros((0, 3), dtype=float)
@@ -108,7 +113,22 @@ def keep_largest_occupancy_component(points_xyz: np.ndarray) -> np.ndarray:
         return np.zeros((0, 3), dtype=float)
     areas = stats[1:, cv2.CC_STAT_AREA]
     max_area = float(np.max(areas))
-    valid_labels = [i + 1 for i, a in enumerate(areas) if a >= 0.15 * max_area or a >= 300]
+    valid_labels = [i + 1 for i, a in enumerate(areas) if a >= 0.15 * max_area or a >= 200]
+    if trajectory is not None:
+        t_arr = np.asarray(trajectory, dtype=float)
+        if t_arr.ndim == 2 and len(t_arr) > 0 and t_arr.shape[1] >= 2:
+            t_valid = t_arr[np.all(np.isfinite(t_arr[:, :2]), axis=1)]
+            if len(t_valid) > 0:
+                t_ix = np.clip(((t_valid[:, 0] - x_min) / resolution).astype(int), 0, width - 1)
+                t_iy = np.clip(((t_valid[:, 1] - y_min) / resolution).astype(int), 0, height - 1)
+                t_mask = np.zeros((height, width), dtype=np.uint8)
+                t_mask[t_iy, t_ix] = 1
+                t_dil = cv2.dilate(t_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)))
+                for i, a in enumerate(areas):
+                    lab = i + 1
+                    if lab not in valid_labels and a >= 50:
+                        if np.any((labels == lab) & (t_dil > 0)):
+                            valid_labels.append(lab)
     keep = np.isin(labels[iy, ix], valid_labels)
     return pts[keep]
 
@@ -168,6 +188,7 @@ def robust_profile_bounds(
 def clean_occupancy_projection_profile(
     points_xyz: np.ndarray,
     resolution_m: float = 0.01,
+    trajectory: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Filter 2D/3D point cloud via accumulative density thresholding and 1D profile trimming.
 
@@ -302,6 +323,27 @@ def clean_occupancy_projection_profile(
     row_profile = occupied.sum(axis=1)
     x0, x1, trimmed_x = robust_profile_bounds(col_profile, width)
     y0, y1, trimmed_y = robust_profile_bounds(row_profile, height)
+
+    if trajectory is not None:
+        t_arr = np.asarray(trajectory, dtype=float)
+        if t_arr.ndim == 2 and len(t_arr) > 0 and t_arr.shape[1] >= 2:
+            t_valid = t_arr[np.all(np.isfinite(t_arr[:, :2]), axis=1)]
+            if len(t_valid) > 0:
+                t_x0 = float(np.min(t_valid[:, 0])) - 0.25
+                t_x1 = float(np.max(t_valid[:, 0])) + 0.25
+                t_y0 = float(np.min(t_valid[:, 1])) - 0.25
+                t_y1 = float(np.max(t_valid[:, 1])) + 0.25
+
+                ix_t0 = max(0, int(np.floor((t_x0 - min_x) / resolution)))
+                ix_t1 = min(width - 1, int(np.ceil((t_x1 - min_x) / resolution)))
+                iy_t0 = max(0, int(np.floor((t_y0 - min_y) / resolution)))
+                iy_t1 = min(height - 1, int(np.ceil((t_y1 - min_y) / resolution)))
+
+                x0 = min(x0, ix_t0)
+                x1 = max(x1, ix_t1)
+                y0 = min(y0, iy_t0)
+                y1 = max(y1, iy_t1)
+
     did_profile_trim = bool(
         (trimmed_x and (x0 > 0 or x1 < width - 1))
         or (trimmed_y and (y0 > 0 or y1 < height - 1))
@@ -323,8 +365,18 @@ def clean_occupancy_projection_profile(
         areas = stats[1:, cv2.CC_STAT_AREA]
         max_area = float(np.max(areas))
         valid_labels = [i + 1 for i, a in enumerate(areas) if a >= 0.10 * max_area or a >= 50]
+        if trajectory is not None:
+            t_arr = np.asarray(trajectory, dtype=float)
+            if t_arr.ndim == 2 and len(t_arr) > 0 and t_arr.shape[1] >= 2:
+                t_valid = t_arr[np.all(np.isfinite(t_arr[:, :2]), axis=1)]
+                if len(t_valid) > 0:
+                    t_ix = np.clip(((t_valid[:, 0] - min_x) / resolution).astype(int), 0, width - 1)
+                    t_iy = np.clip(((t_valid[:, 1] - min_y) / resolution).astype(int), 0, height - 1)
+                    t_labels = labels[t_iy, t_ix]
+                    for tl in np.unique(t_labels):
+                        if tl > 0 and tl not in valid_labels:
+                            valid_labels.append(int(tl))
         component_mask = np.isin(labels, valid_labels).astype(np.uint8)
-        # Dilate component mask slightly (3x3) to retain wall points near borders
         footprint = cv2.dilate(component_mask, np.ones((3, 3), np.uint8))
         keep_points = (footprint[idx_y, idx_x] > 0) & profile_keep
     else:
@@ -426,7 +478,28 @@ def estimate_manhattan_angle_bbox_sharpness(
         }
 
     try:
-        if not np.all(np.isfinite(p2d)):
+        pts = np.asarray(p2d, dtype=float)
+        if pts.ndim != 2 or pts.shape[0] < 100 or pts.shape[1] < 2:
+            return {
+                "best_angle_deg": 0.0,
+                "best_score": 0.0,
+                "bbox_area": 0.0,
+                "sharpness": 0.0,
+                "span_x": 0.0,
+                "span_y": 0.0,
+                "applied": False,
+                "angle_deg": 0.0,
+                "score_before": 0.0,
+                "score_after": 0.0,
+                "bbox_area_before": 0.0,
+                "bbox_area_after": 0.0,
+                "bbox_area_improvement": 0.0,
+                "sharpness_before": 0.0,
+                "sharpness_after": 0.0,
+                "center_xy": [0.0, 0.0],
+                "reason": "too_few_points" if (pts.ndim == 2 and pts.shape[0] < 100) else "invalid_shape",
+            }
+        if not np.all(np.isfinite(pts)):
             return {
                 "best_angle_deg": 0.0,
                 "best_score": 0.0,
@@ -467,50 +540,14 @@ def estimate_manhattan_angle_bbox_sharpness(
             "reason": "non_finite_points",
         }
 
-    pts = np.asarray(p2d, dtype=float)
-    if not np.all(np.isfinite(pts)):
-        return {
-            "best_angle_deg": 0.0,
-            "best_score": 0.0,
-            "bbox_area": 0.0,
-            "sharpness": 0.0,
-            "span_x": 0.0,
-            "span_y": 0.0,
-            "applied": False,
-            "angle_deg": 0.0,
-            "score_before": 0.0,
-            "score_after": 0.0,
-            "bbox_area_before": 0.0,
-            "bbox_area_after": 0.0,
-            "bbox_area_improvement": 0.0,
-            "sharpness_before": 0.0,
-            "sharpness_after": 0.0,
-            "center_xy": [0.0, 0.0],
-            "reason": "non_finite_points",
-        }
-
-    if pts.ndim != 2 or pts.shape[0] < 100 or pts.shape[1] < 2:
-        return {
-            "best_angle_deg": 0.0,
-            "best_score": 0.0,
-            "bbox_area": 0.0,
-            "sharpness": 0.0,
-            "span_x": 0.0,
-            "span_y": 0.0,
-            "applied": False,
-            "angle_deg": 0.0,
-            "score_before": 0.0,
-            "score_after": 0.0,
-            "bbox_area_before": 0.0,
-            "bbox_area_after": 0.0,
-            "bbox_area_improvement": 0.0,
-            "sharpness_before": 0.0,
-            "sharpness_after": 0.0,
-            "center_xy": [0.0, 0.0],
-            "reason": "too_few_points" if (pts.ndim == 2 and pts.shape[0] < 100) else "invalid_shape",
-        }
-
     points = pts[:, :2]
+
+    # Subsampling optimization: if N > max_points, stride uniformly
+    n_pts = len(points)
+    if n_pts > max_points:
+        stride = max(1, int(math.ceil(n_pts / float(max_points))))
+        points = points[::stride]
+        n_pts = len(points)
 
     # Degenerate points guard (all points concentrated within 1mm)
     ptp = np.ptp(points, axis=0)
@@ -535,17 +572,15 @@ def estimate_manhattan_angle_bbox_sharpness(
             "reason": "degenerate_points",
         }
 
-    # Subsampling optimization: if N > max_points, stride uniformly
-    n_pts = len(points)
-    if n_pts > max_points:
-        stride = max(1, int(math.ceil(n_pts / float(max_points))))
-        points = points[::stride]
-        n_pts = len(points)
-
     center = np.mean(points, axis=0)
     pts_c = points - center  # (N, 2)
+    x0 = pts_c[:, 0:1]
+    y0 = pts_c[:, 1:2]
     inv_n2 = 1.0 / (float(n_pts) * float(n_pts))
     bin_size = max(float(bin_size_m), 1e-4)
+    inv_bin = 1.0 / bin_size
+    k1 = int(round(0.01 * (n_pts - 1)))
+    k99 = int(round(0.99 * (n_pts - 1)))
 
     def _eval_angles_batch(angles_deg: np.ndarray):
         rads = np.radians(angles_deg)
@@ -553,36 +588,29 @@ def estimate_manhattan_angle_bbox_sharpness(
         sin_a = np.sin(rads)
         k_angles = len(angles_deg)
 
-        # Batch rotation matrix: (2, 2K)
-        # pts_c @ m_rot yields [X_rot, Y_rot] where X_rot = x*cos - y*sin, Y_rot = x*sin + y*cos
-        m_rot = np.vstack([
-            np.concatenate([cos_a, sin_a]),
-            np.concatenate([-sin_a, cos_a])
-        ])
-        rot = pts_c @ m_rot  # shape (N, 2K)
-        xs_batch = rot[:, :k_angles]
-        ys_batch = rot[:, k_angles:]
+        # Batch rotation using broadcasting: (N, 1) * (K,) -> (N, K)
+        xs_batch = x0 * cos_a - y0 * sin_a
+        ys_batch = x0 * sin_a + y0 * cos_a
 
-        # Robust BBox Area using 1% and 99% percentiles (vectorized across K columns)
-        lo_x, hi_x = np.percentile(xs_batch, [1.0, 99.0], axis=0)
-        lo_y, hi_y = np.percentile(ys_batch, [1.0, 99.0], axis=0)
+        # Robust BBox Area using 1% and 99% percentiles via np.partition
+        part_x = np.partition(xs_batch, (k1, k99), axis=0)
+        lo_x, hi_x = part_x[k1], part_x[k99]
+        part_y = np.partition(ys_batch, (k1, k99), axis=0)
+        lo_y, hi_y = part_y[k1], part_y[k99]
         spans_x = np.maximum(hi_x - lo_x, 1e-6)
         spans_y = np.maximum(hi_y - lo_y, 1e-6)
         areas = spans_x * spans_y
 
         # Projection Sharpness via bin_size histogram
+        min_xs = np.min(xs_batch, axis=0)
+        min_ys = np.min(ys_batch, axis=0)
+        idx_x_all = np.maximum(0, ((xs_batch - min_xs) * inv_bin).astype(np.int32))
+        idx_y_all = np.maximum(0, ((ys_batch - min_ys) * inv_bin).astype(np.int32))
         scores = np.empty(k_angles, dtype=float)
         sharpnesses = np.empty(k_angles, dtype=float)
         for i in range(k_angles):
-            xk = xs_batch[:, i]
-            yk = ys_batch[:, i]
-            min_x = np.min(xk)
-            min_y = np.min(yk)
-            idx_x = np.maximum(0, np.floor((xk - min_x) / bin_size).astype(np.int32))
-            idx_y = np.maximum(0, np.floor((yk - min_y) / bin_size).astype(np.int32))
-            # Cast to float64 before dot product to prevent 32-bit signed int overflow
-            cx = np.bincount(idx_x).astype(np.float64)
-            cy = np.bincount(idx_y).astype(np.float64)
+            cx = np.bincount(idx_x_all[:, i])
+            cy = np.bincount(idx_y_all[:, i])
             sx = float(np.dot(cx, cx)) * inv_n2
             sy = float(np.dot(cy, cy)) * inv_n2
             sharp = sx + sy
@@ -591,17 +619,19 @@ def estimate_manhattan_angle_bbox_sharpness(
 
         return scores, areas, sharpnesses, spans_x, spans_y
 
-    # Evaluate angle 0.0° baseline
-    score_0, area_0, sharp_0, span_x_0, span_y_0 = _eval_angles_batch(np.array([0.0]))
-    base_score = float(score_0[0])
-    base_area = float(area_0[0])
-    base_sharpness = float(sharp_0[0])
-
     # Stage 1: Coarse search [-45°, +45°] with 1.0° step (91 angles)
     coarse_angles = np.arange(-45.0, 45.0001, 1.0)
-    coarse_scores, _, _, _, _ = _eval_angles_batch(coarse_angles)
+    coarse_scores, coarse_areas, coarse_sharp, coarse_sx, coarse_sy = _eval_angles_batch(coarse_angles)
     best_coarse_idx = int(np.argmax(coarse_scores))
     theta_coarse = float(coarse_angles[best_coarse_idx])
+
+    # Extract angle 0.0° baseline from coarse search (coarse_angles contains 0.0° at index 45)
+    zero_idx = int(np.argmin(np.abs(coarse_angles)))
+    base_score = float(coarse_scores[zero_idx])
+    base_area = float(coarse_areas[zero_idx])
+    base_sharpness = float(coarse_sharp[zero_idx])
+    span_x_0 = float(coarse_sx[zero_idx])
+    span_y_0 = float(coarse_sy[zero_idx])
 
     # Stage 2: Fine search [theta_coarse - 1.5°, theta_coarse + 1.5°] with 0.1° step (31 angles)
     fine_angles = np.arange(theta_coarse - 1.5, theta_coarse + 1.5001, 0.1)
@@ -615,8 +645,8 @@ def estimate_manhattan_angle_bbox_sharpness(
         final_score = base_score
         final_area = base_area
         final_sharp = base_sharpness
-        final_span_x = float(span_x_0[0])
-        final_span_y = float(span_y_0[0])
+        final_span_x = span_x_0
+        final_span_y = span_y_0
     else:
         if best_angle > 45.0:
             best_angle -= 90.0
@@ -667,22 +697,13 @@ def apply_hough_yaw(points_xyz: np.ndarray) -> tuple[np.ndarray, float, int]:
     if points_xyz is None:
         return points_xyz, 0.0, 0
     try:
-        if len(points_xyz) < 4:
+        pts = np.asarray(points_xyz, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] < 2 or len(pts) < 100:
+            return pts, 0.0, 0
+        if not np.all(np.isfinite(pts)):
             return points_xyz, 0.0, 0
     except (TypeError, ValueError):
         return points_xyz, 0.0, 0
-
-    try:
-        if not np.all(np.isfinite(points_xyz)):
-            return points_xyz, 0.0, 0
-    except Exception:
-        return points_xyz, 0.0, 0
-
-    pts = np.asarray(points_xyz, dtype=float)
-    if not np.all(np.isfinite(pts)):
-        return points_xyz, 0.0, 0
-    if pts.ndim != 2 or pts.shape[1] < 2 or len(pts) < 100:
-        return pts, 0.0, 0
 
     p2d = pts[:, :2]
 
@@ -700,7 +721,7 @@ def apply_hough_yaw(points_xyz: np.ndarray) -> tuple[np.ndarray, float, int]:
         out_stage1[:, :2] = p2d_rot
     else:
         p2d_rot = p2d
-        out_stage1 = pts.copy()
+        out_stage1 = pts
 
     # --- Stage 2: Residual Hough Refinement ---
     delta_theta = 0.0
@@ -709,8 +730,9 @@ def apply_hough_yaw(points_xyz: np.ndarray) -> tuple[np.ndarray, float, int]:
     if not np.all(np.isfinite(p2d_rot)):
         return out_stage1, float(theta_global), 0
 
-    x_min, y_min = p2d_rot.min(axis=0)
-    x_max, y_max = p2d_rot.max(axis=0)
+    p2d_grid = p2d_rot if len(p2d_rot) <= 10000 else p2d_rot[::max(1, len(p2d_rot) // 10000)]
+    x_min, y_min = p2d_grid.min(axis=0)
+    x_max, y_max = p2d_grid.max(axis=0)
     resolution = OCCUPANCY_RESOLUTION_M
     span_x = (x_max - x_min) / resolution
     span_y = (y_max - y_min) / resolution
@@ -726,8 +748,8 @@ def apply_hough_yaw(points_xyz: np.ndarray) -> tuple[np.ndarray, float, int]:
 
     if 32 <= width <= OCCUPANCY_MAX_PX and 32 <= height <= OCCUPANCY_MAX_PX:
         grid = np.zeros((height, width), dtype=np.uint8)
-        ix = np.clip(np.round((p2d_rot[:, 0] - x_min) / resolution).astype(int), 0, width - 1)
-        iy = np.clip(np.round((p2d_rot[:, 1] - y_min) / resolution).astype(int), 0, height - 1)
+        ix = np.clip(np.round((p2d_grid[:, 0] - x_min) / resolution).astype(int), 0, width - 1)
+        iy = np.clip(np.round((p2d_grid[:, 1] - y_min) / resolution).astype(int), 0, height - 1)
         grid[iy, ix] = 255
         grid_closed = cv2.morphologyEx(
             grid, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -885,7 +907,66 @@ def choke_doorway_tails(
         cut_coord = float(neck["cut_coord"])
         tail_dir = neck.get("tail_dir", "prefix")
 
+        frac_in_tail = 0.0
+        all_cams_one_side = True
+        if trajectory is not None:
+            traj_arr_c = np.asarray(trajectory, dtype=float)
+            if traj_arr_c.ndim == 2 and len(traj_arr_c) > 0 and traj_arr_c.shape[1] >= 2:
+                coords_c = traj_arr_c[:, axis]
+                valid_coords = coords_c[np.isfinite(coords_c)]
+                if len(valid_coords) > 0:
+                    if tail_dir == "prefix":
+                        n_tail = int(np.count_nonzero(valid_coords < cut_coord))
+                        t_turn = float(np.min(valid_coords))
+                    else:
+                        n_tail = int(np.count_nonzero(valid_coords > cut_coord))
+                        t_turn = float(np.max(valid_coords))
+                    frac_in_tail = float(n_tail) / float(len(valid_coords))
+                    if n_tail > 0:
+                        all_cams_one_side = False
+                    if tail_dir == "prefix":
+                        if cut_coord > t_turn:
+                            cut_coord = t_turn
+                    else:
+                        if cut_coord < t_turn:
+                            cut_coord = t_turn
+
         cut_px = int(round((cut_coord - (x_min if axis == 0 else y_min)) / resolution))
+
+        # Topological check: Specular void (mirror) vs doorway choke
+        # If all camera poses lie on one side of cut (looking at mirror, not crossing through)
+        # and both adjacent orthogonal walls extend past the cut plane -> mark specular_void
+        is_specular_void = False
+        if all_cams_one_side and 0 < cut_px < (width if axis == 0 else height):
+            slice_body = cavity_unpadded[:, :cut_px] if (axis == 0 and tail_dir == "suffix") else (
+                cavity_unpadded[:, cut_px:] if (axis == 0 and tail_dir == "prefix") else (
+                    cavity_unpadded[:cut_px, :] if (axis == 1 and tail_dir == "suffix") else cavity_unpadded[cut_px:, :]
+                )
+            )
+            slice_tail = cavity_unpadded[:, cut_px:] if (axis == 0 and tail_dir == "suffix") else (
+                cavity_unpadded[:, :cut_px] if (axis == 0 and tail_dir == "prefix") else (
+                    cavity_unpadded[cut_px:, :] if (axis == 1 and tail_dir == "suffix") else cavity_unpadded[:cut_px, :]
+                )
+            )
+            if np.count_nonzero(slice_body) > 0 and np.count_nonzero(slice_tail) > 0:
+                axis_proj = 0 if axis == 0 else 1
+                hits_body = np.flatnonzero(np.any(slice_body, axis=axis_proj))
+                hits_tail = np.flatnonzero(np.any(slice_tail, axis=axis_proj))
+                if len(hits_body) and len(hits_tail):
+                    span_body_lo, span_body_hi = hits_body.min(), hits_body.max()
+                    span_tail_lo, span_tail_hi = hits_tail.min(), hits_tail.max()
+                    if (
+                        abs(span_body_lo - span_tail_lo) * resolution <= 0.20
+                        and abs(span_body_hi - span_tail_hi) * resolution <= 0.20
+                    ):
+                        is_specular_void = True
+
+        if is_specular_void:
+            info["doorway_choke_applied"] = False
+            info["specular_void"] = True
+            info["choke_guard_reason"] = "specular_void"
+            return pts, info
+
         mask_cav_unpadded = cavity_unpadded.copy()
         if axis == 0:
             if tail_dir == "prefix":
@@ -965,6 +1046,15 @@ def choke_doorway_tails(
                         t_y0, t_y1 = float(np.min(traj_arr[:, 1])), float(np.max(traj_arr[:, 1]))
                         o_x0, o_x1 = float(np.min(out[:, 0])), float(np.max(out[:, 0]))
                         o_y0, o_y1 = float(np.min(out[:, 1])), float(np.max(out[:, 1]))
+                        encroach_x = max(0.0, float(o_x0 - t_x0), float(t_x1 - o_x1))
+                        encroach_y = max(0.0, float(o_y0 - t_y0), float(t_y1 - o_y1))
+                        max_encroach = max(encroach_x, encroach_y)
+                        is_small_room_5m2 = (
+                            cavity_area_m2 < 5.0
+                            or (pre[0] * pre[1] < 5.0)
+                            or (neck is not None and 0.0 < area_a_neck < 5.0)
+                        )
+
                         if o_x0 > t_x0 + 0.05 or o_x1 < t_x1 - 0.05 or o_y0 > t_y0 + 0.05 or o_y1 < t_y1 - 0.05:
                             bypass_guard = False
                             if (is_narrow_tail or is_narrow_aperture or is_small_room) and len(traj_arr) > 0:
@@ -1005,6 +1095,7 @@ def choke_doorway_tails(
                                         bypass_guard = True
                                     elif is_narrow_tail and frac_in_tail < 0.20 and (L_in_tail < 1.50 or t_span_tail < 0.80):
                                         bypass_guard = True
+
                             if not bypass_guard:
                                 info["doorway_choke_applied"] = False
                                 info["choke_guard_reason"] = "trajectory_encroachment_guard"
@@ -1150,6 +1241,14 @@ def _clip_doorway_profile_tails(
             t_y0, t_y1 = float(np.min(traj_arr[:, 1])), float(np.max(traj_arr[:, 1]))
             o_x0, o_x1 = float(np.min(out[:, 0])), float(np.max(out[:, 0]))
             o_y0, o_y1 = float(np.min(out[:, 1])), float(np.max(out[:, 1]))
+            encroach_x = max(0.0, float(o_x0 - t_x0), float(t_x1 - o_x1))
+            encroach_y = max(0.0, float(o_y0 - t_y0), float(t_y1 - o_y1))
+            max_encroach = max(encroach_x, encroach_y)
+            is_small_room_5m2 = (
+                float(info.get("cavity_area_m2", 0.0)) < 5.0
+                or (pre[0] * pre[1] < 5.0)
+            )
+
             if o_x0 > t_x0 + 0.05 or o_x1 < t_x1 - 0.05 or o_y0 > t_y0 + 0.05 or o_y1 < t_y1 - 0.05:
                 bypass_guard = False
                 if (is_narrow_tail or is_small_room) and len(traj_arr) > 0:
@@ -1525,6 +1624,8 @@ def fit_missing_corner_l_shape(
     if contours:
         cv2.drawContours(cavity, [max(contours, key=cv2.contourArea)], -1, 255, thickness=cv2.FILLED)
     target_mask = np.maximum(cavity, occupied)
+    target_count = int(cv2.countNonZero(target_mask))
+    _line_cache = {}
 
     notch_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (NOTCH_OPEN_PX, NOTCH_OPEN_PX))
     support_open = cv2.morphologyEx(support, cv2.MORPH_OPEN, notch_kernel)
@@ -1537,43 +1638,55 @@ def fit_missing_corner_l_shape(
     def poly_iou(mask: np.ndarray, poly: list[tuple[int, int]]) -> float:
         poly_mask = np.zeros(mask.shape, dtype=np.uint8)
         cv2.fillPoly(poly_mask, [np.asarray(poly, dtype=np.int32)], 255)
-        mask_bool = mask > 0
-        poly_bool = poly_mask > 0
-        union = int(np.logical_or(mask_bool, poly_bool).sum())
-        if union == 0:
+        poly_count = int(cv2.countNonZero(poly_mask))
+        if poly_count == 0:
             return 0.0
-        inter = int(np.logical_and(mask_bool, poly_bool).sum())
-        return float(inter / union)
+        inter = int(cv2.countNonZero(cv2.bitwise_and(mask, poly_mask)))
+        union = target_count + poly_count - inter
+        return float(inter / union) if union > 0 else 0.0
 
     def line_sup(px: int, py: int, qx: int, qy: int) -> float:
+        k = (px, py, qx, qy)
+        if k in _line_cache:
+            return _line_cache[k]
         if py == qy:
-            y = min(max(0, py), H - 1)
-            x_lo = min(max(0, min(px, qx)), W - 1)
-            x_hi = min(max(0, max(px, qx)), W - 1)
+            y = 0 if py < 0 else (H - 1 if py >= H else py)
+            p_lo = px if px <= qx else qx
+            p_hi = qx if px <= qx else px
+            x_lo = 0 if p_lo < 0 else (W - 1 if p_lo >= W else p_lo)
+            x_hi = 0 if p_hi < 0 else (W - 1 if p_hi >= W else p_hi)
             cnt = x_hi - x_lo + 1
             if cnt <= 0:
-                return 0.0
-            r_sum = int(
-                integral_dilated[y + 1, x_hi + 1]
-                - integral_dilated[y, x_hi + 1]
-                - integral_dilated[y + 1, x_lo]
-                + integral_dilated[y, x_lo]
-            )
-            return float(r_sum / cnt)
+                res = 0.0
+            else:
+                r_sum = int(
+                    integral_dilated[y + 1, x_hi + 1]
+                    - integral_dilated[y, x_hi + 1]
+                    - integral_dilated[y + 1, x_lo]
+                    + integral_dilated[y, x_lo]
+                )
+                res = float(r_sum / cnt)
+            _line_cache[k] = res
+            return res
         elif px == qx:
-            x = min(max(0, px), W - 1)
-            y_lo = min(max(0, min(py, qy)), H - 1)
-            y_hi = min(max(0, max(py, qy)), H - 1)
+            x = 0 if px < 0 else (W - 1 if px >= W else px)
+            p_lo = py if py <= qy else qy
+            p_hi = qy if py <= qy else py
+            y_lo = 0 if p_lo < 0 else (H - 1 if p_lo >= H else p_lo)
+            y_hi = 0 if p_hi < 0 else (H - 1 if p_hi >= H else p_hi)
             cnt = y_hi - y_lo + 1
             if cnt <= 0:
-                return 0.0
-            c_sum = int(
-                integral_dilated[y_hi + 1, x + 1]
-                - integral_dilated[y_lo, x + 1]
-                - integral_dilated[y_hi + 1, x]
-                + integral_dilated[y_lo, x]
-            )
-            return float(c_sum / cnt)
+                res = 0.0
+            else:
+                c_sum = int(
+                    integral_dilated[y_hi + 1, x + 1]
+                    - integral_dilated[y_lo, x + 1]
+                    - integral_dilated[y_hi + 1, x]
+                    + integral_dilated[y_lo, x]
+                )
+                res = float(c_sum / cnt)
+            _line_cache[k] = res
+            return res
         else:
             n_samp = max(1, abs(qx - px) + abs(qy - py))
             xs_e = np.clip(np.linspace(px, qx, n_samp).astype(int), 0, W - 1)

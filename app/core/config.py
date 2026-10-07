@@ -80,6 +80,11 @@ class Settings(BaseSettings):
             self.DATABASE_URL = (
                 f"sqlite+aiosqlite:///{os.path.join(self.DATA_DIR, 'server.db')}"
             )
+        if not os.path.isabs(self.MODEL_WEIGHTS_PATH):
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            abs_weights = os.path.join(project_root, self.MODEL_WEIGHTS_PATH)
+            if os.path.exists(abs_weights):
+                self.MODEL_WEIGHTS_PATH = abs_weights
 
         if self.ENV_MODE == "production":
             if self.JWT_SECRET_KEY in {"", "change_me_in_production"} or len(

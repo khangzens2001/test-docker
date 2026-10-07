@@ -258,6 +258,13 @@ class DepthorModelManager:
         return cls._instance
 
     @classmethod
+    def release(cls):
+        with cls._get_lock():
+            cls._instance = None
+        import gc
+        gc.collect()
+
+    @classmethod
     def _init_session(cls, model_path: str):
         if not os.path.exists(model_path):
             env_mode = getattr(settings, "ENV_MODE", "local")
@@ -371,18 +378,25 @@ class DepthCompletionService:
             return (s * x + c) - y
 
         try:
-            # Explicitly specify Huber loss f_scale=0.1 and scale bound s >= 0.001
-            res_opt = least_squares(
-                res,
-                x0=[s0, 0.0],
-                loss="huber",
-                f_scale=0.1,
-                bounds=([1e-3, -np.inf], [np.inf, np.inf]),
-            )
-            s_opt, c_opt = res_opt.x
+            # Explicitly specify Huber loss f_scale=0.1 and scale bound s based on s0
+            lb = max(0.3 * s0, 0.1)
+            ub = min(3.0 * s0, 10.0)
+            if lb < ub:
+                s_init = float(np.clip(s0, lb, ub))
+                res_opt = least_squares(
+                    res,
+                    x0=[s_init, 0.0],
+                    loss="huber",
+                    f_scale=0.1,
+                    bounds=([max(0.3 * s0, 0.1), -np.inf], [min(3.0 * s0, 10.0), np.inf]),
+                )
+                s_opt, c_opt = res_opt.x
+            else:
+                s_opt = max(s0, 0.1)
+                c_opt = 0.0
         except Exception as err:
             logger.warning("Scale optimization failed: %s. Falling back to median ratio.", err)
-            s_opt = s0
+            s_opt = max(s0, 0.1)
             c_opt = 0.0
 
         aligned = s_opt * rel_depth + c_opt

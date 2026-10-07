@@ -32,6 +32,7 @@ from scipy.spatial.transform import Rotation, Slerp
 
 try:
     import cv2
+    cv2.setNumThreads(2)
 except ImportError:
     cv2 = None
 
@@ -63,7 +64,7 @@ from app.services.vio_core.visual_update import (
 from app.services.vio_core.loop_closure import LoopDetector
 from app.services.vio_core.pose_graph_optimizer import PoseGraphOptimizer, apply_pgo_se3_interpolation
 
-PUBLISH_WALL_S = 90.0
+PUBLISH_WALL_S = float(os.environ.get("VIO_WALL_CLOCK_BUDGET_S", "450.0"))
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +294,30 @@ class ServerSideVioEstimator:
                 if {"qx", "qy", "qz", "qw"}.issubset(odometry_df.columns):
                     qs = odometry_df[["qx", "qy", "qz", "qw"]].to_numpy(dtype=float)
                     odo_rots = Rotation.from_quat(qs).as_matrix()
+
+        span_xy_odo = None
+        if odo_pos is not None and len(odo_pos) > 0:
+            finite_odo = np.all(np.isfinite(odo_pos[:, :2]), axis=1)
+            if np.any(finite_odo):
+                span_xy_odo = float(np.max(np.ptp(odo_pos[finite_odo, :2], axis=0)))
+        # Check if small room from SPAD sensor depths
+        is_small_room = False
+        if spad_lidar_df is not None and not spad_lidar_df.empty:
+            d_cols = [c for c in spad_lidar_df.columns if c.startswith("distance_") or c.startswith("d") or c.isdigit()]
+            if d_cols:
+                vals = spad_lidar_df[d_cols].to_numpy(dtype=float)
+                valid_vals = vals[(vals > 0.05) & np.isfinite(vals)]
+                if len(valid_vals) > 0:
+                    depth_p90 = float(np.percentile(valid_vals, 90))
+                    if depth_p90 > 50.0:
+                        depth_p90 = depth_p90 / 1000.0
+                    if depth_p90 <= 2.50:
+                        is_small_room = True
+
+        if is_small_room:
+            r_bound = 2.60
+        else:
+            r_bound = max(1.5 * float(span_xy_odo), 3.5) if (span_xy_odo is not None and np.isfinite(span_xy_odo) and span_xy_odo > 0) else 3.5
 
         sync = EventDrivenTimeSynchronizer()
 
@@ -723,7 +748,7 @@ class ServerSideVioEstimator:
                                 eskf.state.v = (eskf.state.v / v_norm) * target_speed
 
                         v_cur_speed = float(np.linalg.norm(eskf.state.v))
-                        max_allowed_speed = max(s_odo * 1.15, 0.05)
+                        max_allowed_speed = max(1.2 * s_odo, 0.10)
                         if v_cur_speed > max_allowed_speed:
                             eskf.state.v *= (max_allowed_speed / v_cur_speed)
 
@@ -771,10 +796,10 @@ class ServerSideVioEstimator:
                                 else:
                                     q_seg = float(np.clip(1.0 - max(0.0, s_seg - 1.2), 0.0, 1.0))
 
-                                if len(cur_spad_active) >= 50:
+                                if len(all_spad_active_ids) >= 50:
                                     w_odo = 0.0
                                 else:
-                                    w_odo = float(np.clip(0.80 - 0.20 * o_node, 0.50, 0.85)) * q_seg
+                                    w_odo = float(np.clip(0.80 - 0.20 * o_node, 0.35, 0.85)) * max(q_seg, 0.20)
                                 if w_odo > 0.0:
                                     if R_vio_odo is not None:
                                         dp_w_odo = R_vio_odo @ dp_raw
@@ -787,6 +812,11 @@ class ServerSideVioEstimator:
                                         if meas_norm > 1e-4 and d_odo > 1e-4:
                                             d_eff = (1.0 - w_odo) * meas_norm + w_odo * d_odo
                                             t_rel_meas = (t_rel_meas / meas_norm) * d_eff
+                                meas_norm = float(np.linalg.norm(t_rel_meas))
+                                d_raw_norm = float(np.linalg.norm(dp_raw))
+                                max_step = max(1.2 * d_raw_norm, 0.10 * dt_seg)
+                                if meas_norm > max_step and meas_norm > 1e-4:
+                                    t_rel_meas = t_rel_meas * (max_step / meas_norm)
                                 t_rel_meas[2] = float(np.clip(t_rel_meas[2], -0.20, 0.20))
 
                             info_trans = min(50.0, 10.0 + 40.0 * o_node)
@@ -869,7 +899,7 @@ class ServerSideVioEstimator:
                                         cos_ang = float(np.clip((np.trace(R_rel.T @ R_loop) - 1.0) / 2.0, -1.0, 1.0))
                                         ang_deg = float(np.degrees(np.arccos(cos_ang)))
                                         t_norm = float(np.linalg.norm(t_loop))
-                                        loop_t_norm_max = max(3.5, (float(span_odo) * 1.2) if (span_odo is not None and np.isfinite(span_odo)) else 3.5)
+                                        loop_t_norm_max = 2.60 if is_small_room else max(3.5, (float(span_odo) * 1.2) if (span_odo is not None and np.isfinite(span_odo)) else 3.5)
                                         logger.info("LOOP CANDIDATE: %d -> %d, inliers=%d, t_norm=%.3f, max=%.3f, t_err=%.3f, ang_deg=%.2f", past_node_id, query_node_id, inliers, t_norm, loop_t_norm_max, t_err, ang_deg)
                                         # Physical room bound: adaptively bounded by scan odometry scale
                                         if t_norm <= loop_t_norm_max:
@@ -946,10 +976,10 @@ class ServerSideVioEstimator:
                     else:
                         q_seg = float(np.clip(1.0 - max(0.0, s_seg - 1.2), 0.0, 1.0))
 
-                    if len(cur_spad_active) >= 50:
+                    if len(all_spad_active_ids) >= 50:
                         w_odo = 0.0
                     else:
-                        w_odo = float(np.clip(0.80 - 0.20 * o_node, 0.50, 0.85)) * q_seg
+                        w_odo = float(np.clip(0.80 - 0.20 * o_node, 0.35, 0.85)) * max(q_seg, 0.20)
                     if w_odo > 0.0:
                         if R_vio_odo is not None:
                             dp_w_odo = R_vio_odo @ dp_raw
@@ -962,6 +992,11 @@ class ServerSideVioEstimator:
                             if meas_norm > 1e-4 and d_odo > 1e-4:
                                 d_eff = (1.0 - w_odo) * meas_norm + w_odo * d_odo
                                 t_rel_meas = (t_rel_meas / meas_norm) * d_eff
+                    meas_norm = float(np.linalg.norm(t_rel_meas))
+                    d_raw_norm = float(np.linalg.norm(dp_raw))
+                    max_step = max(1.2 * d_raw_norm, 0.10 * dt_seg)
+                    if meas_norm > max_step and meas_norm > 1e-4:
+                        t_rel_meas = t_rel_meas * (max_step / meas_norm)
                     t_rel_meas[2] = float(np.clip(t_rel_meas[2], -0.20, 0.20))
 
                 info_trans = min(50.0, 10.0 + 40.0 * o_node)
@@ -1047,8 +1082,8 @@ class ServerSideVioEstimator:
                         t_curr = t_prev_node + R_prev_node @ t_ij
                         t_curr[2] = float(np.clip(t_curr[2], -1.60, 1.20))
                         d_xy = float(np.linalg.norm(t_curr[:2] - p0_init[:2]))
-                        if d_xy > 2.60:
-                            t_curr[:2] = p0_init[:2] + (t_curr[:2] - p0_init[:2]) * (2.60 / d_xy)
+                        if d_xy > r_bound:
+                            t_curr[:2] = p0_init[:2] + (t_curr[:2] - p0_init[:2]) * (r_bound / d_xy)
                         pgo.nodes[nid] = (R_curr, t_curr)
                     else:
                         pgo.nodes[nid] = (R_curr, t_filter[s_idx].copy())
@@ -1103,9 +1138,9 @@ class ServerSideVioEstimator:
 
             t_final[:, 2] = np.clip(t_final[:, 2], -1.60, 1.20)
             d_xy_final = np.linalg.norm(t_final[:, :2] - t_final[0, :2], axis=1)
-            mask_rad = d_xy_final > 2.60
+            mask_rad = d_xy_final > r_bound
             if np.any(mask_rad):
-                scale = 2.60 / d_xy_final[mask_rad, None]
+                scale = r_bound / d_xy_final[mask_rad, None]
                 t_final[mask_rad, :2] = t_final[0, :2] + (t_final[mask_rad, :2] - t_final[0, :2]) * scale
 
             for idx, snap in enumerate(camera_snapshots):
@@ -1526,6 +1561,30 @@ def _odometry_aabb_span(session_dir: str) -> tuple[float | None, int]:
     return _aabb_span_xyz(xyz[finite]), n
 
 
+def _odometry_aabb_span_decoupled(session_dir: str) -> tuple[float | None, float | None, int]:
+    path = os.path.join(session_dir, "processed_odometry.csv")
+    if not os.path.isfile(path):
+        path = os.path.join(session_dir, "odometry.csv")
+    if not os.path.isfile(path):
+        return None, None, 0
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None, None, 0
+    if not {"x", "y", "z"}.issubset(df.columns):
+        return None, None, 0
+    try:
+        xyz = df[["x", "y", "z"]].to_numpy(dtype=np.float64)
+    except (ValueError, TypeError):
+        return None, None, 0
+    finite = np.all(np.isfinite(xyz), axis=1)
+    n = int(np.count_nonzero(finite))
+    if n < TRAJECTORY_SPAN_MIN_ODO_POSES:
+        return None, None, n
+    span_xy, span_z = _aabb_span_decoupled(xyz[finite])
+    return span_xy, span_z, n
+
+
 def _make_default_gates() -> dict[str, Any]:
     return {
         "trajectory_rows": {"ok": False, "n": 0},
@@ -1859,8 +1918,9 @@ def publish_session_vio(session_dir: str) -> bool:
             )
         span_v = _aabb_span_xyz(vio_xyz)
         span_xy_v, span_z_v = _aabb_span_decoupled(vio_xyz)
-        span_o, _n_odo = _odometry_aabb_span(session_dir)
-        if span_o is None:
+        span_xy_o, span_z_o, _n_odo = _odometry_aabb_span_decoupled(session_dir)
+        span_o, _ = _odometry_aabb_span(session_dir)
+        if span_xy_o is None:
             gates["trajectory_span"] = {
                 "ok": bool(span_z_v <= 2.50),
                 "span_xyz_m": float(span_v),
@@ -1871,15 +1931,15 @@ def publish_session_vio(session_dir: str) -> bool:
                 "skipped": True,
             }
         else:
-            thresh = max(TRAJECTORY_SPAN_RATIO * float(span_o), float(span_o) + TRAJECTORY_SPAN_ABS_M)
-            ok_span = (not (float(span_xy_v) > thresh)) and (span_z_v <= 2.50)
-            ratio = (float(span_v) / float(span_o)) if float(span_o) > 0.0 else None
+            thresh_xy = max(1.8 * float(span_xy_o), float(span_xy_o) + 0.8)
+            ok_span = (not (float(span_xy_v) > thresh_xy)) and (span_z_v <= 2.50)
+            ratio = (float(span_xy_v) / float(span_xy_o)) if float(span_xy_o) > 0.0 else None
             gates["trajectory_span"] = {
                 "ok": bool(ok_span),
                 "span_xyz_m": float(span_v),
                 "span_xy_m": float(span_xy_v),
                 "span_z_m": float(span_z_v),
-                "span_odo_m": float(span_o),
+                "span_odo_m": float(span_xy_o),
                 "span_ratio": ratio,
                 "skipped": False,
             }

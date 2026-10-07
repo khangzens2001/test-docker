@@ -1,6 +1,10 @@
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional, Self
+from typing import Any, Optional
+try:
+    from typing import Self
+except ImportError:
+    from typing_extensions import Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 

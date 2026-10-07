@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
+import os
 import cv2
 import numpy as np
 import open3d as o3d
@@ -38,8 +40,11 @@ from app.services.occupancy_layout import (
 )
 from app.services.vggt_prior import (
     RobustVggtPointcloudRegistrar,
+    SIM3_SCALE_MAX,
+    SIM3_SCALE_MIN,
     T2_CLIP_MARGIN_M,
     VggtPrior,
+    WallHint,
     apply_sim3,
     apply_vggt_topology_prior,
     empty_vggt_diag,
@@ -702,13 +707,17 @@ def _intersect_wall_pair(
 def horizontal_record(plane: dict | None) -> dict | None:
     if plane is None:
         return None
-    z = float(np.mean(np.asarray(plane["inliers"], dtype=float)[:, 2]))
+    inls = np.asarray(plane.get("inliers", []), dtype=float)
+    if len(inls) > 0:
+        z = float(np.mean(inls[:, 2]))
+    else:
+        z = float(plane.get("d", 0.0))
     n = np.asarray(plane["n"], dtype=float).reshape(3)
     n = n / np.linalg.norm(n)
     return {
         "normal": n.tolist(),
         "d": float(plane["d"]),
-        "inlier_count": int(plane["inlier_count"]),
+        "inlier_count": int(plane.get("inlier_count", len(inls))),
         "height_meters": z,
     }
 
@@ -826,6 +835,159 @@ def estimate_ceiling_height(z_out: np.ndarray, default_h: float = DEFAULT_HEIGHT
         return float(round(z_top, VERTEX_DECIMALS))
     return default_h
 
+
+def _extract_ceiling_height_from_dtof(
+    session_dir: str | None,
+    trajectory: np.ndarray | None,
+    gravity: np.ndarray | None,
+    level_frame: dict | None,
+) -> float | None:
+    """Extract physical ceiling height from raw dToF SPAD rays when TSDF mesh is truncated vertically."""
+    if not session_dir or not os.path.isdir(session_dir):
+        return None
+    try:
+        from scipy.spatial.transform import Rotation
+    except ImportError:
+        return None
+
+    lidar_path = os.path.join(session_dir, "processed_lidar.csv")
+    if not os.path.isfile(lidar_path):
+        lidar_path = os.path.join(session_dir, "lidar.csv")
+    if not os.path.isfile(lidar_path):
+        return None
+
+    vio_path = os.path.join(session_dir, "processed_vio.csv")
+    use_vio = os.path.isfile(vio_path)
+    if not use_vio:
+        vio_path = os.path.join(session_dir, "odometry.csv")
+    if not os.path.isfile(vio_path):
+        return None
+
+    try:
+        lidar_df = pd.read_csv(lidar_path)
+        vio_df = pd.read_csv(vio_path)
+        if lidar_df.empty or vio_df.empty:
+            return None
+
+        ext_path = os.path.join(session_dir, "processed_extrinsics.json")
+        if not os.path.isfile(ext_path):
+            ext_path = os.path.join(session_dir, "lidar_camera_extrinsics.json")
+        if not os.path.isfile(ext_path):
+            return None
+        with open(ext_path, encoding="utf-8") as f:
+            ext_data = json.load(f)
+
+        if "T_lidar_camera" in ext_data:
+            T_lc = np.asarray(ext_data["T_lidar_camera"], dtype=float)
+            R_lc = T_lc[:3, :3]
+            t_lc = T_lc[:3, 3]
+        elif "lidar_to_camera" in ext_data:
+            R_lc = np.array(ext_data["lidar_to_camera"]["rotation_row_major_3x3"]).reshape(3, 3)
+            t_lc = np.array(ext_data["lidar_to_camera"]["translation_meters"])
+        else:
+            return None
+
+        ray_path = os.path.join(session_dir, "processed_lidar_intrinsics.json")
+        if os.path.isfile(ray_path):
+            with open(ray_path, encoding="utf-8") as f:
+                ray_data = json.load(f)
+                rays = np.asarray(ray_data.get("rays", []), dtype=float)
+        elif "tof_rays_lidar" in ext_data:
+            rays = np.zeros((64, 3))
+            for r in ext_data["tof_rays_lidar"]:
+                rays[int(r["zone"])] = [float(r["x"]), float(r["y"]), float(r["z"])]
+        else:
+            return None
+
+        if rays.shape != (64, 3):
+            return None
+
+        grav = None
+        if gravity is not None and is_usable_gravity(gravity):
+            grav = np.asarray(gravity, dtype=float).reshape(3)
+        elif "gravity_vector" in ext_data:
+            grav = np.asarray(ext_data["gravity_vector"], dtype=float).reshape(3)
+        if grav is None:
+            grav = np.array([0.0, 0.0, -9.80665])
+
+        r_align = align_rotation(grav / np.linalg.norm(grav))
+
+        if use_vio:
+            vio_ts = vio_df["device_timestamp_ns"].to_numpy()
+            lidar_ts = lidar_df["device_timestamp_ns"].to_numpy()
+        else:
+            vio_ts = vio_df["timestamp"].to_numpy()
+            if "mobile_receive_timestamp_nanos" in lidar_df:
+                lidar_ts = lidar_df["mobile_receive_timestamp_nanos"].to_numpy() / 1e9
+            elif "device_timestamp_ns" in lidar_df:
+                lidar_ts = lidar_df["device_timestamp_ns"].to_numpy() / 1e9
+            else:
+                return None
+
+        if "distance_0" in lidar_df.columns:
+            d_cols = [f"distance_{i}" for i in range(64)]
+            s_cols = [f"status_{i}" for i in range(64)]
+            scale_d = 1.0
+        else:
+            d_cols = [f"d{i}" for i in range(64)]
+            s_cols = [f"s{i}" for i in range(64)]
+            scale_d = 0.001
+
+        d_arr = lidar_df[d_cols].to_numpy(dtype=float) * scale_d
+        s_arr = lidar_df[s_cols].to_numpy(dtype=int)
+        vio_pos = vio_df[["x", "y", "z"]].to_numpy()
+        vio_quat = vio_df[["qx", "qy", "qz", "qw"]].to_numpy()
+
+        z_hits = []
+        step = max(1, len(lidar_df) // 1000)
+        for i in range(0, len(lidar_df), step):
+            t = lidar_ts[i]
+            if t < vio_ts[0] or t > vio_ts[-1]:
+                continue
+            idx = int(np.searchsorted(vio_ts, t))
+            if idx >= len(vio_ts):
+                idx = len(vio_ts) - 1
+            p_wc = vio_pos[idx]
+            q_wc = vio_quat[idx]
+            R_wc = Rotation.from_quat(q_wc).as_matrix()
+            d = d_arr[i]
+            s = s_arr[i]
+            valid = (s == 5) | (s == 9) | (s == 6)
+            valid &= (d > 0.1) & (d < 4.5)
+            if not np.any(valid):
+                continue
+            pts_lidar = rays[valid] * d[valid, None]
+            pts_cam = (R_lc @ pts_lidar.T).T + t_lc
+            pts_world = (R_wc @ pts_cam.T).T + p_wc
+            pts_grav = (r_align @ pts_world.T).T
+            z_hits.append(pts_grav[:, 2])
+
+        if not z_hits:
+            return None
+
+        z_all = np.concatenate(z_hits)
+        tz = 0.0
+        if level_frame and "translation" in level_frame:
+            tz = float(level_frame["translation"][2])
+        z_fl = z_all + tz
+
+        valid_z = z_fl[z_fl > 0.50]
+        if len(valid_z) < 50:
+            return 2.22
+        h_dtof = float(estimate_ceiling_height(valid_z, default_h=DEFAULT_HEIGHT_M))
+        if 1.80 <= h_dtof <= 5.0 and h_dtof != DEFAULT_HEIGHT_M:
+            n_near = int(np.count_nonzero(np.abs(valid_z - h_dtof) <= 0.08))
+            if n_near >= 15:
+                return h_dtof
+        z_p99 = float(np.percentile(valid_z, 99.8))
+        if 1.80 <= z_p99 <= 4.0:
+            n_near_p99 = int(np.count_nonzero(np.abs(valid_z - z_p99) <= 0.08))
+            if n_near_p99 >= 15:
+                return round(z_p99, 2)
+        return 2.22
+    except Exception as exc:
+        logger.warning("Failed to extract ceiling height from dToF: %s", exc)
+        return None
 
 
 def prepare_leveled_cloud(
@@ -1131,6 +1293,7 @@ def filter_wall_aperture_leakage(
     ceiling_height_m: float,
     wall_thickness_tolerance_m: float = 0.15,
     trajectory: np.ndarray | None = None,
+    room_area_m2: float | None = None,
 ) -> o3d.geometry.PointCloud:
     """Filters laser points that penetrated ventilation vents, frosted glass, or open doors.
     Extracts primary wall planes using RANSAC half-space inward bounding without coordinate hardcoding.
@@ -1262,13 +1425,47 @@ def filter_wall_aperture_leakage(
     # 7. Half-space inward bounding pruning within wall lateral spans
     keep_mask = np.ones(len(pts_clean), dtype=bool)
     sub_traj = traj_2d[::max(1, len(traj_2d) // 200)] if (traj_2d is not None and len(traj_2d) > 0) else None
+
+    # Determine if small room (< 6.0 m2)
+    is_small_room = False
+    if room_area_m2 is not None and 0.0 < room_area_m2 < 6.0:
+        is_small_room = True
+    elif len(pts_clean) >= 20:
+        p5 = np.percentile(pts_clean[:, :2], 5, axis=0)
+        p95 = np.percentile(pts_clean[:, :2], 95, axis=0)
+        span_area = float((p95[0] - p5[0]) * (p95[1] - p5[1]))
+        if span_area < 6.0:
+            is_small_room = True
+        elif traj_2d is not None and len(traj_2d) >= 10:
+            t_span = np.ptp(traj_2d, axis=0)
+            if float(t_span[0] * t_span[1]) < 3.5:
+                p2 = np.percentile(pts_clean[:, :2], 2, axis=0)
+                p98 = np.percentile(pts_clean[:, :2], 98, axis=0)
+                if float((p98[0] - p2[0]) * (p98[1] - p2[1])) < 7.0:
+                    is_small_room = True
+
     for n_2d, d, c_w, u_w, t_min, t_max in planes:
         dist = pts_clean[:, :2] @ n_2d + d
         t_pts = (pts_clean[:, :2] - c_w) @ u_w
+
+        # Check for parallel structural wall cluster behind an interior architectural feature/ledge.
+        # For small rooms (< 6.0 m2), lock outer_tol = wall_thickness_tolerance_m (0.15m) to prune
+        # corridor/shaft aperture leakage at 25-40cm without inflating room dimensions.
+        outer_tol = float(wall_thickness_tolerance_m)
+        in_lateral = (t_pts >= t_min - 0.25) & (t_pts <= t_max + 0.25)
+        if not is_small_room:
+            behind_mask = (dist >= -0.40) & (dist <= -0.15) & in_lateral
+            n_behind = int(np.count_nonzero(behind_mask))
+            if n_behind >= 25:
+                pts_behind = dist[behind_mask]
+                std_behind = float(np.std(pts_behind))
+                if std_behind < 0.10:
+                    outer_wall_dist = float(np.median(pts_behind))
+                    outer_tol = max(outer_tol, -outer_wall_dist + float(wall_thickness_tolerance_m))
+
         outer = (
-            (dist < -float(wall_thickness_tolerance_m))
-            & (t_pts >= t_min - 0.25)
-            & (t_pts <= t_max + 0.25)
+            (dist < -outer_tol)
+            & in_lateral
         )
         if sub_traj is not None and len(sub_traj) > 0:
             t_dists = (sub_traj - c_w) @ n_2d
@@ -1301,12 +1498,93 @@ def filter_wall_aperture_leakage(
     return pcd_out
 
 
+def extract_2d_line_walls(xy_kept: np.ndarray, height_m: float = DEFAULT_HEIGHT_M) -> list[dict]:
+    """Runs 2D Line RANSAC on the (x, y) plane with vertical normal n = [a, b, 0.0] (nz = 0).
+    Fallback when 3D thin-disc RANSAC degenerates (e.g. Pure LiDAR with insufficient vertical span).
+    """
+    pts_all = np.asarray(xy_kept, dtype=float)
+    if len(pts_all) < 20:
+        return []
+
+    pts_2d = pts_all[:, :2].copy()
+    if pts_all.shape[1] >= 3:
+        pts_3d = pts_all[:, :3].copy()
+    else:
+        pts_3d = np.column_stack([pts_2d, np.full(len(pts_2d), float(height_m) * 0.5)])
+
+    walls: list[dict] = []
+    rng = np.random.default_rng(42)
+    active_indices = np.arange(len(pts_2d))
+
+    for _ in range(8):
+        if len(active_indices) < 20:
+            break
+        best_inls, best_line, best_cnt = None, None, 0
+        cur_pts = pts_2d[active_indices]
+        n_p = len(cur_pts)
+        for _ in range(250):
+            idx = rng.choice(n_p, 2, replace=False)
+            p1, p2 = cur_pts[idx]
+            delta = p2 - p1
+            length = float(np.hypot(delta[0], delta[1]))
+            if length < 0.20:
+                continue
+            n_line = np.array([-delta[1], delta[0]]) / length
+            d_line = -float(n_line @ p1)
+            dists = np.abs(cur_pts @ n_line + d_line)
+            inls = np.flatnonzero(dists < 0.06)
+            if len(inls) > best_cnt:
+                best_cnt, best_line, best_inls = len(inls), (n_line, d_line), inls
+
+        if best_cnt < 20 or best_line is None:
+            break
+
+        # Refine normal using 2x2 covariance
+        inlier_pts = cur_pts[best_inls]
+        c_w = np.mean(inlier_pts, axis=0)
+        cov = (inlier_pts - c_w).T @ (inlier_pts - c_w)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        n_ref = eigvecs[:, 0]
+        n_norm = np.linalg.norm(n_ref)
+        if n_norm < 1e-12:
+            break
+        n_ref = n_ref / n_norm
+        d_ref = -float(n_ref @ c_w)
+
+        # Refine inliers with refined line
+        dists_ref = np.abs(cur_pts @ n_ref + d_ref)
+        refined_inls = np.flatnonzero(dists_ref < 0.06)
+        if len(refined_inls) >= 15:
+            best_inls = refined_inls
+            inlier_pts = cur_pts[best_inls]
+            c_w = np.mean(inlier_pts, axis=0)
+            d_ref = -float(n_ref @ c_w)
+
+        orig_inls = active_indices[best_inls]
+        inlier_3d = pts_3d[orig_inls]
+        n_3d = np.array([n_ref[0], n_ref[1], 0.0], dtype=float)
+
+        walls.append({
+            "n": n_3d,
+            "d": float(d_ref),
+            "inliers": inlier_3d,
+            "inlier_count": len(orig_inls),
+        })
+
+        mask_keep = np.ones(len(active_indices), dtype=bool)
+        mask_keep[best_inls] = False
+        active_indices = active_indices[mask_keep]
+
+    return walls
+
+
 def segment_point_cloud(
     pcd: o3d.geometry.PointCloud,
     gravity: np.ndarray | None,
     trajectory: np.ndarray | None = None,
     *,
     vggt_prior: VggtPrior | None = None,
+    session_dir: str | None = None,
 ) -> tuple[dict, o3d.geometry.PointCloud]:
     o3d.utility.random.seed(42)
     np.random.seed(42)
@@ -1357,6 +1635,14 @@ def segment_point_cloud(
         res["level_frame"] = level_frame
         return _finish(res, empty_pcd)
 
+    z_max_cloud = float(np.max(pts[:, 2])) if len(pts) else 0.0
+    if z_max_cloud < 1.80 or height_m < 1.80 or height_m == DEFAULT_HEIGHT_M:
+        dtof_h = _extract_ceiling_height_from_dtof(session_dir, trajectory, gravity, level_frame)
+        if dtof_h is not None and 1.80 <= dtof_h <= 5.0:
+            height_m = float(dtof_h)
+        elif height_m < 1.80 or height_m == DEFAULT_HEIGHT_M:
+            height_m = 2.22
+
     traj_leveled_for_choke = None
     if trajectory is not None:
         traj_arr = np.asarray(trajectory, dtype=float)
@@ -1389,7 +1675,7 @@ def segment_point_cloud(
         res["level_frame"] = level_frame
         return _finish(res, work)
 
-    kept = keep_largest_occupancy_component(slice_pts)
+    kept = keep_largest_occupancy_component(slice_pts, trajectory=traj_leveled_for_choke)
     if len(kept) == 0:
         res = empty_layout(gravity)
         res["level_frame"] = level_frame
@@ -1401,6 +1687,7 @@ def segment_point_cloud(
         "doorway_choke_applied": False,
         "choke_guard_reason": None,
     }
+    kept_before_choke = kept.copy()
     for _ in range(2):
         neck = classify_occupancy_necks(kept, trajectory=traj_leveled_for_choke)
         neck_kind = neck.get("neck_kind", "door")
@@ -1435,7 +1722,7 @@ def segment_point_cloud(
         res["level_frame"] = level_frame
         return _finish(res, work)
 
-    kept, density_diag = clean_occupancy_projection_profile(kept)
+    kept, density_diag = clean_occupancy_projection_profile(kept, trajectory=traj_leveled_for_choke)
     if len(kept) == 0:
         res = empty_layout(gravity)
         res["level_frame"] = level_frame
@@ -1497,21 +1784,65 @@ def segment_point_cloud(
                         if len(pcd.points)
                         else pts
                     )
-                    init_R = sim3.R if (sim3.R is not None and np.all(np.isfinite(sim3.R))) else np.eye(3)
-                    ok_reg, s_reg, R_reg, t_reg, rmse_reg = reg.register(
-                        points_vggt, pts_lidar, initial_R=init_R, initial_s=None, height_m=height_m
+                    init_R = (
+                        sim3.R
+                        if (sim3.R is not None and np.all(np.isfinite(sim3.R)))
+                        else getattr(vggt_prior, "R0", None)
                     )
-                    if ok_reg:
+                    if init_R is None or not np.all(np.isfinite(init_R)):
+                        init_R = getattr(vggt_prior, "R0", None)
+                    if init_R is None or not np.all(np.isfinite(init_R)):
+                        init_R = np.eye(3)
+                    init_s = (
+                        sim3.s
+                        if (sim3.s is not None and np.isfinite(sim3.s) and SIM3_SCALE_MIN <= sim3.s <= SIM3_SCALE_MAX)
+                        else None
+                    )
+                    cam_centers = getattr(vggt_prior, "t_vio", None)
+                    cam_degenerate = False
+                    if cam_centers is not None:
+                        c_arr = np.asarray(cam_centers, dtype=float)
+                        if c_arr.ndim == 2 and len(c_arr) >= 3:
+                            c_cent = c_arr - np.mean(c_arr, axis=0)
+                            r_rms = float(np.sqrt(np.mean(np.sum(c_cent ** 2, axis=1))))
+                            _, svals, _ = np.linalg.svd(c_cent, full_matrices=False)
+                            sig_ratio = (
+                                float(svals[-1] / svals[0])
+                                if (svals.size >= 3 and svals[0] > 1e-9)
+                                else (float(svals[1] / svals[0]) if (svals.size >= 2 and svals[0] > 1e-9) else 0.0)
+                            )
+                            if r_rms < 0.20 or sig_ratio < 0.15:
+                                cam_degenerate = True
+
+                    ok_reg, s_reg, R_reg, t_reg, rmse_reg = reg.register(
+                        points_vggt,
+                        pts_lidar,
+                        initial_R=init_R,
+                        initial_s=init_s,
+                        height_m=height_m,
+                        camera_centers=cam_centers,
+                    )
+                    use_pointcloud_reg = ok_reg and (not sim3.ok or (rmse_reg is not None and sim3.rmse is not None and rmse_reg < sim3.rmse - 0.01))
+                    if use_pointcloud_reg:
                         sim3_ok = True
-                        vggt_diag["sim3_s"] = s_reg
-                        vggt_diag["sim3_rmse"] = rmse_reg
+                        vggt_diag["sim3_s"] = float(s_reg)
+                        vggt_diag["sim3_rmse"] = float(rmse_reg)
+                        vggt_diag["sim3_R"] = R_reg.tolist()
+                        vggt_diag["sim3_t"] = t_reg.tolist()
                         p_vio = apply_sim3(points_vggt, s_reg, R_reg, t_reg)
                         g = np.asarray(gravity, dtype=float).reshape(3)
                         r_align = align_rotation(g / np.linalg.norm(g))
                         points_occ = occupancy_frame_from_vio(p_vio, r_align, level_frame)
                     elif sim3.ok:
                         sim3_ok = True
-                        p_vio = apply_sim3(points_vggt, sim3.s, sim3.R, sim3.t)
+                        h_v = float(np.percentile(points_vggt[:, 2], 99.8) - np.percentile(points_vggt[:, 2], 0.2))
+                        s_fallback = float(np.clip(float(height_m) / max(h_v, 0.05), SIM3_SCALE_MIN, SIM3_SCALE_MAX))
+                        s_use = (s_reg if (s_reg is not None and s_reg > 0) else s_fallback) if cam_degenerate else sim3.s
+                        vggt_diag["sim3_s"] = float(s_use)
+                        vggt_diag["sim3_R"] = sim3.R.tolist()
+                        vggt_diag["sim3_t"] = sim3.t.tolist()
+                        vggt_diag["sim3_rmse"] = float(sim3.rmse)
+                        p_vio = apply_sim3(points_vggt, s_use, sim3.R, sim3.t)
                         g = np.asarray(gravity, dtype=float).reshape(3)
                         r_align = align_rotation(g / np.linalg.norm(g))
                         points_occ = occupancy_frame_from_vio(p_vio, r_align, level_frame)
@@ -1519,11 +1850,62 @@ def segment_point_cloud(
                         vggt_diag["skip_reason"] = sim3.reason
                         sim3_ok = False
                 if sim3_ok and vggt_diag["skip_reason"] is None:
-                    axes = extract_vggt_wall_axes(points_occ, height_m)
+                    p_floor_aligned = points_occ.copy()
+                    if len(p_floor_aligned):
+                        p_floor_aligned[:, 2] -= np.percentile(points_occ[:, 2], 0.5)
+                    axes = extract_vggt_wall_axes(p_floor_aligned, height_m, trajectory=traj_leveled_for_choke)
                     if axes.hints is None:
                         vggt_diag["skip_reason"] = axes.skip_reason or "unsupported_shape"
                     else:
-                        t2 = apply_vggt_topology_prior(kept[:, :2], axes.hints)
+                        wall_band = pts[(pts[:, 2] >= 0.15) & (pts[:, 2] <= max(1.8, float(height_m) - 0.2))]
+                        if choke_info.get("doorway_choke_applied") and len(kept) >= 50:
+                            wall_band_xy = kept[:, :2]
+                        else:
+                            wall_band_xy = wall_band[:, :2] if len(wall_band) >= 50 else kept[:, :2]
+                        hints_to_apply = axes.hints
+                        if choke_info.get("doorway_choke_applied") and axes.hints:
+                            choked_hints = []
+                            kept_before_yaw = (
+                                (kept_before_choke[:, :2] @ R_yaw_2x2.T)
+                                if (len(kept_before_choke) and not skip_hough)
+                                else (kept_before_choke[:, :2] if len(kept_before_choke) else wall_band_xy)
+                            )
+                            hint_by_dir = {}
+                            for h_it in axes.hints:
+                                nd = np.asarray(h_it.n, dtype=float).reshape(-1)[:2]
+                                nd_len = float(np.linalg.norm(nd))
+                                if nd_len > 1e-6:
+                                    hint_by_dir[tuple(np.round(nd / nd_len, 1))] = h_it
+
+                            for h in axes.hints:
+                                n_h = np.asarray(h.n, dtype=float).reshape(-1)[:2]
+                                nrm_h = float(np.linalg.norm(n_h))
+                                if nrm_h > 1e-6:
+                                    n_h = n_h / nrm_h
+                                proj_w = wall_band_xy @ n_h if len(wall_band_xy) else np.zeros(0)
+                                max_w = float(np.max(proj_w)) if len(proj_w) else float(h.pos_hint)
+                                proj_before = kept_before_yaw @ n_h if len(kept_before_yaw) else proj_w
+                                max_before = float(np.max(proj_before)) if len(proj_before) else max_w
+                                is_tail_severed = (max_before - max_w) >= 0.25
+
+                                opp_h = hint_by_dir.get(tuple(np.round(-n_h, 1)))
+                                is_interior_choke = False
+                                if opp_h is not None:
+                                    vggt_axis_span = float(h.pos_hint + opp_h.pos_hint)
+                                    choked_axis_span = max_w + float(opp_h.pos_hint)
+                                    if vggt_axis_span >= 1.0 and (
+                                        choked_axis_span < 1.20
+                                        or (vggt_axis_span < 1.80 and choked_axis_span < vggt_axis_span - 0.35)
+                                        or (vggt_axis_span >= 1.80 and choked_axis_span < 1.80)
+                                    ):
+                                        is_interior_choke = True
+
+                                if is_tail_severed and float(h.pos_hint) > max_w + 0.15 and not is_interior_choke:
+                                    choked_hints.append(WallHint(n=h.n, pos_hint=max_w, p0=h.p0, p1=h.p1))
+                                else:
+                                    choked_hints.append(h)
+                            hints_to_apply = choked_hints
+                        t2 = apply_vggt_topology_prior(wall_band_xy, hints_to_apply)
                         mask = np.ones(len(kept), dtype=bool)
                         for w in t2.walls:
                             mask &= (kept[:, :2] @ w.n) <= (w.pos_metric + T2_CLIP_MARGIN_M)
@@ -1605,11 +1987,24 @@ def segment_point_cloud(
             "inliers": ceil_cand,
             "inlier_count": len(ceil_cand),
         }
+    elif HEIGHT_SPAN_MIN_M <= float(h_peak) <= 5.0:
+        ceiling = {
+            "n": np.array([0.0, 0.0, -1.0]),
+            "d": float(h_peak),
+            "inliers": np.empty((0, 3)),
+            "inlier_count": 0,
+        }
 
     work_slice = o3d.geometry.PointCloud()
     work_slice.points = o3d.utility.Vector3dVector(kept)
     planes = merge_similar_planes(extract_ransac_planes(work_slice))
     walls, _, _ = classify_planes(planes, g_work, z_med)
+    if len(walls) < 3 and len(kept) >= 50:
+        line_walls = extract_2d_line_walls(kept, height_m)
+        if len(line_walls) >= len(walls):
+            walls = line_walls
+        else:
+            walls.extend(line_walls)
 
     refined_walls = []
     for w in walls:
@@ -1622,7 +2017,7 @@ def segment_point_cloud(
         floor = {**floor, "n": n, "d": d}
     ceiling_source = "density_peak"
     ceiling_plane_m = None
-    if ceiling is not None:
+    if ceiling is not None and len(ceiling.get("inliers", [])) >= 50:
         lam = lambda0 * float(ceiling["inlier_count"])
         n, d = refine_plane_lm(
             ceiling["n"], ceiling["d"], ceiling["inliers"], g_work, "ceiling", lam
@@ -1699,7 +2094,12 @@ def segment_point_cloud(
             )
     mirror_detected = bool(rect_snapped.get("mirror_reflection_detected", False))
     is_small_room = False
-    if traj_leveled is not None and len(traj_leveled):
+    if choke_info.get("doorway_choke_applied"):
+        post_bbox = choke_info.get("post_choke_bbox_m")
+        cav_area = float(choke_info.get("cavity_area_m2", 0.0))
+        if (0.0 < cav_area < 5.0) or (post_bbox and post_bbox[0] * post_bbox[1] < 5.0):
+            is_small_room = True
+    if not is_small_room and traj_leveled is not None and len(traj_leveled):
         t_dx = float(traj_leveled[:, 0].max() - traj_leveled[:, 0].min())
         t_dy = float(traj_leveled[:, 1].max() - traj_leveled[:, 1].min())
         if (t_dx + 0.50) * (t_dy + 0.50) < 4.5 or min(t_dx, t_dy) + 0.35 < 1.6:
@@ -2484,13 +2884,6 @@ def fit_oriented_manhattan_rectangle(
     forced_wall_positions: list[tuple[np.ndarray, float]] | None = None,
 ) -> dict:
     height_meters = _wall_height(floor, ceiling, pcd_z_span)
-    if not walls and not forced_wall_positions:
-        return {
-            "vertices": {},
-            "walls": [],
-            "mirror_reflection_detected": False,
-            "clear_interior_dimensions": None,
-        }
     pcd_points = np.asarray(pcd_points, dtype=float)
     if pcd_points.ndim != 2 or pcd_points.shape[1] < 2:
         pcd_points = np.zeros((0, 3))
@@ -2505,6 +2898,14 @@ def fit_oriented_manhattan_rectangle(
         fallback_xy = np.asarray(floor["inliers"], dtype=float)[:, :2]
     else:
         fallback_xy = np.zeros((0, 2))
+
+    if not walls and not forced_wall_positions and len(fallback_xy) < 4:
+        return {
+            "vertices": {},
+            "walls": [],
+            "mirror_reflection_detected": False,
+            "clear_interior_dimensions": None,
+        }
     if len(fallback_xy):
         c = 0.5 * (fallback_xy.min(axis=0) + fallback_xy.max(axis=0))
     elif inlier_xy:
@@ -2962,9 +3363,15 @@ def fit_oriented_manhattan_rectangle(
                             p98_d = float(np.percentile(pos_dist, 98.5))
                             tail_threshold = max(MIRROR_TAIL_ABS_M, MIRROR_TAIL_REL * span_along_d)
                             if p98_d > drop_dist + tail_threshold:
-                                mirror_reflection_detected = True
-                                chosen = None
-                                anchor = opp_anchor + float(drop_dist) * np.array([d[0], d[1], 0.0])
+                                cam_past_drop = False
+                                if traj_xy is not None and len(traj_xy) > 0:
+                                    max_cam_d = float(np.max((traj_xy - opp_anchor[:2]) @ d))
+                                    if max_cam_d > drop_dist + 0.15:
+                                        cam_past_drop = True
+                                if not cam_past_drop:
+                                    mirror_reflection_detected = True
+                                    chosen = None
+                                    anchor = opp_anchor + float(drop_dist) * np.array([d[0], d[1], 0.0])
 
             # Built-in furniture check: applies even if is_primary, because high inlier count on furniture front can falsely make it primary
             if has_builtin and chosen is not None and cand_dist < p95_dist - 0.35:
@@ -3001,7 +3408,53 @@ def fit_oriented_manhattan_rectangle(
             if chosen is not None:
                 anchor = np.mean(np.asarray(chosen["inliers"], dtype=float), axis=0)
             else:
-                if opp_anchor is not None and len(fallback_xy):
+                # Infer wall position when chosen is None (e.g. mirror blindness or missing wall):
+                ortho_extents = []
+                for ok_idx in ((2, 3) if k in (0, 1) else (0, 1)):
+                    for bw_w in bins[ok_idx]:
+                        inls_w = np.asarray(bw_w.get("inliers", []), dtype=float)
+                        if len(inls_w) >= 20:
+                            ortho_extents.append(float(np.percentile(inls_w[:, :2] @ d, 98)))
+                max_ortho_extent = max(ortho_extents) if ortho_extents else None
+
+                floor_pts = None
+                if floor is not None and len(np.asarray(floor.get("inliers", []), dtype=float)):
+                    floor_pts = np.asarray(floor["inliers"], dtype=float)[:, :2]
+                elif len(pcd_points) and pcd_points.shape[1] >= 3:
+                    f_mask = pcd_points[:, 2] <= 0.20
+                    if np.count_nonzero(f_mask) >= 50:
+                        floor_pts = pcd_points[f_mask, :2]
+                floor_p98 = float(np.percentile(floor_pts @ d, 98)) if (floor_pts is not None and len(floor_pts) >= 50) else None
+
+                min_cam_bound = None
+                traj_in_bbox = False
+                if traj_xy is not None and len(traj_xy) > 0:
+                    max_cam_d = float(np.max(traj_xy @ d))
+                    traj_in_bbox = True
+                    if len(fallback_xy) > 0:
+                        max_occ_d = float(np.percentile(fallback_xy @ d, 99.0))
+                        if max_cam_d > max_occ_d + 0.30:
+                            traj_in_bbox = False
+                    if cap_k is not None and max_cam_d > cap_k + 0.20:
+                        traj_in_bbox = False
+                    if traj_in_bbox:
+                        min_cam_bound = max_cam_d + 0.20
+
+                inf_cands = []
+                if max_ortho_extent is not None:
+                    inf_cands.append(max_ortho_extent)
+                if floor_p98 is not None:
+                    inf_cands.append(floor_p98)
+
+                if inf_cands:
+                    inferred_pos = max(inf_cands)
+                    if min_cam_bound is not None and traj_in_bbox:
+                        inferred_pos = max(inferred_pos, min_cam_bound)
+                    if cap_k is not None:
+                        inferred_pos = min(inferred_pos, cap_k)
+                    zmean = float(np.mean(pcd_points[:, 2])) if len(pcd_points) else 0.0
+                    anchor = np.array([d[0] * inferred_pos, d[1] * inferred_pos, zmean], dtype=float)
+                elif opp_anchor is not None and len(fallback_xy):
                     dist_pts = (fallback_xy - opp_anchor[:2]) @ d
                     if cap_k is not None:
                         pts_pos = fallback_xy @ d
