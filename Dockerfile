@@ -56,7 +56,18 @@ COPY run_pipeline_url.py /app/vggt-space/run_pipeline_url.py
 COPY backend_api_extended_manhattan.py /app/vggt-space/backend_api_extended_manhattan.py
 COPY handler.py /app/vggt-space/handler.py
 
-# 7. Tạo thư mục để lưu các jobs tạm thời
+# 7. Tải trước trọng số model depthor.onnx từ Hugging Face (nếu chưa có trong context build)
+ARG HF_DEPTHOR_TOKEN=""
+RUN if [ ! -f /app/vggt-space/weights/depthor.onnx ]; then \
+        echo "--> Downloading depthor_plus.onnx from Hugging Face trungshin99/depthor-onnx..." && \
+        mkdir -p /app/vggt-space/weights && \
+        python -c "import os, shutil; from huggingface_hub import hf_hub_download; p = hf_hub_download(repo_id='trungshin99/depthor-onnx', filename='depthor_plus.onnx', local_dir='/app/vggt-space/weights', token='${HF_DEPTHOR_TOKEN}' if '${HF_DEPTHOR_TOKEN}' else None); t = '/app/vggt-space/weights/depthor.onnx'; shutil.move(p, t) if p != t and os.path.exists(p) else None" && \
+        echo "--> depthor.onnx downloaded successfully!"; \
+    else \
+        echo "--> depthor.onnx already exists in build context, skipping download."; \
+    fi
+
+# 8. Tạo thư mục để lưu các jobs tạm thời
 RUN mkdir -p /app/vggt_room3d_jobs && chmod -R 777 /app/vggt_room3d_jobs
 
 # Mở port 8000 của API

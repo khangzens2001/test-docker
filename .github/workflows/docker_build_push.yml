@@ -34,6 +34,7 @@ jobs:
           push: true
           build-args: |
             HF_TOKEN=${{ secrets.HF_TOKEN }}
+            HF_DEPTHOR_TOKEN=${{ secrets.HF_DEPTHOR_TOKEN }}
           tags: |
             khangzens/vggt-1b:latest
             khangzens/vggt-1b:${{ github.ref_name }}
