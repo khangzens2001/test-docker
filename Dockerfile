@@ -13,7 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     BASE_DIR=/app/vggt_room3d_jobs \
     HF_HOME=/app/hf_cache
 
-# 2. Cài đặt các package hệ thống cần thiết (cho OpenCV, Open3D, git, v.v.)
+# 2. Cài đặt các package hệ thống cần thiết (cho OpenCV, Open3D, font CJK, git, v.v.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender1 \
     libx11-6 \
+    fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. Clone repo VGGT của Hugging Face
@@ -39,19 +40,34 @@ RUN conda install -y -c conda-forge libstdcxx-ng && \
     pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir -r requirements_demo.txt && \
-    pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles boto3 open3d gdown runpod huggingface-hub==0.24.0 safetensors opencv-python-headless scipy matplotlib shapely
+    pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles boto3 open3d gdown runpod huggingface-hub==0.24.0 safetensors opencv-python-headless scipy matplotlib shapely pandas trimesh ezdxf pypdf Pillow onnxruntime pyarrow pydantic-settings
 
 # 5. Tải trước trọng số model VGGT-1B từ Hugging Face và lưu vào cache (không load vào RAM để tránh OOM)
-ARG HF_TOKEN
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/VGGT-1B-Commercial', token='${HF_TOKEN}')"
+ARG HF_TOKEN=""
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/VGGT-1B', token='${HF_TOKEN}' if '${HF_TOKEN}' else None)"
 
-# 6. Copy floorplan generator, icons, file API Server chính và handler vào thư mục space
+# 6. Copy core modules, app, weights, floorplan generator, icons, scripts, file API Server chính và handler vào thư mục space
+COPY app /app/vggt-space/app
+COPY weights /app/vggt-space/weights
 COPY floorplan_generator /app/vggt-space/floorplan_generator
 COPY icon /app/vggt-space/icon
+COPY scripts /app/vggt-space/scripts
+COPY run_pipeline_url.py /app/vggt-space/run_pipeline_url.py
 COPY backend_api_extended_manhattan.py /app/vggt-space/backend_api_extended_manhattan.py
 COPY handler.py /app/vggt-space/handler.py
 
-# 7. Tạo thư mục để lưu các jobs tạm thời
+# 7. Tải trước trọng số model depthor.onnx từ Hugging Face (nếu chưa có trong context build)
+ARG HF_DEPTHOR_TOKEN=""
+RUN if [ ! -f /app/vggt-space/weights/depthor.onnx ]; then \
+        echo "--> Downloading depthor_plus.onnx from Hugging Face trungshin99/depthor-onnx..." && \
+        mkdir -p /app/vggt-space/weights && \
+        python -c "import os, shutil; from huggingface_hub import hf_hub_download; p = hf_hub_download(repo_id='trungshin99/depthor-onnx', filename='depthor_plus.onnx', local_dir='/app/vggt-space/weights', token='${HF_DEPTHOR_TOKEN}' if '${HF_DEPTHOR_TOKEN}' else None); t = '/app/vggt-space/weights/depthor.onnx'; shutil.move(p, t) if p != t and os.path.exists(p) else None" && \
+        echo "--> depthor.onnx downloaded successfully!"; \
+    else \
+        echo "--> depthor.onnx already exists in build context, skipping download."; \
+    fi
+
+# 8. Tạo thư mục để lưu các jobs tạm thời
 RUN mkdir -p /app/vggt_room3d_jobs && chmod -R 777 /app/vggt_room3d_jobs
 
 # Mở port 8000 của API
