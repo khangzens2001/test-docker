@@ -1,4 +1,7 @@
+import json
 import os
+from typing import Optional
+
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
@@ -9,7 +12,7 @@ import torch
 from vggt.models.vggt import VGGT
 
 # Define global constants matching backend
-MODEL_ID = "facebook/VGGT-1B-Commercial"
+MODEL_ID = os.getenv("VGGT_MODEL_ID", "facebook/VGGT-1B")
 BASE_DIR = os.getenv("BASE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "vggt_room3d_jobs"))
 DEFAULT_HARD_MAX_POINTS = 300_000_000
 
