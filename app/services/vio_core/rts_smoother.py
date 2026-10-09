@@ -1,9 +1,16 @@
 """Manifold SR-RTS Backward Smoother with SO(3) Retraction."""
 
 import copy
+import logging
+import os
 import numpy as np
 from app.services.vio_core.math_utils import so3_log
+from app.services.vio_core import numba_accelerated as _nba
 from app.services.vio_core.state import NominalState, StateIndex as I
+
+logger = logging.getLogger(__name__)
+
+RTS_CHUNK = 2048  # steps per gain-precompute chunk (bounds peak memory to a few 10 MB on either device)
 
 
 def _copy_state(state: NominalState) -> NominalState:
@@ -19,6 +26,84 @@ def _copy_state(state: NominalState) -> NominalState:
     new_s.td = float(state.td)
     new_s.sl = float(state.sl)
     return new_s
+
+
+def resolve_rts_device() -> str:
+    """Pick the device for the RTS gain precompute from VIO_RTS_DEVICE (auto|cuda|cpu)."""
+    pref = os.environ.get("VIO_RTS_DEVICE", "auto").strip().lower()
+    if pref not in ("auto", "cuda", "cpu"):
+        logger.warning("Unrecognised VIO_RTS_DEVICE=%r (expected auto|cuda|cpu); treating as auto", pref)
+        pref = "auto"
+    if pref == "cpu":
+        return "cpu"
+    try:
+        import torch
+    except ImportError:
+        if pref == "cuda":
+            logger.warning("VIO_RTS_DEVICE=cuda requested but torch is not installed; using cpu")
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    if pref == "cuda":
+        logger.warning("VIO_RTS_DEVICE=cuda requested but torch.cuda.is_available() is False; using cpu")
+    return "cpu"
+
+
+def rts_gains_numpy(S: np.ndarray, F: np.ndarray, Q: np.ndarray) -> np.ndarray:
+    """C_k = (P_{k+1|k}^{-1} F_k P_k)^T for stacked (M,23,23) inputs, same formulas as the loop."""
+    P = S @ np.transpose(S, (0, 2, 1))
+    FP = F @ P
+    P_pred = FP @ np.transpose(F, (0, 2, 1)) + Q
+    P_pred = 0.5 * (P_pred + np.transpose(P_pred, (0, 2, 1)))
+    return np.transpose(np.linalg.solve(P_pred, FP), (0, 2, 1))
+
+
+def rts_gains_torch(S: np.ndarray, F: np.ndarray, Q: np.ndarray, device: str) -> np.ndarray:
+    """Same as rts_gains_numpy, computed in float64 on the given torch device."""
+    import torch
+
+    with torch.no_grad():
+        S_t = torch.from_numpy(np.ascontiguousarray(S, dtype=np.float64)).to(device)
+        F_t = torch.from_numpy(np.ascontiguousarray(F, dtype=np.float64)).to(device)
+        Q_t = torch.from_numpy(np.ascontiguousarray(Q, dtype=np.float64)).to(device)
+        P = S_t @ S_t.transpose(1, 2)
+        FP = F_t @ P
+        P_pred = FP @ F_t.transpose(1, 2) + Q_t
+        P_pred = 0.5 * (P_pred + P_pred.transpose(1, 2))
+        C = torch.linalg.solve(P_pred, FP).transpose(1, 2).contiguous()
+        return C.cpu().numpy()
+
+
+def _pack_states(states: list[NominalState]) -> tuple[np.ndarray, np.ndarray]:
+    N = len(states)
+    x = np.empty((N, 20), dtype=np.float64)
+    R = np.empty((N, 3, 3), dtype=np.float64)
+    for i, s in enumerate(states):
+        x[i, 0:3] = s.p
+        x[i, 3:6] = s.v
+        x[i, 6:9] = s.ba
+        x[i, 9:12] = s.bg
+        x[i, 12:15] = s.bg_hub
+        x[i, 15:18] = s.g
+        x[i, 18] = s.td
+        x[i, 19] = s.sl
+        R[i] = s.R
+    return x, R
+
+
+def _unpack_states(states: list[NominalState], x: np.ndarray, R: np.ndarray) -> None:
+    """Write packed arrays back into the NominalState objects (in-place on their arrays, like inject())."""
+    for i, s in enumerate(states):
+        s.p[...] = x[i, 0:3]
+        s.v[...] = x[i, 3:6]
+        s.ba[...] = x[i, 6:9]
+        s.bg[...] = x[i, 9:12]
+        s.bg_hub[...] = x[i, 12:15]
+        s.g[...] = x[i, 15:18]
+        s.td = float(x[i, 18])
+        s.sl = float(x[i, 19])
+        s.R[...] = R[i]
+
 
 
 class ManifoldRtsSmoother:
@@ -74,6 +159,9 @@ class ManifoldRtsSmoother:
             raise ValueError(f"F_list length ({len(F_list)}) must be N-1 ({N - 1})")
         if pred_states is not None and len(pred_states) != N - 1:
             raise ValueError(f"pred_states length ({len(pred_states)}) must be N-1 ({N - 1})")
+
+        if not compute_covariances:
+            return self._smooth_states_batched(states, S_P_list, F_list, Q_list, pred_states, in_place), []
 
         smoothed_states = states if in_place else [_copy_state(s) for s in states]
         smoothed_S_P = [S.copy() for S in S_P_list] if compute_covariances else []
@@ -138,6 +226,63 @@ class ManifoldRtsSmoother:
                 smoothed_S_P[k] = S_P_k_smooth
 
         return smoothed_states, smoothed_S_P
+
+    def _q_block(self, Q_list, k0: int, k1: int) -> np.ndarray:
+        """Process-noise matrices for steps k0..k1-1 as an (M,23,23) array (view when constant)."""
+        m = k1 - k0
+        if Q_list is None:
+            return np.broadcast_to(self.default_Q, (m, I.DIM, I.DIM))
+        if isinstance(Q_list, list):
+            return np.stack(Q_list[k0:k1])
+        if isinstance(Q_list, np.ndarray) and Q_list.ndim == 2:
+            return np.broadcast_to(Q_list, (m, I.DIM, I.DIM))
+        return np.asarray(Q_list[k0:k1], dtype=np.float64)
+
+    def _smooth_states_batched(
+        self,
+        states: list[NominalState],
+        S_P_list: list[np.ndarray],
+        F_list: list[np.ndarray],
+        Q_list,
+        pred_states: list[NominalState] | None,
+        in_place: bool,
+    ) -> list[NominalState]:
+        """States-only RTS pass: chunked gain precompute (numpy or CUDA) + numba backward recursion."""
+        N = len(states)
+        out_states = states if in_place else [_copy_state(s) for s in states]
+        x_s, R_s = _pack_states(out_states)
+
+        if pred_states is not None:
+            x_pred, R_pred = _pack_states(pred_states)
+            pred_offset = 0
+        elif in_place:
+            # The loop reads states[k+1] which, in place, is the already-smoothed state: alias.
+            x_pred, R_pred = x_s, R_s
+            pred_offset = 1
+        else:
+            x_pred, R_pred = _pack_states(states)
+            pred_offset = 1
+
+        device = resolve_rts_device()
+        k1 = N - 1
+        while k1 > 0:
+            k0 = max(0, k1 - RTS_CHUNK)
+            S = np.stack(S_P_list[k0:k1]).astype(np.float64, copy=False)
+            F = np.stack(F_list[k0:k1]).astype(np.float64, copy=False)
+            Q = self._q_block(Q_list, k0, k1)
+            if device == "cuda":
+                C = rts_gains_torch(S, F, Q, device)
+            else:
+                C = rts_gains_numpy(S, F, Q)
+            _nba.rts_backward_chunk(np.ascontiguousarray(C), x_s, R_s, x_pred, R_pred, pred_offset, k0, k1)
+            k1 = k0
+
+        if device == "cuda":
+            import torch
+            torch.cuda.empty_cache()
+
+        _unpack_states(out_states, x_s, R_s)
+        return out_states
 
 
 def rts_smooth(

@@ -271,8 +271,10 @@ class RobustVggtPointcloudRegistrar:
         initial_s: float | None = None,
         height_m: float | None = None,
         camera_centers: np.ndarray | None = None,
+        gravity: np.ndarray | None = None,
+        vggt_R0: np.ndarray | None = None,
     ) -> tuple[bool, float, np.ndarray, np.ndarray, float]:
-        """Aligns VGGT to metric LiDAR using vertical height scale and 3-DoF planar search."""
+        """Aligns VGGT to metric LiDAR using vertical height scale, gravity locking, and 3-DoF planar search."""
         import open3d as o3d
 
         pts_v = np.asarray(vggt_points, dtype=float)
@@ -281,6 +283,7 @@ class RobustVggtPointcloudRegistrar:
             return False, 1.0, np.eye(3), np.zeros(3), float("inf")
 
         R_init = np.asarray(initial_R, dtype=float) if initial_R is not None else np.eye(3)
+
         pts_rot = pts_v @ R_init.T
 
         cam_degenerate = False
@@ -295,7 +298,7 @@ class RobustVggtPointcloudRegistrar:
                     if (svals.size >= 3 and svals[0] > 1e-9)
                     else (float(svals[1] / svals[0]) if (svals.size >= 2 and svals[0] > 1e-9) else 0.0)
                 )
-                if r_rms < 0.20 or sig_ratio < 0.15:
+                if r_rms < 0.20 or sig_ratio < 0.05:
                     cam_degenerate = True
 
         if initial_s is not None and SIM3_SCALE_MIN <= initial_s <= SIM3_SCALE_MAX and not cam_degenerate:
@@ -376,22 +379,7 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
     centroid = xy.mean(axis=0) if len(xy) else np.zeros(2)
     walls: list[T2Wall] = []
 
-    # Determine if small room (< 6.0 m2)
-    is_small_room = False
-    if len(hints) >= 4:
-        try:
-            poly_pts = np.stack([np.asarray(h.p0, dtype=float)[:2] for h in hints])
-            hint_area = abs(_signed_area(poly_pts))
-            if 0.5 <= hint_area < 6.0:
-                is_small_room = True
-        except Exception:
-            pass
-    if not is_small_room and len(hints) >= 4 and len(xy) >= 20:
-        p5 = np.percentile(xy, 5, axis=0)
-        p95 = np.percentile(xy, 95, axis=0)
-        span_area = float((p95[0] - p5[0]) * (p95[1] - p5[1]))
-        if span_area < 6.0:
-            is_small_room = True
+
 
     hint_map = {}
     for h in hints:
@@ -467,10 +455,7 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
         # Structural wall behind fixture check:
         # If candidate sits on an interior fixture while LiDAR points extend further outward
         # to a supported structural wall peak:
-        # For small rooms (< 6.0 m2), lock interior face priority: keep c_hint = centres[best_hint_idx]
-        # (closest to room centroid / density peak) and do not overwrite with outer peak to preserve
-        # clear interior dimensions at 219-220 cm.
-        if opp_pos is not None and not is_small_room:
+        if opp_pos is not None:
             vggt_span = float(pos_hint + opp_pos)
             opp_proj = xy @ (-n) if len(xy) else np.zeros(0)
             opp_lidar = float(np.percentile(opp_proj, 95)) if len(opp_proj) >= 20 else float(opp_pos)
@@ -694,7 +679,7 @@ def _bounding_box_percentiles(xy: np.ndarray) -> tuple[float, float, float, floa
     if len(xy) >= 50:
         p_min = [0.0, 0.0]
         p_max = [100.0, 100.0]
-        p_min[long_ax] = 2.0 if span_curr[long_ax] > 2.25 else 1.2
+        p_min[long_ax] = 0.85 if span_curr[long_ax] > 2.10 else 1.2
         p_max[long_ax] = 99.8
         p_min[short_ax] = 6.0 if span_curr[short_ax] > 1.55 else (5.0 if span_curr[short_ax] > 1.45 else 1.0)
         p_max[short_ax] = 99.0
@@ -752,7 +737,7 @@ def extract_vggt_wall_axes(
             "choke_guard_reason": None,
         }
         clipped_kept, clip_out = _clip_doorway_profile_tails(
-            kept, supp_raw, x_min_raw, y_min_raw, res_raw, w_raw, h_raw, clip_inf
+            kept, supp_raw, x_min_raw, y_min_raw, res_raw, w_raw, h_raw, clip_inf, trajectory=trajectory
         )
         if clip_out.get("doorway_choke_applied") and len(clipped_kept) >= 10:
             post = clip_out.get("post_choke_bbox_m", pre_span)

@@ -178,9 +178,9 @@ def run_vggt_inference(
             pose_enc_list = model.camera_head(aggregated_tokens_list)
             pose_enc = pose_enc_list[-1]
             
-            # Point head chunked processing (chunk size = 2 frames to stay strictly <= 6.5 GB VRAM)
+            # Point head chunked processing (chunk size = 4 frames for fast parallel throughput)
             B, S, _, H, W = images.shape
-            chunk_size = 2
+            chunk_size = 4
             all_pts = []
             all_conf = []
             all_colors = []
@@ -200,8 +200,8 @@ def run_vggt_inference(
                 col_sub = (img_chunk[:, :, ::3, ::3, :].clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).reshape(-1, 3).cpu()
                 all_colors.append(col_sub)
 
-                if device == "cuda":
-                    torch.cuda.empty_cache()
+            if device == "cuda":
+                torch.cuda.empty_cache()
 
             pts_valid = torch.cat(all_pts, dim=0).float().numpy()
             conf_valid = torch.cat(all_conf, dim=0).float().numpy()

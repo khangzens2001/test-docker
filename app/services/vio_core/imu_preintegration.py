@@ -2,7 +2,8 @@
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator
-from app.services.vio_core.math_utils import so3_exp, skew_symmetric, right_jacobian_so3
+from app.services.vio_core import numba_accelerated as _nba
+from app.services.vio_core.math_utils import so3_exp
 
 
 def interpolate_pchip(timestamps: np.ndarray, measurements: np.ndarray, target_timestamps: np.ndarray) -> np.ndarray:
@@ -80,70 +81,40 @@ class ImuPreintegration:
         if dt <= 0.0:
             return
 
-        # Sample gap inflation for dt > 0.1s (100ms - 500ms)
-        inflation_factor = 1.0
-        if dt > 0.1:
+        has_prev = self._prev_accel is not None
+        prev_accel = self._prev_accel if has_prev else np.zeros(3, dtype=np.float64)
+        prev_gyro = self._prev_gyro if has_prev else np.zeros(3, dtype=np.float64)
+
+        (
+            self.delta_R,
+            self.delta_v,
+            self.delta_p,
+            self.covariance,
+            self.J_ba,
+            self.J_bg,
+            self._prev_accel,
+            self._prev_gyro,
+            inflated,
+        ) = _nba.preint_step(
+            np.ascontiguousarray(self.delta_R, dtype=np.float64),
+            np.ascontiguousarray(self.delta_v, dtype=np.float64),
+            np.ascontiguousarray(self.delta_p, dtype=np.float64),
+            np.ascontiguousarray(self.covariance, dtype=np.float64),
+            np.ascontiguousarray(self.J_ba, dtype=np.float64),
+            np.ascontiguousarray(self.J_bg, dtype=np.float64),
+            np.ascontiguousarray(accel, dtype=np.float64),
+            np.ascontiguousarray(gyro, dtype=np.float64),
+            float(dt),
+            np.ascontiguousarray(self.ba, dtype=np.float64),
+            np.ascontiguousarray(self.bg, dtype=np.float64),
+            float(self.sigma_a),
+            float(self.sigma_g),
+            np.ascontiguousarray(prev_accel, dtype=np.float64),
+            np.ascontiguousarray(prev_gyro, dtype=np.float64),
+            bool(has_prev),
+        )
+        if inflated:
             self.is_inflated = True
-            inflation_factor = (dt / 0.005) ** 2
-
-        a_corr = np.array(accel, dtype=np.float64) - self.ba
-        w_corr = np.array(gyro, dtype=np.float64) - self.bg
-
-        if self._prev_accel is not None:
-            a_mid = 0.5 * (self._prev_accel + a_corr)
-            w_mid = 0.5 * (self._prev_gyro + w_corr)
-        else:
-            a_mid = a_corr
-            w_mid = w_corr
-
-        self._prev_accel = a_corr.copy()
-        self._prev_gyro = w_corr.copy()
-
-        phi = w_mid * dt
-        Jr = right_jacobian_so3(phi)
-        dR_step = so3_exp(phi)
-        acc_world = self.delta_R @ a_mid
-
-        # Jacobians update for [pos(0:3), vel(3:6), ori(6:9)]
-        J_bg_R_prev = self.J_bg[6:9, :].copy()
-        J_ba_v_prev = self.J_ba[3:6, :].copy()
-        J_bg_v_prev = self.J_bg[3:6, :].copy()
-
-        # Orientation Jacobian wrt bg
-        self.J_bg[6:9, :] = dR_step.T @ J_bg_R_prev - Jr * dt
-
-        # Velocity Jacobians
-        self.J_ba[3:6, :] = self.J_ba[3:6, :] - self.delta_R * dt
-        self.J_bg[3:6, :] = self.J_bg[3:6, :] - skew_symmetric(acc_world) @ J_bg_R_prev * dt
-
-        # Position Jacobians
-        self.J_ba[0:3, :] = self.J_ba[0:3, :] + J_ba_v_prev * dt - 0.5 * self.delta_R * (dt ** 2)
-        self.J_bg[0:3, :] = self.J_bg[0:3, :] + J_bg_v_prev * dt - 0.5 * skew_symmetric(acc_world) @ J_bg_R_prev * (dt ** 2)
-
-        # Covariance propagation
-        # State order for covariance: [pos(0:3), vel(3:6), ori(6:9)]
-        F = np.eye(9, dtype=np.float64)
-        F[0:3, 3:6] = np.eye(3) * dt
-        F[0:3, 6:9] = -0.5 * skew_symmetric(acc_world) * (dt ** 2)
-        F[3:6, 6:9] = -skew_symmetric(acc_world) * dt
-        F[6:9, 6:9] = dR_step.T
-
-        G = np.zeros((9, 6), dtype=np.float64)
-        G[0:3, 0:3] = 0.5 * self.delta_R * (dt ** 2)
-        G[3:6, 0:3] = self.delta_R * dt
-        G[6:9, 3:6] = Jr * dt
-
-        Q_d = np.diag([
-            *([self.sigma_a ** 2] * 3),
-            *([self.sigma_g ** 2] * 3),
-        ]) * inflation_factor
-
-        self.covariance = F @ self.covariance @ F.T + G @ Q_d @ G.T
-
-        # Update integrated motion state
-        self.delta_p += self.delta_v * dt + 0.5 * acc_world * (dt ** 2)
-        self.delta_v += acc_world * dt
-        self.delta_R = self.delta_R @ dR_step
         self.delta_t += dt
 
     def correct_bias(self, dba: np.ndarray, dbg: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

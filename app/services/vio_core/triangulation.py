@@ -13,6 +13,15 @@ class TriangulationResult(NamedTuple):
     state: np.ndarray       # Bearing angles + inverse depth state [alpha, beta, rho]^T
 
 
+class BatchTriangulationResult(NamedTuple):
+    """Stacked DLT results for N keypoint pairs (same semantics as TriangulationResult per row)."""
+    point_3d: np.ndarray     # (N, 3)
+    rho: np.ndarray          # (N,)
+    valid: np.ndarray        # (N,) bool
+    parallax_deg: np.ndarray  # (N,)
+    state: np.ndarray        # (N, 3)
+
+
 def compute_parallax_angle(P_w: np.ndarray, t1: np.ndarray, t2: np.ndarray) -> float:
     """Computes the ray parallax angle theta in degrees between two optical centers.
 
@@ -166,6 +175,115 @@ def triangulate_dlt_single(
     valid = bool((z1 > 0.01) and (z2 > 0.01) and (rho > 0.0) and (parallax_deg >= min_parallax_deg))
 
     return TriangulationResult(
+        point_3d=P_w,
+        rho=rho,
+        valid=valid,
+        parallax_deg=parallax_deg,
+        state=state,
+    )
+
+
+def triangulate_dlt_batch(
+    uv1: np.ndarray,
+    uv2: np.ndarray,
+    R1: np.ndarray,
+    t1: np.ndarray,
+    R2: np.ndarray,
+    t2: np.ndarray,
+    K: np.ndarray,
+    min_parallax_deg: float = 1.0,
+) -> BatchTriangulationResult:
+    """Vectorised twin of triangulate_dlt_single for N pairs sharing the second camera pose.
+
+    Builds the N 4x4 DLT systems exactly as the single version and runs one stacked
+    np.linalg.svd (LAPACK gesdd per matrix, the same routine the single version uses).
+
+    Args:
+        uv1: Host-frame pixels (N, 2).
+        uv2: Current-frame pixels (N, 2).
+        R1: Host camera rotations R_wc1 (N, 3, 3).
+        t1: Host camera positions t_wc1 (N, 3).
+        R2: Current camera rotation R_wc2 (3, 3).
+        t2: Current camera position t_wc2 (3,).
+        K: Camera intrinsics (3, 3).
+        min_parallax_deg: Minimum parallax for validity.
+    """
+    uv1 = np.asarray(uv1, dtype=np.float64).reshape(-1, 2)
+    uv2 = np.asarray(uv2, dtype=np.float64).reshape(-1, 2)
+    R1 = np.asarray(R1, dtype=np.float64).reshape(-1, 3, 3)
+    t1 = np.asarray(t1, dtype=np.float64).reshape(-1, 3)
+    R2 = np.asarray(R2, dtype=np.float64)
+    t2 = np.asarray(t2, dtype=np.float64).reshape(3)
+    N = uv1.shape[0]
+    if N == 0:
+        return BatchTriangulationResult(
+            point_3d=np.zeros((0, 3)),
+            rho=np.zeros(0),
+            valid=np.zeros(0, dtype=bool),
+            parallax_deg=np.zeros(0),
+            state=np.zeros((0, 3)),
+        )
+
+    K_inv = np.linalg.inv(K)
+    ones = np.ones((N, 1))
+    p1_norm = (K_inv @ np.hstack([uv1, ones]).T).T   # (N, 3)
+    p2_norm = (K_inv @ np.hstack([uv2, ones]).T).T
+    x1, y1 = p1_norm[:, 0], p1_norm[:, 1]
+    x2, y2 = p2_norm[:, 0], p2_norm[:, 1]
+
+    # P1_i = R1_i^T [I | -t1_i]  (N, 3, 4);  P2 = R2^T [I | -t2]  (3, 4)
+    R1T = np.transpose(R1, (0, 2, 1))
+    P1 = np.concatenate([R1T, -(R1T @ t1[:, :, None])], axis=2)
+    P2 = R2.T @ np.hstack([np.eye(3), -t2.reshape(3, 1)])
+
+    A = np.empty((N, 4, 4), dtype=np.float64)
+    A[:, 0, :] = x1[:, None] * P1[:, 2, :] - P1[:, 0, :]
+    A[:, 1, :] = y1[:, None] * P1[:, 2, :] - P1[:, 1, :]
+    A[:, 2, :] = x2[:, None] * P2[2][None, :] - P2[0][None, :]
+    A[:, 3, :] = y2[:, None] * P2[2][None, :] - P2[1][None, :]
+
+    _, _, Vt = np.linalg.svd(A)
+    X_h = Vt[:, -1, :]                                  # (N, 4)
+    w = X_h[:, 3]
+    degenerate = np.abs(w) < 1e-12
+    w_safe = np.where(degenerate, 1.0, w)
+    P_w = X_h[:, :3] / w_safe[:, None]
+
+    p_c1 = (R1T @ (P_w - t1)[:, :, None])[:, :, 0]     # (N, 3)
+    p_c2 = (R2.T @ (P_w - t2).T).T
+    z1 = p_c1[:, 2]
+    z2 = p_c2[:, 2]
+
+    # Vectorised point_3d_to_inverse_depth(P_w, R1, t1)
+    state = np.zeros((N, 3), dtype=np.float64)
+    z_ok = z1 > 1e-8
+    z_safe = np.where(z_ok, z1, 1.0)
+    state[:, 0] = np.where(z_ok, p_c1[:, 0] / z_safe, 0.0)
+    state[:, 1] = np.where(z_ok, p_c1[:, 1] / z_safe, 0.0)
+    state[:, 2] = np.where(z_ok, 1.0 / z_safe, 0.0)
+    rho = state[:, 2].copy()
+
+    # Vectorised compute_parallax_angle(P_w, t1, t2)
+    r1 = P_w - t1
+    r2 = P_w - t2
+    n1 = np.linalg.norm(r1, axis=1)
+    n2 = np.linalg.norm(r2, axis=1)
+    too_close = (n1 < 1e-8) | (n2 < 1e-8)
+    n1_safe = np.where(too_close, 1.0, n1)
+    n2_safe = np.where(too_close, 1.0, n2)
+    cos_theta = np.clip(np.sum((r1 / n1_safe[:, None]) * (r2 / n2_safe[:, None]), axis=1), -1.0, 1.0)
+    parallax_deg = np.degrees(np.arccos(cos_theta))
+    parallax_deg[too_close] = 0.0
+
+    valid = (z1 > 0.01) & (z2 > 0.01) & (rho > 0.0) & (parallax_deg >= min_parallax_deg) & ~degenerate
+
+    # Degenerate rows mirror the single version's early return (all zeros, invalid)
+    P_w[degenerate] = 0.0
+    state[degenerate] = 0.0
+    rho[degenerate] = 0.0
+    parallax_deg[degenerate] = 0.0
+
+    return BatchTriangulationResult(
         point_3d=P_w,
         rho=rho,
         valid=valid,

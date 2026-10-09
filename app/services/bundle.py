@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -28,6 +29,309 @@ from app.services.materials import (
 )
 
 
+def get_available_cpu_count() -> int:
+    """Return available CPU cores considering cgroups/taskset affinity when available."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def get_render_worker_count(cores: int | None = None) -> int:
+    """Determine adaptive concurrency for rendering workers.
+
+    Rules:
+    - Environment variable RENDER_WORKERS or MAX_RENDER_WORKERS takes precedence.
+    - If available cores <= 2 (constrained environments): 1 worker (sequential fallback).
+    - If 3-5 cores: 2 workers (leaving cores free for OS/Celery/FastAPI).
+    - If >= 6 cores: min(3, cores - 2) workers (leaving cores free for OS/Celery/FastAPI).
+    """
+    env_override = os.environ.get("RENDER_WORKERS") or os.environ.get("MAX_RENDER_WORKERS")
+    if env_override is not None:
+        try:
+            return max(1, int(env_override))
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid RENDER_WORKERS value '%s', falling back to auto-detection",
+                env_override,
+            )
+
+    if cores is None:
+        cores = get_available_cpu_count()
+
+    if cores < 3:
+        return 1
+    if cores < 6:
+        return 2
+    return max(1, min(3, cores - 2))
+
+
+def _init_matplotlib_agg() -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg", force=True)
+    except Exception as exc:
+        logger.debug("Failed to set matplotlib Agg backend: %s", exc)
+
+
+def _safe_run_worker(
+    fn,
+    *args,
+    name: str,
+    allow_partial: bool,
+    warnings: list[str],
+    **kwargs,
+) -> Any:
+    if not allow_partial:
+        return fn(*args, **kwargs)
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        logger.warning("Renderer %s failed: %s", name, exc)
+        warnings.append(f"{name}: {exc}")
+        return None
+
+
+def _should_render(render_materials: set[str] | str, key: str) -> bool:
+    if render_materials == "all":
+        return True
+    if isinstance(render_materials, (set, list, tuple)):
+        return key in render_materials
+    if isinstance(render_materials, str):
+        return key == render_materials
+    return False
+
+
+def _run_batch_cad(
+    metrics_mm: dict[str, Any],
+    staging_dir: str,
+    wall_elev_path: str,
+    allow_partial: bool,
+) -> list[str]:
+    """Batch 1: FloorPlan A3 & A4 (PDF & PNG) + Walls elevation PNG."""
+    _init_matplotlib_agg()
+    warnings: list[str] = []
+    try:
+        _safe_run_worker(
+            render_floorplan,
+            metrics_mm,
+            os.path.join(staging_dir, "FloorPlan_A3.png"),
+            sheet_size="A3",
+            name="render_floorplan_a3_png",
+            allow_partial=allow_partial,
+            warnings=warnings,
+        )
+        _safe_run_worker(
+            render_floorplan,
+            metrics_mm,
+            os.path.join(staging_dir, "FloorPlan_A3.pdf"),
+            sheet_size="A3",
+            name="render_floorplan_a3_pdf",
+            allow_partial=allow_partial,
+            warnings=warnings,
+        )
+        _safe_run_worker(
+            render_floorplan,
+            metrics_mm,
+            os.path.join(staging_dir, "FloorPlan_A4.png"),
+            sheet_size="A4",
+            name="render_floorplan_a4_png",
+            allow_partial=allow_partial,
+            warnings=warnings,
+        )
+        _safe_run_worker(
+            render_floorplan,
+            metrics_mm,
+            os.path.join(staging_dir, "FloorPlan_A4.pdf"),
+            sheet_size="A4",
+            name="render_floorplan_a4_pdf",
+            allow_partial=allow_partial,
+            warnings=warnings,
+        )
+
+        def _render_wall_elev():
+            render_wall_elevations(metrics_mm, wall_elev_path)
+            legacy_walls_path = os.path.join(staging_dir, "Walls.png")
+            if os.path.abspath(wall_elev_path) != os.path.abspath(legacy_walls_path):
+                shutil.copyfile(wall_elev_path, legacy_walls_path)
+
+        _safe_run_worker(
+            _render_wall_elev,
+            name="render_wall_elevations",
+            allow_partial=allow_partial,
+            warnings=warnings,
+        )
+    finally:
+        try:
+            import matplotlib.pyplot as plt
+            plt.close("all")
+        except Exception:
+            pass
+    return warnings
+
+
+def _run_batch_neda_plywood(
+    metrics_mm: dict[str, Any],
+    materials: dict[str, Any],
+    staging_dir: str,
+    allow_partial: bool,
+    render_materials: set[str] | str,
+) -> list[str]:
+    """Batch 2: Neda & Plywood (PDF, PNG, Chart)."""
+    _init_matplotlib_agg()
+    warnings: list[str] = []
+    try:
+        if _should_render(render_materials, "neda") and materials.get("neda"):
+            _safe_run_worker(
+                render_neda,
+                metrics_mm,
+                materials["neda"],
+                os.path.join(staging_dir, "Neda.png"),
+                name="render_neda_png",
+                allow_partial=allow_partial,
+                warnings=warnings,
+            )
+            _safe_run_worker(
+                render_neda,
+                metrics_mm,
+                materials["neda"],
+                os.path.join(staging_dir, "Neda.pdf"),
+                name="render_neda_pdf",
+                allow_partial=allow_partial,
+                warnings=warnings,
+            )
+            _safe_run_worker(
+                render_neda,
+                metrics_mm,
+                materials["neda"],
+                os.path.join(staging_dir, "Neda_chart.png"),
+                chart_only=True,
+                name="render_neda_chart",
+                allow_partial=allow_partial,
+                warnings=warnings,
+            )
+
+        if _should_render(render_materials, "plywood") and materials.get("plywood"):
+            _safe_run_worker(
+                render_plywood,
+                metrics_mm,
+                materials["plywood"],
+                os.path.join(staging_dir, "Plywood.png"),
+                name="render_plywood_png",
+                allow_partial=allow_partial,
+                warnings=warnings,
+            )
+            _safe_run_worker(
+                render_plywood,
+                metrics_mm,
+                materials["plywood"],
+                os.path.join(staging_dir, "Plywood.pdf"),
+                name="render_plywood_pdf",
+                allow_partial=allow_partial,
+                warnings=warnings,
+            )
+            _safe_run_worker(
+                render_plywood,
+                metrics_mm,
+                materials["plywood"],
+                os.path.join(staging_dir, "Plywood_chart.png"),
+                chart_only=True,
+                name="render_plywood_chart",
+                allow_partial=allow_partial,
+                warnings=warnings,
+            )
+    finally:
+        try:
+            import matplotlib.pyplot as plt
+            plt.close("all")
+        except Exception:
+            pass
+    return warnings
+
+
+def _run_batch_tiling_cf(
+    metrics_mm: dict[str, Any],
+    materials: dict[str, Any],
+    staging_dir: str,
+    allow_partial: bool,
+    render_materials: set[str] | str,
+) -> list[str]:
+    """Batch 3: Tiling & CF (PDF, PNG, Chart)."""
+    _init_matplotlib_agg()
+    warnings: list[str] = []
+    try:
+        if (
+            _should_render(render_materials, "tiling")
+            and materials.get("tiling")
+            and not materials["tiling"].get("skipped")
+        ):
+            _safe_run_worker(
+                render_tiling,
+                metrics_mm,
+                materials["tiling"],
+                os.path.join(staging_dir, "Tiling.png"),
+                name="render_tiling_png",
+                allow_partial=allow_partial,
+                warnings=warnings,
+            )
+            _safe_run_worker(
+                render_tiling,
+                metrics_mm,
+                materials["tiling"],
+                os.path.join(staging_dir, "Tiling.pdf"),
+                name="render_tiling_pdf",
+                allow_partial=allow_partial,
+                warnings=warnings,
+            )
+            _safe_run_worker(
+                render_tiling,
+                metrics_mm,
+                materials["tiling"],
+                os.path.join(staging_dir, "Tiling_chart.png"),
+                chart_only=True,
+                name="render_tiling_chart",
+                allow_partial=allow_partial,
+                warnings=warnings,
+            )
+
+        if _should_render(render_materials, "cf") and materials.get("cf"):
+            _safe_run_worker(
+                render_cf,
+                metrics_mm,
+                materials["cf"],
+                os.path.join(staging_dir, "CF.png"),
+                name="render_cf_png",
+                allow_partial=allow_partial,
+                warnings=warnings,
+            )
+            _safe_run_worker(
+                render_cf,
+                metrics_mm,
+                materials["cf"],
+                os.path.join(staging_dir, "CF.pdf"),
+                name="render_cf_pdf",
+                allow_partial=allow_partial,
+                warnings=warnings,
+            )
+            _safe_run_worker(
+                render_cf,
+                metrics_mm,
+                materials["cf"],
+                os.path.join(staging_dir, "CF_chart.png"),
+                chart_only=True,
+                name="render_cf_chart",
+                allow_partial=allow_partial,
+                warnings=warnings,
+            )
+    finally:
+        try:
+            import matplotlib.pyplot as plt
+            plt.close("all")
+        except Exception:
+            pass
+    return warnings
+
+
 def export_session_bundle(
     layout: dict,
     session_dir: str,
@@ -39,6 +343,7 @@ def export_session_bundle(
     session_id: str = "",
     estimate_keys: set[str] | str = "all",
     prior_results: dict | None = None,
+    workers: int | None = None,
 ) -> dict[str, Any]:
     """Export session CAD artifacts and material estimations to disk and return summary dict.
 
@@ -53,6 +358,7 @@ def export_session_bundle(
     - estimate_keys: Specific material keys to compute, or 'all'.
     - prior_results: Optional prior results to reuse when selectively calculating.
     """
+    _init_matplotlib_agg()
     os.makedirs(session_dir, exist_ok=True)
     import uuid
 
@@ -118,46 +424,9 @@ def export_session_bundle(
                 render_warnings.append(f"quality_report: {exc}")
                 quality_report = None
 
-            safe_run(
-                render_floorplan,
-                metrics_mm,
-                os.path.join(staging_dir, "FloorPlan_A3.png"),
-                sheet_size="A3",
-                name="render_floorplan_a3_png",
-            )
-            safe_run(
-                render_floorplan,
-                metrics_mm,
-                os.path.join(staging_dir, "FloorPlan_A3.pdf"),
-                sheet_size="A3",
-                name="render_floorplan_a3_pdf",
-            )
-            safe_run(
-                render_floorplan,
-                metrics_mm,
-                os.path.join(staging_dir, "FloorPlan_A4.png"),
-                sheet_size="A4",
-                name="render_floorplan_a4_png",
-            )
-            safe_run(
-                render_floorplan,
-                metrics_mm,
-                os.path.join(staging_dir, "FloorPlan_A4.pdf"),
-                sheet_size="A4",
-                name="render_floorplan_a4_pdf",
-            )
-
             wall_elev_path, _, _ = resolve_artifact_file(
                 staging_dir, session_id, ArtifactTypeEnum.cad_wall_elevations
             )
-
-            def _render_wall_elev():
-                render_wall_elevations(metrics_mm, wall_elev_path)
-                legacy_walls_path = os.path.join(staging_dir, "Walls.png")
-                if os.path.abspath(wall_elev_path) != os.path.abspath(legacy_walls_path):
-                    shutil.copyfile(wall_elev_path, legacy_walls_path)
-
-            safe_run(_render_wall_elev, name="render_wall_elevations")
         else:
             qr_path = os.path.join(session_dir, "quality_report.json")
             if os.path.exists(qr_path):
@@ -165,125 +434,99 @@ def export_session_bundle(
                     quality_report = json.load(f)
             else:
                 quality_report = None
+            wall_elev_path = ""
 
-        # 5. Floor Material Drawings
-        def should_render(key: str) -> bool:
-            if render_materials == "all":
-                return True
-            if isinstance(render_materials, (set, list, tuple)):
-                return key in render_materials
-            if isinstance(render_materials, str):
-                return key == render_materials
-            return False
-
-        if should_render("neda") and materials.get("neda"):
-            safe_run(
-                render_neda,
-                metrics_mm,
-                materials["neda"],
-                os.path.join(staging_dir, "Neda.png"),
-                name="render_neda_png",
-            )
-            safe_run(
-                render_neda,
-                metrics_mm,
-                materials["neda"],
-                os.path.join(staging_dir, "Neda.pdf"),
-                name="render_neda_pdf",
-            )
-            safe_run(
-                render_neda,
-                metrics_mm,
-                materials["neda"],
-                os.path.join(staging_dir, "Neda_chart.png"),
-                chart_only=True,
-                name="render_neda_chart",
-            )
-
+        # 5. Floor Material Drawings & CAD Sheet Rendering
         tiling = materials.get("tiling")
         if isinstance(tiling, dict) and tiling.get("skipped"):
             materials["tiling"] = None
             warn = tiling.get("reason") or "skipped"
             render_warnings.append(f"tiling: {warn}")
 
-        if (
-            should_render("tiling")
-            and materials.get("tiling")
+        cad_tasks = []
+        if render_cad:
+            cad_tasks.append(
+                (_run_batch_cad, (metrics_mm, staging_dir, wall_elev_path, allow_partial))
+            )
+
+        neda_ply_needed = (
+            _should_render(render_materials, "neda") and bool(materials.get("neda"))
+        ) or (
+            _should_render(render_materials, "plywood") and bool(materials.get("plywood"))
+        )
+        neda_ply_tasks = []
+        if neda_ply_needed:
+            neda_ply_tasks.append(
+                (
+                    _run_batch_neda_plywood,
+                    (metrics_mm, materials, staging_dir, allow_partial, render_materials),
+                )
+            )
+
+        tiling_cf_needed = (
+            _should_render(render_materials, "tiling")
+            and bool(materials.get("tiling"))
             and not materials["tiling"].get("skipped")
-        ):
-            safe_run(
-                render_tiling,
-                metrics_mm,
-                materials["tiling"],
-                os.path.join(staging_dir, "Tiling.png"),
-                name="render_tiling_png",
-            )
-            safe_run(
-                render_tiling,
-                metrics_mm,
-                materials["tiling"],
-                os.path.join(staging_dir, "Tiling.pdf"),
-                name="render_tiling_pdf",
-            )
-            safe_run(
-                render_tiling,
-                metrics_mm,
-                materials["tiling"],
-                os.path.join(staging_dir, "Tiling_chart.png"),
-                chart_only=True,
-                name="render_tiling_chart",
+        ) or (
+            _should_render(render_materials, "cf") and bool(materials.get("cf"))
+        )
+        tiling_cf_tasks = []
+        if tiling_cf_needed:
+            tiling_cf_tasks.append(
+                (
+                    _run_batch_tiling_cf,
+                    (metrics_mm, materials, staging_dir, allow_partial, render_materials),
+                )
             )
 
-        if should_render("plywood") and materials.get("plywood"):
-            safe_run(
-                render_plywood,
-                metrics_mm,
-                materials["plywood"],
-                os.path.join(staging_dir, "Plywood.png"),
-                name="render_plywood_png",
-            )
-            safe_run(
-                render_plywood,
-                metrics_mm,
-                materials["plywood"],
-                os.path.join(staging_dir, "Plywood.pdf"),
-                name="render_plywood_pdf",
-            )
-            safe_run(
-                render_plywood,
-                metrics_mm,
-                materials["plywood"],
-                os.path.join(staging_dir, "Plywood_chart.png"),
-                chart_only=True,
-                name="render_plywood_chart",
-            )
+        all_batch_tasks = cad_tasks + neda_ply_tasks + tiling_cf_tasks
 
-        if should_render("cf") and materials.get("cf"):
-            safe_run(
-                render_cf,
-                metrics_mm,
-                materials["cf"],
-                os.path.join(staging_dir, "CF.png"),
-                name="render_cf_png",
-            )
-            safe_run(
-                render_cf,
-                metrics_mm,
-                materials["cf"],
-                os.path.join(staging_dir, "CF.pdf"),
-                name="render_cf_pdf",
-            )
-            safe_run(
-                render_cf,
-                metrics_mm,
-                materials["cf"],
-                os.path.join(staging_dir, "CF_chart.png"),
-                chart_only=True,
-                name="render_cf_chart",
-            )
+        def _execute_sequentially(task_list: list) -> list[str]:
+            seq_warnings: list[str] = []
+            for fn, args in task_list:
+                w = fn(*args)
+                if w:
+                    seq_warnings.extend(w)
+            return seq_warnings
+
+        worker_count = workers if workers is not None else get_render_worker_count()
+
+        if worker_count <= 1 or len(all_batch_tasks) <= 1:
+            seq_warns = _execute_sequentially(all_batch_tasks)
+            render_warnings.extend(seq_warns)
+        else:
+            effective_workers = min(worker_count, len(all_batch_tasks))
+            parallel_succeeded = False
+            batch_warnings: list[str] = []
+            try:
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=effective_workers
+                ) as executor:
+                    futures = [executor.submit(fn, *args) for fn, args in all_batch_tasks]
+                    try:
+                        for f in futures:
+                            w = f.result()
+                            if w:
+                                batch_warnings.extend(w)
+                    except Exception:
+                        for f in futures:
+                            f.cancel()
+                        raise
+                render_warnings.extend(batch_warnings)
+                parallel_succeeded = True
+            except Exception as exc:
+                logger.warning(
+                    "Parallel sheet rendering encountered an error (%s); falling back to sequential execution",
+                    exc,
+                )
+                parallel_succeeded = False
+
+            if not parallel_succeeded:
+                seq_warns = _execute_sequentially(all_batch_tasks)
+                render_warnings.extend(seq_warns)
 
         combined_payload = {}
-        if should_render("combined") or render_materials == "all":
+        if _should_render(render_materials, "combined") or render_materials == "all":
             def _find_chart(name: str) -> str | None:
                 for d in (staging_dir, session_dir):
                     p = os.path.join(d, name)

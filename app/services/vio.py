@@ -30,9 +30,21 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation, Slerp
 
+def _cv_threads_from_env() -> int:
+    """cv2.setNumThreads value from VIO_CV_THREADS (default os.cpu_count(); bad values fall back)."""
+    raw = os.environ.get("VIO_CV_THREADS", "").strip()
+    default = os.cpu_count() or 2
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
 try:
     import cv2
-    cv2.setNumThreads(2)
+    cv2.setNumThreads(_cv_threads_from_env())
 except ImportError:
     cv2 = None
 
@@ -46,12 +58,15 @@ from app.services.vio_core.spad_depth_fusion import associate_spad_depth
 from app.services.vio_core.triangulation import point_3d_to_inverse_depth, compute_parallax_angle
 from app.services.vio_core.lidar_constraints import build_spad_lidar_constraint
 from app.services.vio_core.hub_imu_fusion import build_hub_imu_constraint
-from app.services.vio_core.rts_smoother import ManifoldRtsSmoother, _copy_state
+from app.services.vio_core.rts_smoother import ManifoldRtsSmoother, _copy_state, resolve_rts_device
 from app.services.calibration import (
     remap_lidar_zones_to_camera_frame,
     load_T_bc,
     load_camera_intrinsics,
+    load_session_extrinsics,
+    extract_lidar_display_metadata,
 )
+from app.services.alignment import estimate_R_phone_hub
 from app.services.vio_core.visual_update import (
     LandmarkTrackMap,
     STATUS_CANDIDATE,
@@ -63,6 +78,7 @@ from app.services.vio_core.visual_update import (
 )
 from app.services.vio_core.loop_closure import LoopDetector
 from app.services.vio_core.pose_graph_optimizer import PoseGraphOptimizer, apply_pgo_se3_interpolation
+from app.services.vio_core.frontend_pipeline import FrontendFrame, FrontendPipeline, FrontendTimeout, decode_gray
 
 PUBLISH_WALL_S = float(os.environ.get("VIO_WALL_CLOCK_BUDGET_S", "450.0"))
 
@@ -83,6 +99,14 @@ class SensorEvent:
     data: Dict[str, Any]
 
     def __lt__(self, other: "SensorEvent") -> bool:
+        s_ok = np.isfinite(self.timestamp)
+        o_ok = np.isfinite(other.timestamp)
+        if not s_ok and not o_ok:
+            return False
+        if not s_ok:
+            return False
+        if not o_ok:
+            return True
         if self.timestamp != other.timestamp:
             return self.timestamp < other.timestamp
         # Priority fallback for tie-breaking: PHONE_IMU -> HUB_IMU -> SPAD_LIDAR -> CAMERA_FRAME
@@ -152,6 +176,8 @@ class EventDrivenTimeSynchronizer:
         gyr_vals = df[[gx_col, gy_col, gz_col]].to_numpy(dtype=np.float64)
 
         for i in range(len(ts_vals)):
+            if not np.isfinite(ts_vals[i]):
+                continue
             self.enqueue_phone_imu(ts_vals[i], acc_vals[i], gyr_vals[i])
 
     def add_hub_imu_df(self, df: pd.DataFrame) -> None:
@@ -179,6 +205,8 @@ class EventDrivenTimeSynchronizer:
         gyr_vals = df[[gx_col, gy_col, gz_col]].to_numpy(dtype=np.float64)
 
         for i in range(len(ts_vals)):
+            if not np.isfinite(ts_vals[i]):
+                continue
             self.enqueue_hub_imu(ts_vals[i], acc_vals[i], gyr_vals[i])
 
     def add_spad_lidar_df(self, df: pd.DataFrame) -> None:
@@ -192,23 +220,31 @@ class EventDrivenTimeSynchronizer:
         if ts_col is None:
             return
         grid_col = "depth_grid" if "depth_grid" in df.columns else ("spad_depth" if "spad_depth" in df.columns else None)
-        has_dist_0 = "distance_0" in df.columns
-        has_status_0 = "status_0" in df.columns
+        has_dist_0 = "distance_0" in df.columns or "d0" in df.columns
+        has_status_0 = "status_0" in df.columns or "s0" in df.columns
 
-        ts_vals = df[ts_col].to_numpy(dtype=np.float64)
+        ts_series = df[ts_col]
+        if ts_series.isna().any() and "mobile_receive_timestamp_nanos" in df.columns:
+            ts_series = ts_series.fillna(df["mobile_receive_timestamp_nanos"])
+        ts_vals = ts_series.to_numpy(dtype=np.float64)
         n = len(ts_vals)
 
         if grid_col is not None:
             grids = df[grid_col].tolist()
         elif has_dist_0:
-            dist_cols = [f"distance_{i}" for i in range(64)]
-            grids = df[dist_cols].to_numpy(dtype=np.float64).reshape(-1, 8, 8)
+            prefix = "distance_" if "distance_0" in df.columns else "d"
+            dist_cols = [f"{prefix}{i}" for i in range(64)]
+            raw_depth = df[dist_cols].to_numpy(dtype=np.float64)
+            if np.nanmedian(raw_depth) > 20.0 or np.nanmax(raw_depth) > 50.0:
+                raw_depth = raw_depth / 1000.0
+            grids = raw_depth.reshape(-1, 8, 8)
         else:
             return
 
         statuses = None
         if has_status_0:
-            status_cols = [f"status_{i}" for i in range(64)]
+            s_prefix = "status_" if "status_0" in df.columns else "s"
+            status_cols = [f"{s_prefix}{i}" for i in range(64)]
             statuses = df[status_cols].to_numpy(dtype=np.float64).reshape(-1, 8, 8)
         elif "status_mask" in df.columns:
             statuses = df["status_mask"].tolist()
@@ -216,6 +252,8 @@ class EventDrivenTimeSynchronizer:
             statuses = df["status_grid"].tolist()
 
         for i in range(n):
+            if not np.isfinite(ts_vals[i]):
+                continue
             grid = grids[i]
             if isinstance(grid, (list, np.ndarray)):
                 grid = np.asarray(grid, dtype=np.float64)
@@ -249,7 +287,10 @@ class ServerSideVioEstimator:
     """
 
     def __init__(self) -> None:
-        pass
+        try:
+            resolve_rts_device()
+        except Exception:
+            pass
 
     def process_session(
         self,
@@ -303,12 +344,25 @@ class ServerSideVioEstimator:
         # Check if small room from SPAD sensor depths
         is_small_room = False
         if spad_lidar_df is not None and not spad_lidar_df.empty:
-            d_cols = [c for c in spad_lidar_df.columns if c.startswith("distance_") or c.startswith("d") or c.isdigit()]
+            valid_vals = []
+            d_cols = [c for c in spad_lidar_df.columns if c.startswith("distance_") or (c.startswith("d") and c != "depth_grid") or c.isdigit()]
             if d_cols:
-                vals = spad_lidar_df[d_cols].to_numpy(dtype=float)
-                valid_vals = vals[(vals > 0.05) & np.isfinite(vals)]
-                if len(valid_vals) > 0:
-                    depth_p90 = float(np.percentile(valid_vals, 90))
+                try:
+                    vals = spad_lidar_df[d_cols].to_numpy(dtype=float)
+                    valid_vals.append(vals[(vals > 0.05) & np.isfinite(vals)].ravel())
+                except (ValueError, TypeError) as exc:
+                    # A non-numeric column slipped through the name filter; skip the scalar pool
+                    # rather than abort the session (depth_grid is handled separately below).
+                    logger.warning("is_small_room: skipping non-numeric SPAD columns %s: %s", d_cols, exc)
+            # Object column of per-frame (8,8) grids (synthetic/test sessions); real sessions use d0..d63.
+            if "depth_grid" in spad_lidar_df.columns:
+                for g in spad_lidar_df["depth_grid"].dropna():
+                    arr = np.asarray(g, dtype=float).ravel()
+                    valid_vals.append(arr[(arr > 0.05) & np.isfinite(arr)])
+            if valid_vals:
+                all_valid = np.concatenate(valid_vals)
+                if len(all_valid) > 0:
+                    depth_p90 = float(np.percentile(all_valid, 90))
                     if depth_p90 > 50.0:
                         depth_p90 = depth_p90 / 1000.0
                     if depth_p90 <= 2.50:
@@ -391,7 +445,6 @@ class ServerSideVioEstimator:
         latest_spad_depth: Optional[np.ndarray] = None
         latest_spad_status: Optional[np.ndarray] = None
         latest_phone_gyro: Optional[np.ndarray] = None
-        R_wc_prev: Optional[np.ndarray] = None
         first_camera_seen = False
         first_camera_time = frame_timestamps[0] if (frame_timestamps and len(frame_timestamps) > 0) else float("inf")
 
@@ -493,454 +546,520 @@ class ServerSideVioEstimator:
             else:
                 R_vio_odo = R0
 
+        # Frontend producer: gyro-predicted KLT initial flow (design §3.1–3.2). Frames and gyro
+        # samples are taken from the very event list the loop consumes, so both sides agree.
+        cam_frames = [
+            FrontendFrame(
+                frame_id=int(e.data["frame_id"]),
+                timestamp=float(e.timestamp),
+                image=e.data.get("image") if e.data.get("image") is not None else e.data.get("image_path"),
+            )
+            for e in sorted_events
+            if e.sensor_type == SensorType.CAMERA_FRAME
+        ]
+        imu_events = [e for e in sorted_events if e.sensor_type == SensorType.PHONE_IMU]
+        gyro_t = np.array([e.timestamp for e in imu_events], dtype=np.float64)
+        gyro_w = np.array([e.data["gyro"] for e in imu_events], dtype=np.float64).reshape(-1, 3)
+        del imu_events
+        parallel_frontend = os.environ.get("VIO_PARALLEL_FRONTEND", "1").strip() != "0"
+        is_standard_frontend = (
+            getattr(frontend.process_frame, "__qualname__", "") == "VisualFrontend.process_frame"
+            and getattr(frontend.process_frame, "__module__", "") == "app.services.vio_core.visual_frontend"
+        )
+        use_process = (
+            os.environ.get("VIO_FRONTEND_PROCESS", "1").strip() != "0"
+            and parallel_frontend
+            and is_standard_frontend
+        )
+        pipeline = FrontendPipeline(
+            cam_frames,
+            gyro_t,
+            gyro_w,
+            eskf.state.bg.copy(),
+            T_bc,
+            frontend,
+            threaded=parallel_frontend,
+            use_process=use_process,
+        )
+
+        timings: Dict[str, float] = {
+            "frontend": 0.0, "frontend_wait": 0.0, "dlt": 0.0, "eskf_update": 0.0,
+            "imu": 0.0, "rts": 0.0, "pgo": 0.0, "total": 0.0,
+        }
+
+        def _timeout_result() -> Dict[str, Any]:
+            g_out = [0.0, 0.0, 0.0]
+            if hasattr(eskf.state, "g"):
+                g_out = np.asarray(eskf.state.g, dtype=float).reshape(3).tolist()
+            timings["frontend"] = pipeline.compute_time_s
+            timings["total"] = time.monotonic() - t_proc_start
+            return {
+                "status": "timeout",
+                "message": "wall_clock_exceeded",
+                "trajectory": [],
+                "ate_rmse": 0.0,
+                "gravity": g_out,
+                "_gate_stats": {},
+                "_timings": dict(timings),
+            }
+
         t_proc_start = time.monotonic()
         initial_floor_distance = None
-        for event in sorted_events:
-            ts = event.timestamp
+        R_C_floor = None
+        pipeline.start()
+        try:
+            for event in sorted_events:
+                ts = event.timestamp
 
-            if event.sensor_type == SensorType.PHONE_IMU:
-                accel = event.data["accel"].copy()
-                gyro = event.data["gyro"].copy()
-                if scale_accel:
-                    accel *= 9.80665
+                if event.sensor_type == SensorType.PHONE_IMU:
+                    accel = event.data["accel"].copy()
+                    gyro = event.data["gyro"].copy()
+                    if scale_accel:
+                        accel *= 9.80665
 
-                if last_phone_imu_time is not None:
-                    dt = ts - last_phone_imu_time
-                    if dt > 0.0:
-                        preint.integrate(accel, gyro, dt)
-                        F_k = eskf.predict_imu(preint)
-                        F_list.append(F_k.copy())
-                        pred_states.append(_copy_state(eskf.state))
-                        preint.reset(eskf.state.ba, eskf.state.bg)
+                    if last_phone_imu_time is not None:
+                        dt = ts - last_phone_imu_time
+                        if dt > 0.0:
+                            t_imu0 = time.perf_counter()
+                            preint.integrate(accel, gyro, dt)
+                            F_k = eskf.predict_imu(preint)
+                            timings["imu"] += time.perf_counter() - t_imu0
+                            F_list.append(F_k.copy())
+                            pred_states.append(_copy_state(eskf.state))
+                            preint.reset(eskf.state.ba, eskf.state.bg)
 
-                        # Pre-camera stabilization and stationary ZUPT
-                        if not first_camera_seen and ts < first_camera_time:
-                            eskf.state.v[:] = 0.0
-                            eskf.state.p[:] = 0.0
-                            eskf.update_zupt(sigma_vel=0.005)
+                            # Pre-camera stabilization and stationary ZUPT
+                            if not first_camera_seen and ts < first_camera_time:
+                                eskf.state.v[:] = 0.0
+                                eskf.state.p[:] = 0.0
+                                eskf.update_zupt(sigma_vel=0.005)
+                            else:
+                                # In-flight ZUPT during camera tracking only when device is physically at rest
+                                w_mag = float(np.linalg.norm(gyro - eskf.state.bg))
+                                g_mag = float(np.linalg.norm(eskf.state.g)) if hasattr(eskf.state, "g") else 9.80665
+                                a_dyn = abs(float(np.linalg.norm(accel)) - g_mag)
+                                if w_mag < 0.03 and a_dyn < 0.15:
+                                    eskf.update_zupt(sigma_vel=0.01)
+
+                            cur_v_mag = float(np.linalg.norm(eskf.state.v))
+                            if cur_v_mag > 1.2:
+                                eskf.state.v *= (1.2 / cur_v_mag)
+                            eskf.state.v[2] = float(np.clip(eskf.state.v[2], -0.80, 0.80))
+                            eskf.state.p[2] = float(np.clip(eskf.state.p[2], -1.60, 1.20))
                         else:
-                            # In-flight ZUPT during camera tracking only when device is physically at rest
-                            w_mag = float(np.linalg.norm(gyro - eskf.state.bg))
-                            g_mag = float(np.linalg.norm(eskf.state.g)) if hasattr(eskf.state, "g") else 9.80665
-                            a_dyn = abs(float(np.linalg.norm(accel)) - g_mag)
-                            if w_mag < 0.03 and a_dyn < 0.15:
-                                eskf.update_zupt(sigma_vel=0.01)
+                            F_list.append(np.eye(StateIndex.DIM))
+                            pred_states.append(_copy_state(eskf.state))
 
-                        cur_v_mag = float(np.linalg.norm(eskf.state.v))
-                        if cur_v_mag > 1.2:
-                            eskf.state.v *= (1.2 / cur_v_mag)
-                        eskf.state.v[2] = float(np.clip(eskf.state.v[2], -0.80, 0.80))
-                        eskf.state.p[2] = float(np.clip(eskf.state.p[2], -1.60, 1.20))
-                    else:
-                        F_list.append(np.eye(StateIndex.DIM))
-                        pred_states.append(_copy_state(eskf.state))
+                    last_phone_imu_time = ts
+                    latest_phone_gyro = gyro.copy()
 
-                last_phone_imu_time = ts
-                latest_phone_gyro = gyro.copy()
+                    forward_states.append(_copy_state(eskf.state))
+                    S_P_list.append(eskf.S_P.copy())
+                    timestamps.append(ts)
 
-                forward_states.append(_copy_state(eskf.state))
-                S_P_list.append(eskf.S_P.copy())
-                timestamps.append(ts)
+                elif event.sensor_type == SensorType.HUB_IMU:
+                    omega_hub = event.data["gyro"]
+                    if latest_phone_gyro is not None and R_phone_hub is not None and last_phone_imu_time is not None:
+                        dt_sync = abs(ts - last_phone_imu_time)
+                        w_norm = float(np.linalg.norm(latest_phone_gyro))
+                        if dt_sync <= 0.025 and 0.05 <= w_norm < 2.5:
+                            y, H, R_cov = build_hub_imu_constraint(
+                                eskf.state, omega_hub, latest_phone_gyro, R_phone_hub=R_phone_hub
+                            )
+                            # Inflate measurement noise to account for dynamic rotation and timestamp skew
+                            sigma_motion = 0.05 * w_norm + 3.0 * dt_sync
+                            R_eff = R_cov + (sigma_motion ** 2) * np.eye(3, dtype=np.float64)
+                            eskf.update_measurement(y, H, R_eff)
 
-            elif event.sensor_type == SensorType.HUB_IMU:
-                omega_hub = event.data["gyro"]
-                if latest_phone_gyro is not None and R_phone_hub is not None and last_phone_imu_time is not None:
-                    dt_sync = abs(ts - last_phone_imu_time)
-                    w_norm = float(np.linalg.norm(latest_phone_gyro))
-                    if dt_sync <= 0.025 and 0.05 <= w_norm < 2.5:
-                        y, H, R_cov = build_hub_imu_constraint(
-                            eskf.state, omega_hub, latest_phone_gyro, R_phone_hub=R_phone_hub
+                elif event.sensor_type == SensorType.SPAD_LIDAR:
+                    latest_spad_depth = event.data["depth_map"]
+                    latest_spad_status = event.data.get("status_mask")
+
+                elif event.sensor_type == SensorType.CAMERA_FRAME:
+                    first_camera_seen = True
+                    if max_wall_time_s is not None and (time.monotonic() - t_proc_start) > max_wall_time_s:
+                        logger.warning(
+                            "VIO processing aborted: wall clock budget of %s s exceeded during camera frame processing",
+                            max_wall_time_s,
                         )
-                        # Inflate measurement noise to account for dynamic rotation and timestamp skew
-                        sigma_motion = 0.05 * w_norm + 3.0 * dt_sync
-                        R_eff = R_cov + (sigma_motion ** 2) * np.eye(3, dtype=np.float64)
-                        eskf.update_measurement(y, H, R_eff)
+                        return _timeout_result()
 
-            elif event.sensor_type == SensorType.SPAD_LIDAR:
-                latest_spad_depth = event.data["depth_map"]
-                latest_spad_status = event.data.get("status_mask")
+                    frame_id = event.data["frame_id"]
+                    get_timeout = None
+                    if max_wall_time_s is not None:
+                        get_timeout = max(0.1, max_wall_time_s - (time.monotonic() - t_proc_start))
+                    t_fe0 = time.perf_counter()
+                    try:
+                        fres = pipeline.get(frame_id, timeout=get_timeout)
+                    except FrontendTimeout:
+                        logger.warning(
+                            "VIO processing aborted: frontend result for frame %s not ready within wall clock budget",
+                            frame_id,
+                        )
+                        return _timeout_result()
+                    timings["frontend_wait"] += time.perf_counter() - t_fe0
 
-            elif event.sensor_type == SensorType.CAMERA_FRAME:
-                first_camera_seen = True
-                if max_wall_time_s is not None and (time.monotonic() - t_proc_start) > max_wall_time_s:
-                    logger.warning(
-                        "VIO processing aborted: wall clock budget of %s s exceeded during camera frame processing",
-                        max_wall_time_s,
-                    )
-                    g_out = [0.0, 0.0, 0.0]
-                    if hasattr(eskf.state, "g"):
-                        g_out = np.asarray(eskf.state.g, dtype=float).reshape(3).tolist()
-                    return {
-                        "status": "timeout",
-                        "message": "wall_clock_exceeded",
-                        "trajectory": [],
-                        "ate_rmse": 0.0,
-                        "gravity": g_out,
-                        "_gate_stats": {},
-                    }
+                    if not fres.skipped:
+                        R_wc_now, p_wc_now = camera_pose_from_body(eskf.state, T_bc)
+                        R_prev_curr = fres.R_prev_curr
 
-                img = event.data.get("image")
-                img_path = event.data.get("image_path")
-                if img is None and img_path and os.path.exists(img_path):
-                    if cv2 is not None:
-                        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+                        matched_pts_prev = fres.matched_pts_prev
+                        matched_pts_curr = fres.matched_pts_curr
+                        new_uv = fres.new_pts
+                        w_img, h_img = fres.image_size
+                        track_map.sync_klt(matched_pts_prev, matched_pts_curr, new_uv, image_size=(w_img, h_img))
 
-                frame_id = event.data["frame_id"]
-                if img is not None and isinstance(img, np.ndarray):
-                    if img.ndim == 3:
-                        if cv2 is not None:
-                            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                        else:
-                            gray = np.mean(img, axis=2).astype(np.uint8)
-                    else:
-                        gray = img
-
-                    R_wc_now, p_wc_now = camera_pose_from_body(eskf.state, T_bc)
-                    R_prev_curr = relative_camera_rotation(R_wc_prev, R_wc_now) if R_wc_prev is not None else None
-
-                    res = frontend.process_frame(gray, R_prev_curr)
-
-                    matched_pts_prev = res.get("matched_pts_prev", np.empty((0, 2)))
-                    matched_pts_curr = res.get("matched_pts_curr", np.empty((0, 2)))
-                    n_inj = res.get("new_features_injected", 0)
-                    new_uv = res.get("new_pts")
-                    if new_uv is None:
-                        if n_inj > 0 and hasattr(frontend, "_prev_pts") and len(frontend._prev_pts) >= n_inj:
-                            new_uv = frontend._prev_pts[-n_inj:].reshape(-1, 2)
-                        else:
-                            new_uv = np.empty((0, 2))
-                    h_img, w_img = gray.shape[:2]
-                    track_map.sync_klt(matched_pts_prev, matched_pts_curr, new_uv, image_size=(w_img, h_img))
-
-                    if latest_spad_depth is not None:
-                        depth_to_assoc = latest_spad_depth
-                        status_to_assoc = latest_spad_status
-                        has_grid_remap = bool(flip_h or flip_v or (rot_deg != 0))
-                        if has_grid_remap:
-                            depth_to_assoc = remap_lidar_zones_to_camera_frame(
-                                latest_spad_depth, flip_h=flip_h, flip_v=flip_v, rot_deg=rot_deg
-                            )
-                            if status_to_assoc is not None:
-                                status_to_assoc = remap_lidar_zones_to_camera_frame(
-                                    status_to_assoc, flip_h=flip_h, flip_v=flip_v, rot_deg=rot_deg
+                        if latest_spad_depth is not None:
+                            depth_to_assoc = latest_spad_depth
+                            status_to_assoc = latest_spad_status
+                            has_grid_remap = bool(flip_h or flip_v or (rot_deg != 0))
+                            if has_grid_remap:
+                                depth_to_assoc = remap_lidar_zones_to_camera_frame(
+                                    latest_spad_depth, flip_h=flip_h, flip_v=flip_v, rot_deg=rot_deg
                                 )
-                        candidate_tracks = [t for t in track_map.tracks_by_id.values() if t.status == STATUS_CANDIDATE]
-                        if candidate_tracks:
-                            cand_uvs = np.array([t.uv for t in candidate_tracks], dtype=np.float64)
-                            T_cam_spad_eff = None
-                            if T_lidar_camera is not None:
-                                if has_grid_remap:
-                                    T_cam_spad_eff = np.eye(4, dtype=np.float64)
-                                    T_cam_spad_eff[:3, 3] = T_lidar_camera[:3, 3]
-                                else:
-                                    T_cam_spad_eff = T_lidar_camera
-                            depths, validity, variances = associate_spad_depth(
-                                depth_to_assoc,
-                                cand_uvs,
-                                K,
-                                T_cam_spad=T_cam_spad_eff,
-                                status_mask=status_to_assoc,
-                                image_size=(w_img, h_img),
-                                rays=rays,
-                                ray_frame=ray_frame,
-                            )
-                            track_map.ingest_spad(
-                                depths,
-                                validity,
-                                variances,
-                                R_wc_now,
-                                p_wc_now,
-                                s_L=eskf.state.sl,
-                                K=K,
-                            )
-
-                    track_map.try_promote_dlt(R_wc_now, p_wc_now, K)
-
-                    if latest_spad_depth is not None and hasattr(eskf, "update_floor_distance"):
-                        d_grid = np.asarray(latest_spad_depth, dtype=np.float64)
-                        if d_grid.ndim == 2:
-                            hg, wg = d_grid.shape
-                            floor_z_estimates = []
-                            for rg in range(hg):
-                                for cg in range(wg):
-                                    d_val = float(d_grid[rg, cg])
-                                    if d_val < 0.20 or d_val > 3.0:
-                                        continue
-                                    u_c = ((cg + 0.5) / wg) * w_img
-                                    v_c = ((rg + 0.5) / hg) * h_img
-                                    r_c = np.array([(u_c - K[0, 2]) / K[0, 0], (v_c - K[1, 2]) / K[1, 1], 1.0], dtype=np.float64)
-                                    r_c_norm = np.linalg.norm(r_c)
-                                    if r_c_norm > 1e-6:
-                                        r_c = r_c / r_c_norm
-                                        r_w = R_wc_now @ r_c
-                                        if r_w[2] < -0.70:
-                                            pz_meas = d_val * abs(r_w[2])
-                                            if 0.10 <= pz_meas <= 2.50:
-                                                floor_z_estimates.append(pz_meas)
-                            if floor_z_estimates:
-                                med_pz = float(np.median(floor_z_estimates))
-                                if initial_floor_distance is None:
-                                    initial_floor_distance = med_pz
-                                delta_pz = med_pz - initial_floor_distance
-                                eskf.update_floor_distance(delta_pz, sigma_z=0.03)
-
-                    cur_active = [t for t in track_map.tracks_by_id.values() if t.status == STATUS_ACTIVE]
-                    active_counts.append(len(cur_active))
-                    cur_spad_active = [t for t in cur_active if t.origin == ORIGIN_SPAD]
-                    spad_active_counts.append(len(cur_spad_active))
-                    all_spad_active_ids.update(t.track_id for t in cur_spad_active)
-
-                    tracks = track_map.select_for_update((w_img, h_img))
-                    meas = build_visual_measurement(
-                        eskf.state, tracks, K, T_bc, eskf.P, image_size=(w_img, h_img)
-                    )
-                    if meas is not None:
-                        y, H, R_cov = meas
-                        try:
-                            if eskf.update_visual(y, H, R_cov):
-                                frames_with_accepted_visual += 1
-                        except (np.linalg.LinAlgError, ValueError) as exc:
-                            logger.debug("Visual update failed with numerical exception: %s", exc)
-
-                    # Check optical flow parallax / odometry speed for ZUPT
-                    is_stationary = False
-                    if len(matched_pts_prev) >= 10 and len(matched_pts_curr) >= 10:
-                        p_norm = (matched_pts_prev - np.array([K[0, 2], K[1, 2]])) / np.array([K[0, 0], K[1, 1]])
-                        p_norm_hom = np.hstack([p_norm, np.ones((len(p_norm), 1))])
-                        if R_prev_curr is not None:
-                            p_derot = (R_prev_curr @ p_norm_hom.T).T
-                            u_derot = np.column_stack([
-                                K[0, 0] * p_derot[:, 0] / p_derot[:, 2] + K[0, 2],
-                                K[1, 1] * p_derot[:, 1] / p_derot[:, 2] + K[1, 2],
-                            ])
-                            flow_res = np.linalg.norm(matched_pts_curr - u_derot, axis=1)
-                            if np.median(flow_res) < 1.0:
-                                is_stationary = True
-
-                    o_spad = float(np.clip(len(cur_spad_active) / 8.0, 0.0, 1.0))
-                    q_motion = 1.0
-                    if odo_times is not None and len(odo_times) > 1:
-                        idx_odo = np.clip(np.searchsorted(odo_times, ts), 1, len(odo_times) - 1)
-                        dt_o = max(1e-3, odo_times[idx_odo] - odo_times[idx_odo - 1])
-                        dp_odo = odo_pos[idx_odo] - odo_pos[idx_odo - 1]
-                        s_odo = float(np.linalg.norm(dp_odo) / max(dt_o, 0.005))
-                        if s_odo < 0.05:
-                            is_stationary = True
-                        if s_odo > 2.5 or dt_o < 0.005:
-                            q_motion = 0.0
-                        else:
-                            q_motion = float(np.clip(1.0 - max(0.0, s_odo - 1.2), 0.0, 1.0))
-
-                    if is_stationary:
-                        eskf.state.v[:] = 0.0
-                        eskf.update_zupt(sigma_vel=0.01)
-                    elif odo_times is not None and len(odo_times) > 1 and q_motion > 0.0:
-                        alpha_v = float(np.clip(0.80 - 0.10 * o_spad, 0.65, 0.85)) * q_motion
-                        if R_vio_odo is not None:
-                            v_odo_w = R_vio_odo @ (dp_odo / dt_o)
-                            v_odo_w[2] = 0.0
-                            eskf.state.v[:2] = (1.0 - alpha_v) * eskf.state.v[:2] + alpha_v * v_odo_w[:2]
-                            eskf.state.v[2] = float(np.clip(eskf.state.v[2] * (1.0 - 0.5 * alpha_v), -0.40, 0.40))
-                        else:
-                            v_norm = float(np.linalg.norm(eskf.state.v))
-                            if v_norm > 1e-4 and s_odo > 1e-4:
-                                target_speed = (1.0 - alpha_v) * v_norm + alpha_v * min(s_odo, 2.0)
-                                eskf.state.v = (eskf.state.v / v_norm) * target_speed
-
-                        v_cur_speed = float(np.linalg.norm(eskf.state.v))
-                        max_allowed_speed = max(1.2 * s_odo, 0.10)
-                        if v_cur_speed > max_allowed_speed:
-                            eskf.state.v *= (max_allowed_speed / v_cur_speed)
-
-                    v_mag = float(np.linalg.norm(eskf.state.v))
-                    if v_mag > 1.2:
-                        eskf.state.v *= (1.2 / v_mag)
-
-                    R_wc_prev = R_wc_now.copy()
-
-                    # Keyframe / PGO Node selection & Odometry / Loop Edge construction
-                    snap_idx = len(camera_snapshots)
-                    is_first_camera = (len(pgo_node_ids) == 0)
-                    is_node = False
-                    if is_first_camera:
-                        is_node = True
-                    else:
-                        delta_p = float(np.linalg.norm(p_wc_now - last_node_p_wc))
-                        R_rel = last_node_R_wc.T @ R_wc_now
-                        angle_diff = float(np.linalg.norm(so3_log(R_rel)))
-                        delta_theta_deg = float(np.rad2deg(angle_diff))
-                        frames_since_last_node += 1
-                        if delta_p >= 0.08 or delta_theta_deg >= 8.0 or frames_since_last_node >= 12:
-                            is_node = True
-
-                    if is_node:
-                        node_id = len(pgo_node_ids)
-                        pgo.add_node(node_id, R_wc_now, p_wc_now)
-                        if node_id > 0:
-                            prev_node_id = pgo_node_ids[-1]
-                            R_rel_meas = last_node_R_wc.T @ R_wc_now
-                            t_rel_meas = last_node_R_wc.T @ (p_wc_now - last_node_p_wc)
-
-                            # Soft Scale Anchor from ARCore relative translation with motion gating
-                            o_node = o_spad
-                            if odo_times is not None and len(odo_times) > 1:
-                                t_prev = pgo_nodes_meta[-1]["timestamp"]
-                                t_curr = ts
-                                idx_p = np.clip(np.searchsorted(odo_times, t_prev), 0, len(odo_times) - 1)
-                                idx_c = np.clip(np.searchsorted(odo_times, t_curr), 0, len(odo_times) - 1)
-                                dt_seg = max(1e-3, t_curr - t_prev)
-                                dp_raw = odo_pos[idx_c] - odo_pos[idx_p]
-                                s_seg = float(np.linalg.norm(dp_raw) / max(dt_seg, 0.005))
-                                if s_seg > 2.5 or dt_seg < 0.005:
-                                    q_seg = 0.0
-                                else:
-                                    q_seg = float(np.clip(1.0 - max(0.0, s_seg - 1.2), 0.0, 1.0))
-
-                                if len(all_spad_active_ids) >= 50:
-                                    w_odo = 0.0
-                                else:
-                                    w_odo = float(np.clip(0.80 - 0.20 * o_node, 0.35, 0.85)) * max(q_seg, 0.20)
-                                if w_odo > 0.0:
-                                    if R_vio_odo is not None:
-                                        dp_w_odo = R_vio_odo @ dp_raw
-                                        dp_w_odo[2] = 0.0
-                                        t_rel_odo = last_node_R_wc.T @ dp_w_odo
-                                        t_rel_meas = (1.0 - w_odo) * t_rel_meas + w_odo * t_rel_odo
+                                if status_to_assoc is not None:
+                                    status_to_assoc = remap_lidar_zones_to_camera_frame(
+                                        status_to_assoc, flip_h=flip_h, flip_v=flip_v, rot_deg=rot_deg
+                                    )
+                            candidate_tracks = [t for t in track_map.tracks_by_id.values() if t.status == STATUS_CANDIDATE]
+                            if candidate_tracks:
+                                cand_uvs = np.array([t.uv for t in candidate_tracks], dtype=np.float64)
+                                T_cam_spad_eff = None
+                                if T_lidar_camera is not None:
+                                    if has_grid_remap:
+                                        T_cam_spad_eff = np.eye(4, dtype=np.float64)
+                                        T_cam_spad_eff[:3, 3] = T_lidar_camera[:3, 3]
                                     else:
-                                        d_odo = float(np.linalg.norm(dp_raw))
-                                        meas_norm = float(np.linalg.norm(t_rel_meas))
-                                        if meas_norm > 1e-4 and d_odo > 1e-4:
-                                            d_eff = (1.0 - w_odo) * meas_norm + w_odo * d_odo
-                                            t_rel_meas = (t_rel_meas / meas_norm) * d_eff
-                                meas_norm = float(np.linalg.norm(t_rel_meas))
-                                d_raw_norm = float(np.linalg.norm(dp_raw))
-                                max_step = max(1.2 * d_raw_norm, 0.10 * dt_seg)
-                                if meas_norm > max_step and meas_norm > 1e-4:
-                                    t_rel_meas = t_rel_meas * (max_step / meas_norm)
-                                t_rel_meas[2] = float(np.clip(t_rel_meas[2], -0.20, 0.20))
+                                        T_cam_spad_eff = T_lidar_camera
+                                depths, validity, variances = associate_spad_depth(
+                                    depth_to_assoc,
+                                    cand_uvs,
+                                    K,
+                                    T_cam_spad=T_cam_spad_eff,
+                                    status_mask=status_to_assoc,
+                                    image_size=(w_img, h_img),
+                                    rays=rays,
+                                    ray_frame=ray_frame,
+                                )
+                                track_map.ingest_spad(
+                                    depths,
+                                    validity,
+                                    variances,
+                                    R_wc_now,
+                                    p_wc_now,
+                                    s_L=eskf.state.sl,
+                                    K=K,
+                                )
 
-                            info_trans = min(50.0, 10.0 + 40.0 * o_node)
-                            info_rot = 10.0
-                            pgo.add_odometry_edge(
-                                prev_node_id,
-                                node_id,
-                                R_rel_meas,
-                                t_rel_meas,
-                                information=np.diag([info_rot, info_rot, info_rot, info_trans, info_trans, info_trans]),
-                            )
+                        t_dlt0 = time.perf_counter()
+                        track_map.try_promote_dlt(R_wc_now, p_wc_now, K)
+                        timings["dlt"] += time.perf_counter() - t_dlt0
 
-                        pgo_node_ids.append(node_id)
-                        pgo_nodes_meta.append({
-                            "node_id": node_id,
+                        if latest_spad_depth is not None and hasattr(eskf, "update_floor_distance"):
+                            d_grid = np.asarray(latest_spad_depth, dtype=np.float64)
+                            if d_grid.ndim == 2:
+                                hg, wg = d_grid.shape
+                                if R_C_floor is None or R_C_floor.shape != (hg * wg, 3):
+                                    c_grid = (np.arange(wg) + 0.5) / float(wg) * float(w_img)
+                                    r_grid = (np.arange(hg) + 0.5) / float(hg) * float(h_img)
+                                    CC, RR = np.meshgrid(c_grid, r_grid)
+                                    rc_x = (CC.ravel() - K[0, 2]) / K[0, 0]
+                                    rc_y = (RR.ravel() - K[1, 2]) / K[1, 1]
+                                    rc_z = np.ones(hg * wg, dtype=np.float64)
+                                    R_C_raw = np.column_stack([rc_x, rc_y, rc_z])
+                                    norms = np.linalg.norm(R_C_raw, axis=1, keepdims=True)
+                                    R_C_floor = R_C_raw / np.maximum(norms, 1e-6)
+
+                                rw_z = R_C_floor @ R_wc_now[2, :]
+                                d_flat = d_grid.ravel()
+                                valid_m = (d_flat >= 0.20) & (d_flat <= 3.0) & (rw_z < -0.70)
+                                if np.any(valid_m):
+                                    pz = d_flat[valid_m] * np.abs(rw_z[valid_m])
+                                    pz_m = (pz >= 0.10) & (pz <= 2.50)
+                                    if np.any(pz_m):
+                                        med_pz = float(np.median(pz[pz_m]))
+                                        if initial_floor_distance is None:
+                                            initial_floor_distance = med_pz
+                                        delta_pz = med_pz - initial_floor_distance
+                                        eskf.update_floor_distance(delta_pz, sigma_z=0.03)
+
+                        cur_active = [t for t in track_map.tracks_by_id.values() if t.status == STATUS_ACTIVE]
+                        active_counts.append(len(cur_active))
+                        cur_spad_active = [t for t in cur_active if t.origin == ORIGIN_SPAD]
+                        spad_active_counts.append(len(cur_spad_active))
+                        all_spad_active_ids.update(t.track_id for t in cur_spad_active)
+
+                        t_upd0 = time.perf_counter()
+                        tracks = track_map.select_for_update((w_img, h_img))
+                        meas = build_visual_measurement(
+                            eskf.state, tracks, K, T_bc, eskf.P, image_size=(w_img, h_img)
+                        )
+                        if meas is not None:
+                            y, H, R_cov = meas
+                            try:
+                                if eskf.update_visual(y, H, R_cov):
+                                    frames_with_accepted_visual += 1
+                            except (np.linalg.LinAlgError, ValueError) as exc:
+                                logger.debug("Visual update failed with numerical exception: %s", exc)
+                        timings["eskf_update"] += time.perf_counter() - t_upd0
+
+                        # Check optical flow parallax / odometry speed for ZUPT
+                        is_stationary = False
+                        if len(matched_pts_prev) >= 10 and len(matched_pts_curr) >= 10:
+                            p_norm = (matched_pts_prev - np.array([K[0, 2], K[1, 2]])) / np.array([K[0, 0], K[1, 1]])
+                            p_norm_hom = np.hstack([p_norm, np.ones((len(p_norm), 1))])
+                            if R_prev_curr is not None:
+                                p_derot = (R_prev_curr @ p_norm_hom.T).T
+                                u_derot = np.column_stack([
+                                    K[0, 0] * p_derot[:, 0] / p_derot[:, 2] + K[0, 2],
+                                    K[1, 1] * p_derot[:, 1] / p_derot[:, 2] + K[1, 2],
+                                ])
+                                flow_res = np.linalg.norm(matched_pts_curr - u_derot, axis=1)
+                                if np.median(flow_res) < 1.0:
+                                    is_stationary = True
+
+                        o_spad = float(np.clip(len(cur_spad_active) / 8.0, 0.0, 1.0))
+                        q_motion = 1.0
+                        if odo_times is not None and len(odo_times) > 1:
+                            idx_odo = np.clip(np.searchsorted(odo_times, ts), 1, len(odo_times) - 1)
+                            dt_o = max(1e-3, odo_times[idx_odo] - odo_times[idx_odo - 1])
+                            dp_odo = odo_pos[idx_odo] - odo_pos[idx_odo - 1]
+                            s_odo = float(np.linalg.norm(dp_odo) / max(dt_o, 0.005))
+                            if s_odo < 0.05:
+                                is_stationary = True
+                            if s_odo > 2.5 or dt_o < 0.005:
+                                q_motion = 0.0
+                            else:
+                                q_motion = float(np.clip(1.0 - max(0.0, s_odo - 1.2), 0.0, 1.0))
+
+                        if is_stationary:
+                            eskf.state.v[:] = 0.0
+                            eskf.update_zupt(sigma_vel=0.01)
+                        elif odo_times is not None and len(odo_times) > 1 and q_motion > 0.0:
+                            if len(all_spad_active_ids) >= 50 or len(cur_spad_active) >= 4 or len(cur_active) >= 12:
+                                # When visual/SPAD tracking is stable, minimize odometry drift leakage:
+                                # Anchor scalar speed with low alpha_v to prevent IMU runaway without injecting drifting odometry heading
+                                alpha_v = float(np.clip(0.15 - 0.05 * o_spad, 0.05, 0.15)) * q_motion
+                                v_norm = float(np.linalg.norm(eskf.state.v))
+                                if v_norm > 1e-4 and s_odo > 1e-4:
+                                    target_speed = (1.0 - alpha_v) * v_norm + alpha_v * min(s_odo, 2.0)
+                                    eskf.state.v = (eskf.state.v / v_norm) * target_speed
+                            else:
+                                alpha_v = float(np.clip(0.60 - 0.10 * o_spad, 0.35, 0.60)) * q_motion
+                                if R_vio_odo is not None:
+                                    v_odo_w = R_vio_odo @ (dp_odo / dt_o)
+                                    v_odo_w[2] = 0.0
+                                    eskf.state.v[:2] = (1.0 - alpha_v) * eskf.state.v[:2] + alpha_v * v_odo_w[:2]
+                                    eskf.state.v[2] = float(np.clip(eskf.state.v[2] * (1.0 - 0.5 * alpha_v), -0.40, 0.40))
+                                else:
+                                    v_norm = float(np.linalg.norm(eskf.state.v))
+                                    if v_norm > 1e-4 and s_odo > 1e-4:
+                                        target_speed = (1.0 - alpha_v) * v_norm + alpha_v * min(s_odo, 2.0)
+                                        eskf.state.v = (eskf.state.v / v_norm) * target_speed
+
+                            v_cur_speed = float(np.linalg.norm(eskf.state.v))
+                            max_allowed_speed = max(1.2 * s_odo, 0.10)
+                            if v_cur_speed > max_allowed_speed:
+                                eskf.state.v *= (max_allowed_speed / v_cur_speed)
+
+                        v_mag = float(np.linalg.norm(eskf.state.v))
+                        if v_mag > 1.2:
+                            eskf.state.v *= (1.2 / v_mag)
+
+
+                        # Keyframe / PGO Node selection & Odometry / Loop Edge construction
+                        snap_idx = len(camera_snapshots)
+                        is_first_camera = (len(pgo_node_ids) == 0)
+                        is_node = False
+                        if is_first_camera:
+                            is_node = True
+                        else:
+                            delta_p = float(np.linalg.norm(p_wc_now - last_node_p_wc))
+                            R_rel = last_node_R_wc.T @ R_wc_now
+                            angle_diff = float(np.linalg.norm(so3_log(R_rel)))
+                            delta_theta_deg = float(np.rad2deg(angle_diff))
+                            frames_since_last_node += 1
+                            if delta_p >= 0.08 or delta_theta_deg >= 8.0 or frames_since_last_node >= 12:
+                                is_node = True
+
+                        if is_node:
+                            node_id = len(pgo_node_ids)
+                            pgo.add_node(node_id, R_wc_now, p_wc_now)
+                            if node_id > 0:
+                                prev_node_id = pgo_node_ids[-1]
+                                R_rel_meas = last_node_R_wc.T @ R_wc_now
+                                t_rel_meas = last_node_R_wc.T @ (p_wc_now - last_node_p_wc)
+
+                                # Soft Scale Anchor from ARCore relative translation with motion gating
+                                o_node = o_spad
+                                if odo_times is not None and len(odo_times) > 1:
+                                    t_prev = pgo_nodes_meta[-1]["timestamp"]
+                                    t_curr = ts
+                                    idx_p = np.clip(np.searchsorted(odo_times, t_prev), 0, len(odo_times) - 1)
+                                    idx_c = np.clip(np.searchsorted(odo_times, t_curr), 0, len(odo_times) - 1)
+                                    dt_seg = max(1e-3, t_curr - t_prev)
+                                    dp_raw = odo_pos[idx_c] - odo_pos[idx_p]
+                                    s_seg = float(np.linalg.norm(dp_raw) / max(dt_seg, 0.005))
+                                    if s_seg > 2.5 or dt_seg < 0.005:
+                                        q_seg = 0.0
+                                    else:
+                                        q_seg = float(np.clip(1.0 - max(0.0, s_seg - 1.2), 0.0, 1.0))
+
+                                    if len(all_spad_active_ids) >= 50:
+                                        w_odo = 0.0
+                                    else:
+                                        w_odo = float(np.clip(0.80 - 0.20 * o_node, 0.35, 0.85)) * max(q_seg, 0.20)
+                                    if w_odo > 0.0:
+                                        if R_vio_odo is not None:
+                                            dp_w_odo = R_vio_odo @ dp_raw
+                                            dp_w_odo[2] = 0.0
+                                            t_rel_odo = last_node_R_wc.T @ dp_w_odo
+                                            t_rel_meas = (1.0 - w_odo) * t_rel_meas + w_odo * t_rel_odo
+                                        else:
+                                            d_odo = float(np.linalg.norm(dp_raw))
+                                            meas_norm = float(np.linalg.norm(t_rel_meas))
+                                            if meas_norm > 1e-4 and d_odo > 1e-4:
+                                                d_eff = (1.0 - w_odo) * meas_norm + w_odo * d_odo
+                                                t_rel_meas = (t_rel_meas / meas_norm) * d_eff
+                                    meas_norm = float(np.linalg.norm(t_rel_meas))
+                                    d_raw_norm = float(np.linalg.norm(dp_raw))
+                                    max_step = max(1.2 * d_raw_norm, 0.10 * dt_seg)
+                                    if meas_norm > max_step and meas_norm > 1e-4:
+                                        t_rel_meas = t_rel_meas * (max_step / meas_norm)
+                                    t_rel_meas[2] = float(np.clip(t_rel_meas[2], -0.20, 0.20))
+
+                                info_trans = min(50.0, 10.0 + 40.0 * o_node)
+                                info_rot = 10.0
+                                pgo.add_odometry_edge(
+                                    prev_node_id,
+                                    node_id,
+                                    R_rel_meas,
+                                    t_rel_meas,
+                                    information=np.diag([info_rot, info_rot, info_rot, info_trans, info_trans, info_trans]),
+                                )
+
+                            pgo_node_ids.append(node_id)
+                            pgo_nodes_meta.append({
+                                "node_id": node_id,
+                                "timestamp": ts,
+                                "frame_id": frame_id,
+                                "snap_idx": snap_idx,
+                            })
+                            last_node_R_wc = R_wc_now.copy()
+                            last_node_p_wc = p_wc_now.copy()
+                            frames_since_last_node = 0
+
+                            p_c, uv = track_map.camera_points_for_loop(R_wc_now, p_wc_now, eskf.state.sl)
+                            if len(p_c) > 0:
+                                pts_2d = uv.reshape(-1, 2)
+                                # Compute real ORB descriptors or generate deterministic descriptors
+                                descriptors = None
+                                is_real_orb = False
+                                node_gray = fres.gray
+                                if node_gray is None:
+                                    img_src = event.data.get("image") if event.data.get("image") is not None else event.data.get("image_path")
+                                    node_gray = decode_gray(img_src)
+                                if cv2 is not None and isinstance(node_gray, np.ndarray) and node_gray.size > 0:
+                                    h_g, w_g = node_gray.shape[:2]
+                                    border = 16
+                                    valid_m = (
+                                        (pts_2d[:, 0] >= border)
+                                        & (pts_2d[:, 0] < w_g - border)
+                                        & (pts_2d[:, 1] >= border)
+                                        & (pts_2d[:, 1] < h_g - border)
+                                    )
+                                    if np.count_nonzero(valid_m) >= 12:
+                                        sub_pts_2d = pts_2d[valid_m]
+                                        sub_p_c = p_c[valid_m]
+                                        try:
+                                            orb = orb_detector if orb_detector is not None else cv2.ORB_create()
+                                            cv_kps = [
+                                                cv2.KeyPoint(x=float(pt[0]), y=float(pt[1]), size=31)
+                                                for pt in sub_pts_2d
+                                            ]
+                                            kps_out, descs_out = orb.compute(node_gray, cv_kps)
+                                            if descs_out is not None and len(descs_out) >= 12:
+                                                out_coords = np.array([[k.pt[0], k.pt[1]] for k in kps_out])
+                                                d = np.linalg.norm(sub_pts_2d[:, None, :] - out_coords[None, :, :], axis=2)
+                                                matched_sub = np.argmin(d, axis=0)
+                                                descriptors = descs_out
+                                                pts_2d = sub_pts_2d[matched_sub]
+                                                p_c = sub_p_c[matched_sub]
+                                                is_real_orb = True
+                                        except Exception:
+                                            descriptors = None
+                                del node_gray
+
+                                if not is_real_orb:
+                                    num_pts = len(pts_2d)
+                                    descriptors = np.zeros((num_pts, 32), dtype=np.uint8)
+                                    for idx_pt, pt in enumerate(pts_2d):
+                                        seed = int(abs(pt[0] * 1000 + pt[1] * 10 + node_id * 37) % 255)
+                                        descriptors[idx_pt, :] = np.uint8((np.arange(32) + seed) % 256)
+
+                                loop_detector.add_keyframe(node_id, descriptors, p_c, K, kps_2d=pts_2d)
+
+                                # Loop detection check ONLY when real ORB descriptors were extracted
+                                if is_real_orb and node_id >= loop_detector.min_kf_diff:
+                                    match = loop_detector.detect_loop(node_id, descriptors, pts_2d, K)
+                                    if match is not None:
+                                        past_node_id, query_node_id, R_loop, t_loop, inliers = match
+                                        if past_node_id in pgo.nodes and query_node_id in pgo.nodes:
+                                            R_i, p_i = pgo.nodes[past_node_id]
+                                            R_j, p_j = pgo.nodes[query_node_id]
+                                            R_rel = R_i.T @ R_j
+                                            t_rel = R_i.T @ (p_j - p_i)
+                                            t_err = float(np.linalg.norm(t_loop - t_rel))
+                                            cos_ang = float(np.clip((np.trace(R_rel.T @ R_loop) - 1.0) / 2.0, -1.0, 1.0))
+                                            ang_deg = float(np.degrees(np.arccos(cos_ang)))
+                                            t_norm = float(np.linalg.norm(t_loop))
+                                            loop_t_norm_max = 2.60 if is_small_room else max(3.5, (float(span_odo) * 1.2) if (span_odo is not None and np.isfinite(span_odo)) else 3.5)
+                                            logger.info("LOOP CANDIDATE: %d -> %d, inliers=%d, t_norm=%.3f, max=%.3f, t_err=%.3f, ang_deg=%.2f", past_node_id, query_node_id, inliers, t_norm, loop_t_norm_max, t_err, ang_deg)
+                                            # Physical room bound: adaptively bounded by scan odometry scale
+                                            if t_norm <= loop_t_norm_max:
+                                                kf_diff = abs(query_node_id - past_node_id)
+                                                max_allowed_t_err = min(0.8, 0.4 + 0.015 * kf_diff)
+
+                                                if odo_times is not None and len(odo_times) > 1:
+                                                    t_past = pgo_nodes_meta[past_node_id]["timestamp"]
+                                                    t_query = pgo_nodes_meta[query_node_id]["timestamp"]
+                                                    idx_p = np.clip(np.searchsorted(odo_times, t_past), 0, len(odo_times) - 1)
+                                                    idx_q = np.clip(np.searchsorted(odo_times, t_query), 0, len(odo_times) - 1)
+                                                    d_odo_loop = float(np.linalg.norm(odo_pos[idx_q] - odo_pos[idx_p]))
+                                                    odo_diff = abs(d_odo_loop - t_norm)
+                                                    logger.info("LOOP ODO DEBUG: %d -> %d, inliers=%d, ang=%.2f, d_odo=%.3f, t_norm=%.3f, diff=%.3f", past_node_id, query_node_id, inliers, ang_deg, d_odo_loop, t_norm, odo_diff)
+                                                    is_valid_loop = (
+                                                        (inliers >= 20 and ang_deg <= 25.0)
+                                                        or (inliers >= 20 and ang_deg <= 30.0 and d_odo_loop <= 0.45 and odo_diff <= 0.25)
+                                                        or (inliers >= 12 and ang_deg <= 30.0 and d_odo_loop <= 0.30 and odo_diff <= 0.15)
+                                                        or (inliers >= 12 and ang_deg <= 50.0 and d_odo_loop <= 0.25 and odo_diff <= 0.15)
+                                                    )
+                                                else:
+                                                    is_consistent = (t_err <= max_allowed_t_err and ang_deg <= 30.0)
+                                                    is_strong = (inliers >= 25 and ang_deg <= 25.0 and t_err <= 0.8)
+                                                    is_valid_loop = is_consistent or is_strong
+
+                                                if is_valid_loop:
+                                                    logger.info("LOOP EDGE ADDED: %d -> %d, inliers=%d, ang_deg=%.2f, t_norm=%.3f", past_node_id, query_node_id, inliers, ang_deg, t_norm)
+                                                    info_w = min(20.0, max(5.0, float(inliers) / 2.0))
+                                                    info_t = min(50.0, max(10.0, float(inliers)))
+                                                    Omega_loop = np.diag([info_w, info_w, info_w, info_t, info_t, info_t])
+                                                    pgo.add_loop_edge(past_node_id, query_node_id, R_loop, t_loop, information=Omega_loop)
+
+                        camera_snapshots.append({
                             "timestamp": ts,
                             "frame_id": frame_id,
-                            "snap_idx": snap_idx,
+                            "device_timestamp_ns": event.data.get("device_timestamp_ns", int(round(ts * 1e9))),
+                            "T_wb": (eskf.state.R.copy(), eskf.state.p.copy()),
+                            "state_idx": max(0, len(forward_states) - 1),
                         })
-                        last_node_R_wc = R_wc_now.copy()
-                        last_node_p_wc = p_wc_now.copy()
-                        frames_since_last_node = 0
 
-                        p_c, uv = track_map.camera_points_for_loop(R_wc_now, p_wc_now, eskf.state.sl)
-                        if len(p_c) > 0:
-                            pts_2d = uv.reshape(-1, 2)
-                            # Compute real ORB descriptors or generate deterministic descriptors
-                            descriptors = None
-                            is_real_orb = False
-                            if cv2 is not None and isinstance(gray, np.ndarray) and gray.size > 0:
-                                h_g, w_g = gray.shape[:2]
-                                border = 16
-                                valid_m = (
-                                    (pts_2d[:, 0] >= border)
-                                    & (pts_2d[:, 0] < w_g - border)
-                                    & (pts_2d[:, 1] >= border)
-                                    & (pts_2d[:, 1] < h_g - border)
-                                )
-                                if np.count_nonzero(valid_m) >= 12:
-                                    sub_pts_2d = pts_2d[valid_m]
-                                    sub_p_c = p_c[valid_m]
-                                    try:
-                                        orb = orb_detector if orb_detector is not None else cv2.ORB_create()
-                                        cv_kps = [
-                                            cv2.KeyPoint(x=float(pt[0]), y=float(pt[1]), size=31)
-                                            for pt in sub_pts_2d
-                                        ]
-                                        kps_out, descs_out = orb.compute(gray, cv_kps)
-                                        if descs_out is not None and len(descs_out) >= 12:
-                                            out_coords = np.array([[k.pt[0], k.pt[1]] for k in kps_out])
-                                            d = np.linalg.norm(sub_pts_2d[:, None, :] - out_coords[None, :, :], axis=2)
-                                            matched_sub = np.argmin(d, axis=0)
-                                            descriptors = descs_out
-                                            pts_2d = sub_pts_2d[matched_sub]
-                                            p_c = sub_p_c[matched_sub]
-                                            is_real_orb = True
-                                    except Exception:
-                                        descriptors = None
-
-                            if not is_real_orb:
-                                num_pts = len(pts_2d)
-                                descriptors = np.zeros((num_pts, 32), dtype=np.uint8)
-                                for idx_pt, pt in enumerate(pts_2d):
-                                    seed = int(abs(pt[0] * 1000 + pt[1] * 10 + node_id * 37) % 255)
-                                    descriptors[idx_pt, :] = np.uint8((np.arange(32) + seed) % 256)
-
-                            loop_detector.add_keyframe(node_id, descriptors, p_c, K, kps_2d=pts_2d)
-
-                            # Loop detection check ONLY when real ORB descriptors were extracted
-                            if is_real_orb and node_id >= loop_detector.min_kf_diff:
-                                match = loop_detector.detect_loop(node_id, descriptors, pts_2d, K)
-                                if match is not None:
-                                    past_node_id, query_node_id, R_loop, t_loop, inliers = match
-                                    if past_node_id in pgo.nodes and query_node_id in pgo.nodes:
-                                        R_i, p_i = pgo.nodes[past_node_id]
-                                        R_j, p_j = pgo.nodes[query_node_id]
-                                        R_rel = R_i.T @ R_j
-                                        t_rel = R_i.T @ (p_j - p_i)
-                                        t_err = float(np.linalg.norm(t_loop - t_rel))
-                                        cos_ang = float(np.clip((np.trace(R_rel.T @ R_loop) - 1.0) / 2.0, -1.0, 1.0))
-                                        ang_deg = float(np.degrees(np.arccos(cos_ang)))
-                                        t_norm = float(np.linalg.norm(t_loop))
-                                        loop_t_norm_max = 2.60 if is_small_room else max(3.5, (float(span_odo) * 1.2) if (span_odo is not None and np.isfinite(span_odo)) else 3.5)
-                                        logger.info("LOOP CANDIDATE: %d -> %d, inliers=%d, t_norm=%.3f, max=%.3f, t_err=%.3f, ang_deg=%.2f", past_node_id, query_node_id, inliers, t_norm, loop_t_norm_max, t_err, ang_deg)
-                                        # Physical room bound: adaptively bounded by scan odometry scale
-                                        if t_norm <= loop_t_norm_max:
-                                            kf_diff = abs(query_node_id - past_node_id)
-                                            max_allowed_t_err = min(0.8, 0.4 + 0.015 * kf_diff)
-
-                                            if odo_times is not None and len(odo_times) > 1:
-                                                t_past = pgo_nodes_meta[past_node_id]["timestamp"]
-                                                t_query = pgo_nodes_meta[query_node_id]["timestamp"]
-                                                idx_p = np.clip(np.searchsorted(odo_times, t_past), 0, len(odo_times) - 1)
-                                                idx_q = np.clip(np.searchsorted(odo_times, t_query), 0, len(odo_times) - 1)
-                                                d_odo_loop = float(np.linalg.norm(odo_pos[idx_q] - odo_pos[idx_p]))
-                                                odo_diff = abs(d_odo_loop - t_norm)
-                                                logger.info("LOOP ODO DEBUG: %d -> %d, inliers=%d, ang=%.2f, d_odo=%.3f, t_norm=%.3f, diff=%.3f", past_node_id, query_node_id, inliers, ang_deg, d_odo_loop, t_norm, odo_diff)
-                                                is_valid_loop = (
-                                                    (inliers >= 20 and ang_deg <= 25.0)
-                                                    or (inliers >= 20 and ang_deg <= 30.0 and d_odo_loop <= 0.45 and odo_diff <= 0.25)
-                                                    or (inliers >= 12 and ang_deg <= 30.0 and d_odo_loop <= 0.30 and odo_diff <= 0.15)
-                                                    or (inliers >= 12 and ang_deg <= 50.0 and d_odo_loop <= 0.25 and odo_diff <= 0.15)
-                                                )
-                                            else:
-                                                is_consistent = (t_err <= max_allowed_t_err and ang_deg <= 30.0)
-                                                is_strong = (inliers >= 25 and ang_deg <= 25.0 and t_err <= 0.8)
-                                                is_valid_loop = is_consistent or is_strong
-
-                                            if is_valid_loop:
-                                                logger.info("LOOP EDGE ADDED: %d -> %d, inliers=%d, ang_deg=%.2f, t_norm=%.3f", past_node_id, query_node_id, inliers, ang_deg, t_norm)
-                                                info_w = min(20.0, max(5.0, float(inliers) / 2.0))
-                                                info_t = min(50.0, max(10.0, float(inliers)))
-                                                Omega_loop = np.diag([info_w, info_w, info_w, info_t, info_t, info_t])
-                                                pgo.add_loop_edge(past_node_id, query_node_id, R_loop, t_loop, information=Omega_loop)
-
-                    camera_snapshots.append({
-                        "timestamp": ts,
-                        "frame_id": frame_id,
-                        "device_timestamp_ns": event.data.get("device_timestamp_ns", int(round(ts * 1e9))),
-                        "T_wb": (eskf.state.R.copy(), eskf.state.p.copy()),
-                        "state_idx": max(0, len(forward_states) - 1),
-                    })
-
-                    del img
+                        fres.gray = None
+                        del fres
+        finally:
+            pipeline.stop()
+        timings["frontend"] = pipeline.compute_time_s
+        del pipeline, cam_frames
 
         # Ensure last camera frame is added as a PGO node if not already
         if camera_snapshots and pgo_nodes_meta:
@@ -1021,6 +1140,7 @@ class ServerSideVioEstimator:
         gc.collect()
 
         # Backward RTS Smoothing
+        t_rts0 = time.perf_counter()
         if len(forward_states) > 1:
             smoothed_states, _ = smoother.smooth_trajectory(
                 forward_states,
@@ -1032,6 +1152,7 @@ class ServerSideVioEstimator:
             )
         else:
             smoothed_states = forward_states
+        timings["rts"] = time.perf_counter() - t_rts0
 
         if camera_snapshots and smoothed_states:
             for snap in camera_snapshots:
@@ -1092,6 +1213,7 @@ class ServerSideVioEstimator:
                 pgo.prior_pose_0 = (pgo.nodes[0][0].copy(), pgo.nodes[0][1].copy())
 
             # Pose Graph Optimization (only if there are loop closure edges)
+            t_pgo0 = time.perf_counter()
             has_loop_edges = any(abs(j - i) > 1 for (i, j, *_) in pgo.edges)
             logger.info("PGO: has_loop_edges=%s, total_edges=%d, total_nodes=%d", has_loop_edges, len(pgo.edges), len(pgo.nodes))
             if has_loop_edges and len(pgo.nodes) > 1:
@@ -1131,6 +1253,7 @@ class ServerSideVioEstimator:
                 logger.info("PGO INTERP DONE: span_t_final=%.3f, finite_final=%s", span_t_final, bool(np.all(np.isfinite(t_final))))
             else:
                 R_final, t_final = R_filter, t_filter
+            timings["pgo"] = time.perf_counter() - t_pgo0
 
             if not np.all(np.isfinite(R_final)) or not np.all(np.isfinite(t_final)):
                 logger.warning("PGO NaN detected, reverting to R_filter, t_filter")
@@ -1207,6 +1330,8 @@ class ServerSideVioEstimator:
             "visual_accept_frac": visual_accept_frac,
         }
 
+        timings["total"] = time.monotonic() - t_proc_start
+
         return {
             "status": "success",
             "trajectory": trajectory,
@@ -1214,6 +1339,7 @@ class ServerSideVioEstimator:
             "gravity": g_out,
             "_gate_stats": gate_stats,
             "_snapshots": camera_snapshots,
+            "_timings": dict(timings),
         }
 
 
@@ -1607,7 +1733,11 @@ def _make_default_gates() -> dict[str, Any]:
 
 
 def _write_vio_diagnostics(
-    session_dir: str, published: bool, reason: Optional[str], gates: dict[str, Any]
+    session_dir: str,
+    published: bool,
+    reason: Optional[str],
+    gates: dict[str, Any],
+    timings: Optional[dict[str, Any]] = None,
 ) -> None:
     session_id = os.path.basename(os.path.abspath(session_dir))
     diag = {
@@ -1615,6 +1745,7 @@ def _write_vio_diagnostics(
         "published_server_vio": bool(published),
         "fail_open_reason": reason,
         "gates": gates,
+        "timings": dict(timings) if timings else {},
     }
     diag_path = os.path.join(session_dir, "vio_diagnostics.json")
     try:
@@ -1704,9 +1835,21 @@ def publish_session_vio(session_dir: str) -> bool:
             except Exception:
                 pass
 
-        flip_h = bool(ext_data.get("lidar_heatmap_display_flip_h", ext_data.get("flip_h", False)))
-        flip_v = bool(ext_data.get("lidar_heatmap_display_flip_v", ext_data.get("flip_v", False)))
-        rot_val = ext_data.get("camera_sensor_to_display_rotation_deg", ext_data.get("rot_deg", 0.0))
+        manifest_path = os.path.join(session_dir, "manifest.json")
+        manifest_data = {}
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    manifest_data = json.load(f)
+            except Exception:
+                pass
+
+        man_flip_h, man_flip_v, man_rot_deg = extract_lidar_display_metadata(
+            manifest_data, default_flip_h=False, default_flip_v=False, default_rot_deg=0
+        )
+        flip_h = bool(ext_data.get("lidar_heatmap_display_flip_h", ext_data.get("flip_h", man_flip_h)))
+        flip_v = bool(ext_data.get("lidar_heatmap_display_flip_v", ext_data.get("flip_v", man_flip_v)))
+        rot_val = ext_data.get("camera_sensor_to_display_rotation_deg", ext_data.get("rot_deg", man_rot_deg))
         try:
             rot_deg = float(rot_val) if rot_val is not None else 0.0
         except (ValueError, TypeError):
@@ -1729,12 +1872,33 @@ def publish_session_vio(session_dir: str) -> bool:
         except (ValueError, TypeError):
             R_phone_hub = None
 
-        hub_imu_df = None
-        if R_phone_hub is not None:
-            hub_path = os.path.join(session_dir, "processed_imu.csv")
-            if not os.path.isfile(hub_path):
-                hub_path = os.path.join(session_dir, "hub_imu.csv")
-            hub_imu_df = pd.read_csv(hub_path) if os.path.isfile(hub_path) else None
+        hub_path = os.path.join(session_dir, "processed_imu.csv")
+        if not os.path.isfile(hub_path):
+            hub_path = os.path.join(session_dir, "hub_imu.csv")
+        if not os.path.isfile(hub_path):
+            hub_path = os.path.join(session_dir, "imu.csv")
+
+        # Fallback estimation for R_phone_hub if missing from extrinsics
+        if R_phone_hub is None and os.path.isfile(hub_path):
+            try:
+                raw_hub_df = pd.read_csv(hub_path)
+                p_ts_col = next((c for c in ("device_timestamp_ns", "timestamp_nanos", "timestamp") if c in phone_imu_df.columns), None)
+                h_ts_col = next((c for c in ("device_timestamp_ns", "timestamp_nanos", "mobile_receive_timestamp_nanos", "timestamp") if c in raw_hub_df.columns), None)
+                if p_ts_col and h_ts_col and {"gx", "gy", "gz"}.issubset(phone_imu_df.columns) and {"gx", "gy", "gz"}.issubset(raw_hub_df.columns):
+                    wahba = estimate_R_phone_hub(
+                        phone_imu_df[p_ts_col].to_numpy(dtype=np.int64),
+                        phone_imu_df[["gx", "gy", "gz"]].to_numpy(dtype=np.float64),
+                        raw_hub_df[h_ts_col].to_numpy(dtype=np.int64),
+                        raw_hub_df[["gx", "gy", "gz"]].to_numpy(dtype=np.float64),
+                    )
+                    if wahba.get("accepted") and wahba.get("R") is not None:
+                        arr = np.asarray(wahba["R"], dtype=np.float64)
+                        if arr.shape == (3, 3) and np.all(np.isfinite(arr)):
+                            R_phone_hub = arr
+            except Exception as exc:
+                logger.warning("estimate_R_phone_hub fallback failed: %s", exc)
+
+        hub_imu_df = pd.read_csv(hub_path) if (R_phone_hub is not None and os.path.isfile(hub_path)) else None
 
         lidar_path = os.path.join(session_dir, "processed_lidar.csv")
         if not os.path.isfile(lidar_path):
@@ -1768,6 +1932,20 @@ def publish_session_vio(session_dir: str) -> bool:
                     ray_frame = str(lidar_int_data["frame"])
             except Exception as e:
                 logger.warning("Failed to load processed_lidar_intrinsics.json: %s", e)
+
+        # Fallback to load_session_extrinsics if T_lidar_camera or rays missing
+        if T_lidar_camera is None or rays is None:
+            try:
+                _T_imu, fallback_T_lidar, fallback_meta = load_session_extrinsics(session_dir)
+                if T_lidar_camera is None and fallback_T_lidar is not None:
+                    arr = np.asarray(fallback_T_lidar, dtype=np.float64)
+                    if arr.shape == (4, 4) and np.all(np.isfinite(arr)):
+                        T_lidar_camera = arr
+                if rays is None and "rays" in fallback_meta and fallback_meta["rays"] is not None:
+                    rays = np.asarray(fallback_meta["rays"], dtype=np.float64)
+                    ray_frame = str(fallback_meta.get("ray_frame", ray_frame))
+            except Exception as e:
+                logger.warning("load_session_extrinsics fallback failed: %s", e)
 
         # Load odometry_df for scale anchoring & loop gating if available
         odo_path = os.path.join(session_dir, "processed_odometry.csv")
@@ -1804,10 +1982,14 @@ def publish_session_vio(session_dir: str) -> bool:
         import gc
         gc.collect()
 
+        timings = dict(res.get("_timings", {})) if isinstance(res, dict) else {}
+        timings["publish_total"] = time.monotonic() - t_start
+
         # Enforce 90s wall clock limit
         if (time.monotonic() - t_start > PUBLISH_WALL_S) or (isinstance(res, dict) and res.get("status") == "timeout"):
             _unlink_csv()
-            _write_vio_diagnostics(session_dir, False, "wall_clock_exceeded", _make_default_gates())
+            timings["publish_total"] = time.monotonic() - t_start
+            _write_vio_diagnostics(session_dir, False, "wall_clock_exceeded", _make_default_gates(), timings)
             return False
 
         trajectory = res.get("trajectory", []) if isinstance(res, dict) else []
@@ -1979,7 +2161,8 @@ def publish_session_vio(session_dir: str) -> bool:
 
         if first_fail is not None:
             _unlink_csv()
-            _write_vio_diagnostics(session_dir, False, first_fail, gates)
+            timings["publish_total"] = time.monotonic() - t_start
+            _write_vio_diagnostics(session_dir, False, first_fail, gates, timings)
             return False
 
         # All gates passed! Write processed_vio.csv
@@ -2007,7 +2190,8 @@ def publish_session_vio(session_dir: str) -> bool:
                 "grav_z": g_list[2],
             })
         pd.DataFrame(rows).to_csv(vio_csv_path, index=False)
-        _write_vio_diagnostics(session_dir, True, None, gates)
+        timings["publish_total"] = time.monotonic() - t_start
+        _write_vio_diagnostics(session_dir, True, None, gates, timings)
         return True
 
     except Exception as exc:

@@ -75,6 +75,11 @@ from app.services.plane_segmentation import is_usable_gravity, resolve_gravity_v
 from app.services.reconstruction import ODOMETRY_RGB_MATCH_NS, ReconstructionService
 from app.services.room_model import export_room_model_glb
 from app.services.room_model_texture import export_room_model_texture_glb
+from app.services.reconstruction_concurrency import (
+    ParallelVGGTWorker,
+    check_parallel_reconstruction_hardware,
+    is_vggt_enabled,
+)
 from app.services.vggt_prior import attach_vggt_diagnostics, load_vggt_prior
 from app.services.vio import VioEstimator, publish_session_vio
 
@@ -984,6 +989,7 @@ def run_3d_reconstruction(
     enable_server_vio: bool = True,
     enable_tof_pipeline: bool = True,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    enable_parallel: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Execute pure 3D reconstruction and spatial measurement chain on session_dir."""
     if not enable_tof_pipeline:
@@ -1071,123 +1077,189 @@ def run_3d_reconstruction(
         diag = 0.0
     z_max_ghost = max(GHOST_RANGE_FLOOR_M, diag + GHOST_TRAJ_MARGIN_M)
 
-    depth_service = DepthCompletionService()
+    enable_vggt = is_vggt_enabled()
+    force_vggt = (pose_df.attrs.get("pose_source") == "server_vio")
+
+    can_parallel = False
+    parallel_reason = ""
+    if enable_vggt:
+        if enable_parallel is False:
+            can_parallel = False
+            parallel_reason = "Parallel reconstruction explicitly disabled by caller"
+        elif enable_parallel is True:
+            can_parallel, parallel_reason = check_parallel_reconstruction_hardware(ignore_config=True)
+            if not can_parallel:
+                logger.warning(
+                    "Caller requested parallel reconstruction, but hardware check failed: %s; falling back to sequential",
+                    parallel_reason,
+                )
+        else:
+            can_parallel, parallel_reason = check_parallel_reconstruction_hardware()
+    else:
+        can_parallel = False
+        parallel_reason = "VGGT is disabled via configuration"
+
+    vggt_worker = None
+    if can_parallel:
+        logger.info(
+            "Adaptive parallel reconstruction active: %s. Spawning VGGT worker process.",
+            parallel_reason,
+        )
+        vggt_worker = ParallelVGGTWorker(session_dir, force_recompute=force_vggt)
+        vggt_worker.start()
+    else:
+        logger.info("Sequential 3D reconstruction mode active: %s.", parallel_reason)
 
     try:
-        em = refine_lidar_camera_extrinsics_em(
-            T0=lidar_pack.get("T_lidar_camera"),
-            pose_df=pose_df,
-            keyframes=keyframes,
-            lidar_pack=lidar_pack,
-            K=k,
-            depth_service=depth_service,
-            flip_h=flip_h,
-            flip_v=flip_v,
-            rot_deg=rot_deg,
-            session_dir=session_dir,
-            g_world=g_world,
-            z_max_ghost=z_max_ghost,
-        )
-        if lidar_pack.get("T_lidar_camera") is not None:
-            lidar_pack["T_lidar_camera"] = em["T_lidar_camera"]
-    except Exception:
-        logger.exception("EM extrinsic refinement failed for session; keeping T0")
+        depth_service = DepthCompletionService()
 
-    for idx, kf in enumerate(keyframes):
-        if progress_callback:
-            progress_callback(idx, len(keyframes))
-
-        rgb = cv2.imread(kf["_rgb_path"]) if cv2 is not None else None
-        if rgb is None:
-            continue
-
-        sparse_tof = np.zeros(rgb.shape[:2], dtype=np.float32)
-        row = lookup_lidar_row(
-            lidar_pack.get("df"),
-            kf.get("frame"),
-            kf.get("device_timestamp_ns"),
-            frame_index=lidar_pack.get("frame_index"),
-        )
-        if row is not None and lidar_pack.get("rays") is not None:
-            dist_cols = [f"distance_{i}" for i in range(64)]
-            dists = row[dist_cols].to_numpy(dtype=np.float64)
-            h, w = rgb.shape[:2]
-            sparse_tof = project_lidar_frame_to_sparse_tof(
-                dists,
-                lidar_pack["rays"],
-                lidar_pack["T_lidar_camera"],
-                k,
-                h,
-                w,
+        try:
+            em = refine_lidar_camera_extrinsics_em(
+                T0=lidar_pack.get("T_lidar_camera"),
+                pose_df=pose_df,
+                keyframes=keyframes,
+                lidar_pack=lidar_pack,
+                K=k,
+                depth_service=depth_service,
                 flip_h=flip_h,
                 flip_v=flip_v,
                 rot_deg=rot_deg,
+                session_dir=session_dir,
+                g_world=g_world,
+                z_max_ghost=z_max_ghost,
             )
-        if should_skip_tof_keyframe(has_lidar, sparse_tof):
-            continue
+            if lidar_pack.get("T_lidar_camera") is not None:
+                lidar_pack["T_lidar_camera"] = em["T_lidar_camera"]
+        except Exception:
+            logger.exception("EM extrinsic refinement failed for session; keeping T0")
 
-        R_wc = Rotation.from_quat([kf["qx"], kf["qy"], kf["qz"], kf["qw"]]).as_matrix()
-        g_cam = None if g_world is None else (R_wc.T @ np.asarray(g_world, dtype=float))
-        dense_depth = depth_service.run_depthor_plus(rgb, sparse_tof, k, g_cam=g_cam, z_max_ghost=z_max_ghost)
-        if np.count_nonzero(dense_depth > 0) == 0:
-            continue
-        depths.append(dense_depth)
-        colors.append(cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB))
+        from concurrent.futures import ThreadPoolExecutor
 
-        pose = np.eye(4)
-        pose[0:3, 3] = [kf["x"], kf["y"], kf["z"]]
-        pose[0:3, 0:3] = R_wc
-        poses.append(pose)
+        def _prep_keyframe(kf):
+            rgb = cv2.imread(kf["_rgb_path"]) if cv2 is not None else None
+            if rgb is None:
+                return None
+            sparse_tof = np.zeros(rgb.shape[:2], dtype=np.float32)
+            row = lookup_lidar_row(
+                lidar_pack.get("df"),
+                kf.get("frame"),
+                kf.get("device_timestamp_ns"),
+                frame_index=lidar_pack.get("frame_index"),
+            )
+            if row is not None and lidar_pack.get("rays") is not None:
+                dist_cols = [f"distance_{i}" for i in range(64)]
+                dists = row[dist_cols].to_numpy(dtype=np.float64)
+                h, w = rgb.shape[:2]
+                sparse_tof = project_lidar_frame_to_sparse_tof(
+                    dists,
+                    lidar_pack["rays"],
+                    lidar_pack["T_lidar_camera"],
+                    k,
+                    h,
+                    w,
+                    flip_h=flip_h,
+                    flip_v=flip_v,
+                    rot_deg=rot_deg,
+                )
+            if should_skip_tof_keyframe(has_lidar, sparse_tof):
+                return None
 
-    trajectory = (
-        pose_df[["x", "y", "z"]].to_numpy(dtype=float)
-        if (pose_df is not None and not pose_df.empty and {"x", "y", "z"}.issubset(pose_df.columns))
-        else (
-            np.array([p[0:3, 3] for p in poses], dtype=float)
-            if poses
+            R_wc = Rotation.from_quat([kf["qx"], kf["qy"], kf["qz"], kf["qw"]]).as_matrix()
+            g_cam = None if g_world is None else (R_wc.T @ np.asarray(g_world, dtype=float))
+            return (kf, rgb, sparse_tof, R_wc, g_cam)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            for idx, item in enumerate(executor.map(_prep_keyframe, keyframes)):
+                if progress_callback:
+                    progress_callback(idx, len(keyframes))
+                if item is None:
+                    continue
+                kf, rgb, sparse_tof, R_wc, g_cam = item
+                dense_depth = depth_service.run_depthor_plus(rgb, sparse_tof, k, g_cam=g_cam, z_max_ghost=z_max_ghost)
+                if np.count_nonzero(dense_depth > 0) == 0:
+                    continue
+                depths.append(dense_depth)
+                colors.append(cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB))
+
+                pose = np.eye(4)
+                pose[0:3, 3] = [kf["x"], kf["y"], kf["z"]]
+                pose[0:3, 0:3] = R_wc
+                poses.append(pose)
+
+        trajectory = (
+            pose_df[["x", "y", "z"]].to_numpy(dtype=float)
+            if (pose_df is not None and not pose_df.empty and {"x", "y", "z"}.issubset(pose_df.columns))
             else (
-                np.array([[kf["x"], kf["y"], kf["z"]] for kf in keyframes], dtype=float)
-                if keyframes
-                else None
+                np.array([p[0:3, 3] for p in poses], dtype=float)
+                if poses
+                else (
+                    np.array([[kf["x"], kf["y"], kf["z"]] for kf in keyframes], dtype=float)
+                    if keyframes
+                    else None
+                )
             )
         )
-    )
 
-    reconstruction_service = ReconstructionService()
-    mesh = reconstruction_service.integrate_tsdf(depths, poses, k, colors)
-    del depths, poses, colors
-    if "depth_service" in locals():
-        del depth_service
-    try:
-        from app.services.depth_completion import DepthorModelManager
-        DepthorModelManager.release()
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-    gc.collect()
-
-    if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
-        raise ValueError("TSDF produced empty mesh.")
-
-    reconstruction_service.export_mesh_artifacts(mesh, session_dir)
-
-    enable_vggt = (os.getenv("ENABLE_VGGT", "1") != "0")
-    vggt_prior = None
-    if enable_vggt:
+        reconstruction_service = ReconstructionService()
+        mesh = reconstruction_service.integrate_tsdf(depths, poses, k, colors)
+        del depths, poses, colors
+        if "depth_service" in locals():
+            del depth_service
         try:
-            from app.services.vggt_runner import run_vggt_inference
-            force_vggt = (pose_df.attrs.get("pose_source") == "server_vio")
-            run_vggt_inference(session_dir, force_recompute=force_vggt)
+            from app.services.depth_completion import DepthorModelManager
+            DepthorModelManager.release()
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         except Exception:
-            logger.exception("VGGT inference attempt failed; falling back to standard reconstruction")
+            pass
+        gc.collect()
 
-        vggt_result = load_vggt_prior(session_dir)
-        vggt_prior = vggt_result.prior
-    else:
-        from app.services.vggt_prior import VggtPriorResult
-        vggt_result = VggtPriorResult(prior=None, skip_reason="disabled_by_config")
+        if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+            raise ValueError("TSDF produced empty mesh.")
+
+        reconstruction_service.export_mesh_artifacts(mesh, session_dir)
+
+        vggt_prior = None
+        if vggt_worker is not None:
+            logger.info("Depthor+ and TSDF integration completed. Waiting for parallel VGGT barrier...")
+            vggt_res = vggt_worker.join()
+            if vggt_res.get("success", False):
+                vggt_result = load_vggt_prior(session_dir)
+                vggt_prior = vggt_result.prior
+                logger.info(
+                    "Parallel VGGT inference completed successfully in %.2fs",
+                    vggt_res.get("duration_s", 0.0),
+                )
+            else:
+                err_msg = vggt_res.get("error", "unknown error")
+                logger.warning(
+                    "Parallel VGGT inference failed (%s); falling back to reconstruction without VGGT prior",
+                    err_msg,
+                )
+                from app.services.vggt_prior import VggtPriorResult
+
+                vggt_result = VggtPriorResult(prior=None, skip_reason=f"parallel_vggt_failed: {err_msg}")
+                vggt_prior = None
+        elif enable_vggt:
+            try:
+                from app.services.vggt_runner import run_vggt_inference
+
+                run_vggt_inference(session_dir, force_recompute=force_vggt)
+            except Exception:
+                logger.exception("VGGT inference attempt failed; falling back to standard reconstruction")
+
+            vggt_result = load_vggt_prior(session_dir)
+            vggt_prior = vggt_result.prior
+        else:
+            from app.services.vggt_prior import VggtPriorResult
+
+            vggt_result = VggtPriorResult(prior=None, skip_reason="disabled_by_config")
+            vggt_prior = None
+    finally:
+        if vggt_worker is not None and not vggt_worker._joined:
+            logger.warning("Terminating background VGGT worker due to unhandled pipeline interruption")
+            vggt_worker.terminate()
 
     try:
         layout, whiteflat_pcd = reconstruction_service.segment_planes(
@@ -1204,6 +1276,7 @@ def run_3d_reconstruction(
             raise
 
     attach_vggt_diagnostics(layout, vggt_result)
+    export_artifacts(layout, session_dir)
     reconstruction_service.export_whiteflat_ply(whiteflat_pcd, session_dir)
     reconstruction_service.export_visual_artifacts(
         mesh, layout, gravity_vector, session_dir, vggt_prior=vggt_result.prior
@@ -1214,8 +1287,6 @@ def run_3d_reconstruction(
         export_room_model_texture_glb(session_dir, layout=layout)
     except Exception:
         logger.exception("Failed to export room_model_texture.glb")
-
-    export_artifacts(layout, session_dir)
 
     return {
         "status": "reconstructed",
@@ -1392,12 +1463,14 @@ class PipelineRunner:
         *,
         enable_server_vio: bool = True,
         enable_tof_pipeline: bool = True,
+        enable_parallel: Optional[bool] = None,
         recalculate_params: dict[str, Any] | None = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         force_ingest: bool = False,
     ):
         self.enable_server_vio = enable_server_vio
         self.enable_tof_pipeline = enable_tof_pipeline
+        self.enable_parallel = enable_parallel
         self.recalculate_params = recalculate_params or dict(DEFAULT_RECALCULATE_PARAMS)
         self.progress_callback = progress_callback
         self.force_ingest = force_ingest
@@ -1409,12 +1482,15 @@ class PipelineRunner:
         self,
         session_dir: str,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        enable_parallel: Optional[bool] = None,
     ) -> dict[str, Any]:
+        eff_parallel = self.enable_parallel if enable_parallel is None else enable_parallel
         return run_3d_reconstruction(
             session_dir,
             enable_server_vio=self.enable_server_vio,
             enable_tof_pipeline=self.enable_tof_pipeline,
             progress_callback=progress_callback or self.progress_callback,
+            enable_parallel=eff_parallel,
         )
 
     def run_materials(

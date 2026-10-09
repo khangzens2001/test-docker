@@ -6,6 +6,7 @@ from scipy.linalg import block_diag
 
 from app.services.vio_core.math_utils import skew_symmetric
 from app.services.vio_core.state import NominalState, StateIndex as I
+from app.services.vio_core.triangulation import triangulate_dlt_batch
 
 CHI2_VIS_2 = 5.99
 HUBER_DELTA_PX = 2.0
@@ -130,6 +131,12 @@ def build_visual_measurement(
     H_list: list[np.ndarray] = []
     R_list: list[np.ndarray] = []
 
+    cols_spad = np.array([0, 1, 2, 6, 7, 8, 21, 22], dtype=np.int64)
+    cols_dlt = np.array([0, 1, 2, 6, 7, 8, 21], dtype=np.int64)
+    P_spad = P[np.ix_(cols_spad, cols_spad)]
+    P_dlt = P[np.ix_(cols_dlt, cols_dlt)]
+    R_state_T = state.R.T
+
     for tr in tracks_to_process:
         if tr.status != STATUS_ACTIVE:
             continue
@@ -168,38 +175,58 @@ def build_visual_measurement(
         r_norm = float(np.linalg.norm(y_i))
 
         # Camera projection Jacobian J_pi (2x3)
+        inv_Z = 1.0 / Z
+        inv_Z2 = inv_Z * inv_Z
         J_pi = np.array([
-            [fx / Z, 0.0, -fx * X / (Z**2)],
-            [0.0, fy / Z, -fy * Y / (Z**2)],
+            [fx * inv_Z, 0.0, -fx * X * inv_Z2],
+            [0.0, fy * inv_Z, -fy * Y * inv_Z2],
         ])
+        J_b = J_pi @ R_bc.T
+        J_R = J_b @ R_state_T
 
         # Measurement Jacobian H_i (2x23)
         H_i = np.zeros((2, 23))
-        # Position error state: -J_pi @ R_wc.T
-        H_i[:, I.POS] = -J_pi @ R_wc.T
+        # Position error state: -J_R
+        H_i[:, I.POS] = -J_R
         # Orientation error state: J_pi @ R_bc.T @ [p_b]_x
         p_b = R_bc @ p_c + t_bc
-        H_i[:, I.ORI] = J_pi @ R_bc.T @ skew_symmetric(p_b)
-        # Time-offset error state: -J_pi @ R_wc.T @ v
-        H_i[:, I.TD] = (-J_pi @ R_wc.T @ state.v).reshape(2, 1)
-        # Scale error state (SPAD only): J_pi @ R_wc.T @ R_host @ u_cam * Z_spad
-        if tr.origin == ORIGIN_SPAD:
-            H_i[:, I.SL] = (J_pi @ R_wc.T @ tr.R_host @ tr.u_cam * tr.Z_spad).reshape(2, 1)
+        H_i[:, I.ORI] = J_b @ skew_symmetric(p_b)
+        # Time-offset error state: -J_R @ v
+        H_i[:, I.TD] = (-J_R @ state.v).reshape(2, 1)
+        # Scale error state (SPAD only): J_R @ R_host @ u_cam * Z_spad
+        is_spad = (tr.origin == ORIGIN_SPAD)
+        if is_spad:
+            H_i[:, I.SL] = (J_R @ (tr.R_host @ tr.u_cam) * tr.Z_spad).reshape(2, 1)
 
-        # Geometric covariance: sigma_pix^2 * I_2 + J_pi @ R_wc.T @ Sigma_pf @ R_wc @ J_pi.T
-        Sigma_pf = tr.Sigma_pf if tr.Sigma_pf is not None else np.zeros((3, 3))
-        R_geom = (SIGMA_PIX ** 2) * np.eye(2) + J_pi @ R_wc.T @ Sigma_pf @ R_wc @ J_pi.T
+        # Geometric covariance: sigma_pix^2 * I_2 + J_R @ Sigma_pf @ J_R.T
+        if tr.Sigma_pf is not None:
+            R_geom = (SIGMA_PIX ** 2) * np.eye(2) + (J_R @ tr.Sigma_pf) @ J_R.T
+        else:
+            R_geom = np.diag([SIGMA_PIX ** 2, SIGMA_PIX ** 2])
 
         # Huber robust weighting
         w = min(1.0, HUBER_DELTA_PX / max(r_norm, 1e-9))
         R_eff = (1.0 / w) * R_geom
 
-        # Chi-square innovation pre-gating with Huber-weighted effective covariance
-        S_i = H_i @ P @ H_i.T + R_eff
-        try:
-            d2 = float(y_i.T @ np.linalg.solve(S_i, y_i))
-        except np.linalg.LinAlgError:
+        # Chi-square innovation pre-gating with fast sub-covariance projection
+        if is_spad:
+            H_sub = H_i[:, cols_spad]
+            S_i = H_sub @ P_spad @ H_sub.T + R_eff
+        else:
+            H_sub = H_i[:, cols_dlt]
+            S_i = H_sub @ P_dlt @ H_sub.T + R_eff
+
+        det_S = S_i[0, 0] * S_i[1, 1] - S_i[0, 1] * S_i[1, 0]
+        if det_S <= 1e-12:
             continue
+        inv_det = 1.0 / det_S
+        d2 = float(
+            (
+                y_i[0] * (S_i[1, 1] * y_i[0] - S_i[0, 1] * y_i[1])
+                + y_i[1] * (-S_i[1, 0] * y_i[0] + S_i[0, 0] * y_i[1])
+            )
+            * inv_det
+        )
 
         if d2 >= CHI2_VIS_2:
             continue
@@ -213,7 +240,14 @@ def build_visual_measurement(
 
     y_stacked = np.concatenate(y_list, axis=0)
     H_stacked = np.vstack(H_list)
-    R_stacked = block_diag(*R_list)
+    n_meas = len(y_list)
+    R_stacked = np.zeros((2 * n_meas, 2 * n_meas), dtype=np.float64)
+    R_arr = np.asarray(R_list)
+    bi = np.arange(n_meas)
+    R_stacked[2 * bi, 2 * bi] = R_arr[:, 0, 0]
+    R_stacked[2 * bi, 2 * bi + 1] = R_arr[:, 0, 1]
+    R_stacked[2 * bi + 1, 2 * bi] = R_arr[:, 1, 0]
+    R_stacked[2 * bi + 1, 2 * bi + 1] = R_arr[:, 1, 1]
     return y_stacked, H_stacked, R_stacked
 
 
@@ -254,11 +288,13 @@ class LandmarkTrackMap:
 
         if len(pts_prev) > 0 and len(alive_tracks) > 0:
             track_uvs = np.array([t.uv for t in alive_tracks])
-            dists = np.linalg.norm(pts_prev[:, None, :] - track_uvs[None, :, :], axis=2)
+            diff = pts_prev[:, None, :] - track_uvs[None, :, :]
+            dists_sq = diff[:, :, 0] ** 2 + diff[:, :, 1] ** 2
 
-            i_indices, j_indices = np.where(dists <= 1.0 + 1e-4)
+            thresh_sq = (1.0 + 1e-4) ** 2
+            i_indices, j_indices = np.where(dists_sq <= thresh_sq)
             if len(i_indices) > 0:
-                dist_vals = dists[i_indices, j_indices]
+                dist_vals = dists_sq[i_indices, j_indices]
                 order = np.argsort(dist_vals)
                 used_prev = set()
                 used_tracks = set()
@@ -338,6 +374,9 @@ class LandmarkTrackMap:
             target_tracks = candidates[: len(depths_arr)]
 
         K_use = self.K
+        fx, fy, cx, cy = (K_use[0, 0], K_use[1, 1], K_use[0, 2], K_use[1, 2]) if K_use is not None else (None, None, None, None)
+        tan_sigma_sq = float(np.tan(np.deg2rad(1.0)) ** 2)
+
         for i, t in enumerate(target_tracks):
             if i >= len(depths_arr):
                 break
@@ -352,23 +391,21 @@ class LandmarkTrackMap:
             t.R_host = R_wc.copy()
             t.p_host = p_wc.copy()
 
-            if K_use is not None:
-                fx, fy = K_use[0, 0], K_use[1, 1]
-                cx, cy = K_use[0, 2], K_use[1, 2]
+            if fx is not None:
                 u, v = t.uv[0], t.uv[1]
                 t.u_cam = np.array([(u - cx) / fx, (v - cy) / fy, 1.0], dtype=float)
             elif t.u_cam is None:
                 t.u_cam = np.array([0.0, 0.0, 1.0], dtype=float)
 
             var_val = float(var_arr[i]) if (i < len(var_arr) and np.isfinite(var_arr[i])) else 0.01
-            u_norm = float(np.linalg.norm(t.u_cam))
-            u_dir = (t.u_cam / u_norm) if u_norm > 1e-6 else np.array([0.0, 0.0, 1.0])
-            sigma_theta = np.deg2rad(1.0)
-            var_ang = (t.Z_spad * np.tan(sigma_theta)) ** 2
-            P_par = np.outer(u_dir, u_dir)
-            P_perp = np.eye(3) - P_par
-            Sigma_cam = var_val * P_par + var_ang * P_perp
-            t.Sigma_pf = t.R_host @ Sigma_cam @ t.R_host.T
+            u_norm_sq = float(t.u_cam[0] ** 2 + t.u_cam[1] ** 2 + t.u_cam[2] ** 2)
+            if u_norm_sq > 1e-12:
+                u_dir = t.u_cam / np.sqrt(u_norm_sq)
+            else:
+                u_dir = np.array([0.0, 0.0, 1.0])
+            var_ang = (t.Z_spad ** 2) * tan_sigma_sq
+            u_world = t.R_host @ u_dir
+            t.Sigma_pf = var_ang * np.eye(3) + (var_val - var_ang) * np.outer(u_world, u_world)
 
     def try_promote_dlt(
         self,
@@ -376,42 +413,42 @@ class LandmarkTrackMap:
         p_wc: np.ndarray,
         K: np.ndarray,
     ) -> None:
-        """Triangulate candidate tracks against host pose and promote if parallax >= 1.5 deg."""
-        from app.services.vio_core.triangulation import triangulate_dlt_single
+        """Triangulate candidate tracks against host pose and promote if parallax >= 1.5 deg.
 
+        Tracks without a host pose get the current pose as host. All remaining candidates are
+        triangulated in one stacked DLT call (numerically identical to the per-track version).
+        """
         self.K = K
 
+        batch_tracks: list[LandmarkTrack] = []
         for t in list(self.tracks_by_id.values()):
             if t.status != STATUS_CANDIDATE:
                 continue
-
             if t.R_host is None or t.p_host is None:
                 t.R_host = R_wc.copy()
                 t.p_host = p_wc.copy()
                 t.uv_host = t.uv.copy()
                 continue
+            batch_tracks.append(t)
 
-            pts1 = t.uv_host if t.uv_host is not None else t.uv
-            pts2 = t.uv
+        if not batch_tracks:
+            return
 
-            res = triangulate_dlt_single(
-                pts1,
-                pts2,
-                t.R_host,
-                t.p_host,
-                R_wc,
-                p_wc,
-                K,
-                min_parallax_deg=MIN_PARALLAX_DEG,
-            )
+        uv1 = np.array([t.uv_host if t.uv_host is not None else t.uv for t in batch_tracks], dtype=np.float64).reshape(-1, 2)
+        uv2 = np.array([t.uv for t in batch_tracks], dtype=np.float64).reshape(-1, 2)
+        R1 = np.stack([t.R_host for t in batch_tracks]).astype(np.float64)
+        t1 = np.stack([t.p_host for t in batch_tracks]).astype(np.float64)
 
-            if res is not None and res.valid:
-                t.status = STATUS_ACTIVE
-                t.origin = ORIGIN_DLT
-                t.p_w = res.point_3d
-                sin_px = np.sin(np.radians(max(res.parallax_deg, 0.1)))
-                var_dlt = float(np.clip((0.05 / sin_px) ** 2, 1e-4, 1.0))
-                t.Sigma_pf = np.eye(3) * var_dlt
+        res = triangulate_dlt_batch(uv1, uv2, R1, t1, R_wc, p_wc, K, min_parallax_deg=MIN_PARALLAX_DEG)
+
+        for i in np.flatnonzero(res.valid):
+            t = batch_tracks[int(i)]
+            t.status = STATUS_ACTIVE
+            t.origin = ORIGIN_DLT
+            t.p_w = res.point_3d[i].copy()
+            sin_px = np.sin(np.radians(max(float(res.parallax_deg[i]), 0.1)))
+            var_dlt = float(np.clip((0.05 / sin_px) ** 2, 1e-4, 1.0))
+            t.Sigma_pf = np.eye(3) * var_dlt
 
     def select_for_update(self, image_size: tuple[int, int]) -> list[LandmarkTrack]:
         """Select up to N_MAX_TRACKS active tracks, prioritizing SPAD with 8x6 grid distribution."""

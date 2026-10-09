@@ -68,15 +68,27 @@ def slice_wall_band(points: np.ndarray, height_m: float) -> np.ndarray:
     if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) == 0:
         return np.zeros((0, 3), dtype=float)
     z_hi = max(SLICE_Z_MAX_M, float(height_m) - 0.2)
-    band = pts[(pts[:, 2] >= SLICE_Z_MIN_M) & (pts[:, 2] <= z_hi)]
-    if len(band) >= SLICE_MIN_POINTS:
-        return band
-    band = pts[(pts[:, 2] >= 0.3) & (pts[:, 2] <= z_hi)]
-    if len(band) >= SLICE_MIN_POINTS:
-        return band
-    band = pts[(pts[:, 2] >= 0.15) & (pts[:, 2] <= z_hi)]
-    if len(band) >= SLICE_MIN_POINTS:
-        return band
+
+    def _has_valid_span(b: np.ndarray) -> bool:
+        if len(b) < SLICE_MIN_POINTS:
+            return False
+        sz = float(b[:, 2].max() - b[:, 2].min())
+        if sz < 0.20:
+            return False
+        span_x = float(b[:, 0].max() - b[:, 0].min())
+        span_y = float(b[:, 1].max() - b[:, 1].min())
+        return max(span_x, span_y) >= 1.0 and min(span_x, span_y) >= 0.5
+
+    for z_lo in (SLICE_Z_MIN_M, 0.3, 0.15):
+        band = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
+        if _has_valid_span(band):
+            return band
+
+    for z_lo in (0.3, 0.15, SLICE_Z_MIN_M):
+        band = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
+        if len(band) >= SLICE_MIN_POINTS:
+            return band
+
     return np.zeros((0, 3), dtype=float)
 
 
@@ -863,7 +875,8 @@ def choke_doorway_tails(
         return pts, empty_info
     pre = [float((xs.max() - xs.min()) * resolution), float((ys.max() - ys.min()) * resolution)]
     bridge_px = _odd_px(DOORWAY_BRIDGE_M, resolution, 11)
-    kernel_px = max(11, _odd_px(DOORWAY_CHOKE_M, resolution, 11))
+    choke_m = min(DOORWAY_CHOKE_M, max(0.40, min(pre) * 0.70))
+    kernel_px = max(11, _odd_px(choke_m, resolution, 11))
     info = {
         "doorway_choke_applied": False,
         "pre_choke_bbox_m": pre,
@@ -924,11 +937,14 @@ def choke_doorway_tails(
                     frac_in_tail = float(n_tail) / float(len(valid_coords))
                     if n_tail > 0:
                         all_cams_one_side = False
-                    if tail_dir == "prefix":
-                        if cut_coord > t_turn:
+                    is_shallow_turn = (
+                        abs(t_turn - cut_coord) <= 0.40
+                        and (n_tail <= 20 or frac_in_tail < 0.15)
+                    )
+                    if is_shallow_turn:
+                        if tail_dir == "prefix" and cut_coord > t_turn:
                             cut_coord = t_turn
-                    else:
-                        if cut_coord < t_turn:
+                        elif tail_dir == "suffix" and cut_coord < t_turn:
                             cut_coord = t_turn
 
         cut_px = int(round((cut_coord - (x_min if axis == 0 else y_min)) / resolution))
@@ -1017,7 +1033,7 @@ def choke_doorway_tails(
         is_narrow_aperture = (w_neck_val > 0.0 and w_neck_val <= 1.60) or is_narrow_tail
 
         max_discard = (
-            0.92 if (is_small_room and trajectory is not None)
+            0.35 if (is_small_room and trajectory is not None)
             else (0.40 if (is_narrow_tail and trajectory is not None) else CHOKE_MAX_DISCARD_RATIO)
         )
         if cavity_area_m2 < SMALL_ROOM_AREA_M2 and discarded_cavity_ratio > max_discard:
@@ -1037,6 +1053,10 @@ def choke_doorway_tails(
                 float(out[:, 0].max() - out[:, 0].min()),
                 float(out[:, 1].max() - out[:, 1].min()),
             ]
+            if is_small_room and (min(post) < 0.80 or (min(pre) > 1.10 and post[0] * post[1] < 1.60)):
+                info["doorway_choke_applied"] = False
+                info["choke_guard_reason"] = "small_room_post_bbox_too_small"
+                return pts, info
             reduction = max(pre[0] - post[0], pre[1] - post[1])
             if reduction >= MIN_CHOKE_BBOX_REDUCTION_M:
                 if trajectory is not None:
@@ -1211,6 +1231,13 @@ def _clip_doorway_profile_tails(
     if reduction < MIN_CHOKE_BBOX_REDUCTION_M:
         return pts, info
     info = dict(info)
+
+    is_small_room = (info.get("cavity_area_m2", 0.0) < 6.0)
+    if is_small_room and (min(post) < 0.80 or (min(pre) > 1.10 and post[0] * post[1] < 1.60)):
+        info["doorway_choke_applied"] = False
+        info["choke_guard_reason"] = "small_room_post_bbox_too_small"
+        return pts, info
+
     discarded_ratio = 1.0 - (len(out) / max(len(pts), 1))
     info["discarded_cavity_ratio"] = float(discarded_ratio)
 
@@ -1225,9 +1252,8 @@ def _clip_doorway_profile_tails(
         if d_len / max(d_wid, 0.05) > 1.2:
             is_narrow_tail = True
 
-    is_small_room = (info.get("cavity_area_m2", 0.0) < 6.0)
     max_discard = (
-        0.92 if is_small_room and trajectory is not None
+        0.35 if is_small_room and trajectory is not None
         else (0.40 if is_narrow_tail and trajectory is not None else CHOKE_MAX_DISCARD_RATIO)
     )
     if info.get("cavity_area_m2", 0.0) < SMALL_ROOM_AREA_M2 and discarded_ratio > max_discard:

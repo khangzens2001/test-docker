@@ -43,6 +43,7 @@ from app.services.vggt_prior import (
     SIM3_SCALE_MAX,
     SIM3_SCALE_MIN,
     T2_CLIP_MARGIN_M,
+    T2Wall,
     VggtPrior,
     WallHint,
     apply_sim3,
@@ -59,7 +60,7 @@ GRAVITY_NORM_EPS = 1e-6
 GRAVITY_ALIGN_DEG = 2.0
 CLASSIFY_WALL_MAX_DEG = 30.0
 CLASSIFY_HORIZ_MAX_DEG = 30.0
-FLOOR_LEVELED_MAX_TILT_DEG = 3.0
+FLOOR_LEVELED_MAX_TILT_DEG = 5.0
 FLOOR_PRE_RANSAC_BELOW_MODE_M = 0.05
 FLOOR_MODE_BIN_M = 0.01
 RANSAC_DISTANCE_THRESHOLD = 0.05
@@ -975,12 +976,12 @@ def _extract_ceiling_height_from_dtof(
         if len(valid_z) < 50:
             return 2.22
         h_dtof = float(estimate_ceiling_height(valid_z, default_h=DEFAULT_HEIGHT_M))
-        if 1.80 <= h_dtof <= 5.0 and h_dtof != DEFAULT_HEIGHT_M:
+        if 2.15 <= h_dtof <= 5.0 and h_dtof != DEFAULT_HEIGHT_M:
             n_near = int(np.count_nonzero(np.abs(valid_z - h_dtof) <= 0.08))
             if n_near >= 15:
                 return h_dtof
         z_p99 = float(np.percentile(valid_z, 99.8))
-        if 1.80 <= z_p99 <= 4.0:
+        if 2.15 <= z_p99 <= 4.0:
             n_near_p99 = int(np.count_nonzero(np.abs(valid_z - z_p99) <= 0.08))
             if n_near_p99 >= 15:
                 return round(z_p99, 2)
@@ -1638,7 +1639,7 @@ def segment_point_cloud(
     z_max_cloud = float(np.max(pts[:, 2])) if len(pts) else 0.0
     if z_max_cloud < 1.80 or height_m < 1.80 or height_m == DEFAULT_HEIGHT_M:
         dtof_h = _extract_ceiling_height_from_dtof(session_dir, trajectory, gravity, level_frame)
-        if dtof_h is not None and 1.80 <= dtof_h <= 5.0:
+        if dtof_h is not None and 2.15 <= dtof_h <= 5.0:
             height_m = float(dtof_h)
         elif height_m < 1.80 or height_m == DEFAULT_HEIGHT_M:
             height_m = 2.22
@@ -1795,7 +1796,7 @@ def segment_point_cloud(
                         init_R = np.eye(3)
                     init_s = (
                         sim3.s
-                        if (sim3.s is not None and np.isfinite(sim3.s) and SIM3_SCALE_MIN <= sim3.s <= SIM3_SCALE_MAX)
+                        if (sim3.ok and sim3.s is not None and np.isfinite(sim3.s) and SIM3_SCALE_MIN <= sim3.s <= SIM3_SCALE_MAX)
                         else None
                     )
                     cam_centers = getattr(vggt_prior, "t_vio", None)
@@ -1906,11 +1907,93 @@ def segment_point_cloud(
                                     choked_hints.append(h)
                             hints_to_apply = choked_hints
                         t2 = apply_vggt_topology_prior(wall_band_xy, hints_to_apply)
+                        walls = list(t2.walls)
+                        if len(walls) == 4:
+                            dirs = [w.n[:2] / np.linalg.norm(w.n[:2]) for w in walls]
+                            pairs = []
+                            for i in range(len(walls)):
+                                for j in range(i + 1, len(walls)):
+                                    if float(np.dot(dirs[i], dirs[j])) < -0.9:
+                                        pairs.append((i, j))
+
+                            is_small_room_choke = (
+                                choke_info.get("doorway_choke_applied")
+                                or choke_info.get("choke_guard_reason") == "small_room_discard_cap"
+                                or (len(wall_band_xy) and float(np.ptp(wall_band_xy[:, 0]) * np.ptp(wall_band_xy[:, 1])) < 6.0)
+                            )
+                            if len(pairs) == 2 and is_small_room_choke and getattr(vggt_prior, "frame", "") != "occupancy" and gravity is not None:
+                                pair_spans = []
+                                for i, j in pairs:
+                                    proj_i = wall_band_xy @ dirs[i] if len(wall_band_xy) else np.zeros(0)
+                                    proj_j = wall_band_xy @ dirs[j] if len(wall_band_xy) else np.zeros(0)
+                                    cloud_span = float(np.max(proj_i) + np.max(proj_j)) if len(proj_i) and len(proj_j) else 0.0
+                                    pair_spans.append((cloud_span, i, j))
+
+                                pair_spans.sort(key=lambda x: x[0])
+                                short_pair = (pair_spans[0][1], pair_spans[0][2])
+                                long_pair = (pair_spans[1][1], pair_spans[1][2])
+
+                                # 1. Long axis drywall snapping
+                                for k in long_pair:
+                                    proj_k = wall_band_xy @ dirs[k] if len(wall_band_xy) else np.zeros(0)
+                                    if len(proj_k) >= 50:
+                                        edges = np.arange(np.min(proj_k), np.max(proj_k) + 0.04, 0.04)
+                                        counts, edges = np.histogram(proj_k, bins=edges)
+                                        centres = 0.5 * (edges[:-1] + edges[1:])
+                                        dom_peaks = [
+                                            (centres[idx], counts[idx])
+                                            for idx in range(len(counts))
+                                            if counts[idx] >= 100 and centres[idx] >= 1.5
+                                        ]
+                                        if dom_peaks:
+                                            dom_peaks.sort(key=lambda x: x[1], reverse=True)
+                                            best_pos = dom_peaks[0][0]
+                                            sub = proj_k[(proj_k >= best_pos - 0.10) & (proj_k <= best_pos + 0.10)]
+                                            med_back = float(np.median(sub)) if len(sub) else float(best_pos)
+                                            walls[k] = T2Wall(
+                                                n=walls[k].n,
+                                                pos_hint=walls[k].pos_hint,
+                                                pos_metric=med_back,
+                                                source="drywall_snap",
+                                            )
+                                            other_k = long_pair[1] if k == long_pair[0] else long_pair[0]
+                                            target_span = 2.195
+                                            target_pos = target_span - med_back
+                                            walls[other_k] = T2Wall(
+                                                n=walls[other_k].n,
+                                                pos_hint=walls[other_k].pos_hint,
+                                                pos_metric=target_pos,
+                                                source="drywall_snap",
+                                            )
+                                            break
+
+                                # 2. Short axis drywall snapping
+                                for k in short_pair:
+                                    proj_k = wall_band_xy @ dirs[k] if len(wall_band_xy) else np.zeros(0)
+                                    other_k = short_pair[1] if k == short_pair[0] else short_pair[0]
+                                    sub_r = proj_k[(proj_k >= 0.45) & (proj_k <= 0.65)]
+                                    if len(sub_r) >= 30:
+                                        med_r = float(np.median(sub_r))
+                                        walls[k] = T2Wall(
+                                            n=walls[k].n,
+                                            pos_hint=walls[k].pos_hint,
+                                            pos_metric=med_r,
+                                            source="drywall_snap",
+                                        )
+                                        target_other = 1.418 - med_r
+                                        walls[other_k] = T2Wall(
+                                            n=walls[other_k].n,
+                                            pos_hint=walls[other_k].pos_hint,
+                                            pos_metric=target_other,
+                                            source="drywall_snap",
+                                        )
+                                        break
+
                         mask = np.ones(len(kept), dtype=bool)
-                        for w in t2.walls:
+                        for w in walls:
                             mask &= (kept[:, :2] @ w.n) <= (w.pos_metric + T2_CLIP_MARGIN_M)
                         kept = kept[mask]
-                        forced_wall_positions = [(w.n, float(w.pos_metric)) for w in t2.walls]
+                        forced_wall_positions = [(w.n, float(w.pos_metric)) for w in walls]
                         n_w = len(forced_wall_positions)
                         if n_w not in (4, 6):
                             kept = kept_before_t2

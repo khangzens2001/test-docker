@@ -12,12 +12,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional
 import uuid
 
-try:
-    from cachetools import TTLCache
-except ImportError:
-    class TTLCache(dict):  # type: ignore[no-redef]
-        def __init__(self, maxsize: int = 10_000, ttl: int = 3600):
-            super().__init__()
+from cachetools import TTLCache
 
 from app.core.config import settings
 

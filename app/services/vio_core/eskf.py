@@ -2,8 +2,8 @@
 
 import numpy as np
 from scipy.linalg import qr
+from app.services.vio_core import numba_accelerated as _nba
 from app.services.vio_core.state import NominalState, StateIndex as I
-from app.services.vio_core.math_utils import skew_symmetric
 
 
 class SRESKF:
@@ -38,40 +38,42 @@ class SRESKF:
 
     def predict_imu(self, preint) -> np.ndarray:
         """Predict nominal state and propagate covariance square root using IMU preintegration."""
-        dt = preint.delta_t
+        dt = float(preint.delta_t)
         s = self.state
-        R_prev = s.R.copy()
-        s.p += s.v * dt + 0.5 * s.g * dt**2 + R_prev @ preint.delta_p
-        s.v += s.g * dt + R_prev @ preint.delta_v
-        s.R = R_prev @ preint.delta_R
 
-        F = np.eye(I.DIM)
-        F[I.POS, I.VEL] = np.eye(3) * dt
-        F[I.POS, I.ORI] = -R_prev @ skew_symmetric(preint.delta_p)
-        F[I.VEL, I.ORI] = -R_prev @ skew_symmetric(preint.delta_v)
-        F[I.ORI, I.ORI] = preint.delta_R.T
-        F[I.POS, I.GRAV] = 0.5 * np.eye(3) * dt**2
-        F[I.VEL, I.GRAV] = np.eye(3) * dt
-
-        # Jacobians with respect to Accel Bias (ba) and Gyro Bias (bg)
-        if hasattr(preint, "J_ba") and preint.J_ba is not None:
-            F[I.POS, I.BA] = R_prev @ preint.J_ba[0:3, :]
-            F[I.VEL, I.BA] = R_prev @ preint.J_ba[3:6, :]
-        else:
-            F[I.POS, I.BA] = -0.5 * R_prev * (dt**2)
-            F[I.VEL, I.BA] = -R_prev * dt
-
-        if hasattr(preint, "J_bg") and preint.J_bg is not None:
-            F[I.POS, I.BG] = R_prev @ preint.J_bg[0:3, :]
-            F[I.VEL, I.BG] = R_prev @ preint.J_bg[3:6, :]
-            F[I.ORI, I.BG] = preint.J_bg[6:9, :]
-        else:
-            F[I.ORI, I.BG] = -np.eye(3) * dt
+        # Jacobians with respect to Accel Bias (ba) and Gyro Bias (bg); legacy fallback when the
+        # preintegration object carries none (first-order constant-rate model).
+        J_ba = getattr(preint, "J_ba", None)
+        J_bg = getattr(preint, "J_bg", None)
+        if J_ba is None:
+            J_ba = np.zeros((9, 3), dtype=np.float64)
+            J_ba[0:3, :] = -0.5 * np.eye(3) * (dt**2)
+            J_ba[3:6, :] = -np.eye(3) * dt
+        if J_bg is None:
+            J_bg = np.zeros((9, 3), dtype=np.float64)
+            J_bg[6:9, :] = -np.eye(3) * dt
 
         q_scale = 5.0 if getattr(preint, "is_inflated", False) else 1.0
-        M = np.hstack([F @ self.S_P, self.Q_sqrt * np.sqrt(dt) * q_scale])
-        _, R_qr = qr(M.T)
-        self.S_P = R_qr[: I.DIM, : I.DIM].T
+
+        p_new, v_new, R_new, F, S_P_new = _nba.eskf_predict(
+            np.ascontiguousarray(s.p, dtype=np.float64),
+            np.ascontiguousarray(s.v, dtype=np.float64),
+            np.ascontiguousarray(s.R, dtype=np.float64),
+            np.ascontiguousarray(s.g, dtype=np.float64),
+            np.ascontiguousarray(self.S_P, dtype=np.float64),
+            np.ascontiguousarray(preint.delta_R, dtype=np.float64),
+            np.ascontiguousarray(preint.delta_v, dtype=np.float64),
+            np.ascontiguousarray(preint.delta_p, dtype=np.float64),
+            np.ascontiguousarray(J_ba, dtype=np.float64),
+            np.ascontiguousarray(J_bg, dtype=np.float64),
+            dt,
+            np.ascontiguousarray(self.Q_sqrt, dtype=np.float64),
+            float(q_scale),
+        )
+        s.p[:] = p_new
+        s.v[:] = v_new
+        s.R = R_new
+        self.S_P = S_P_new
         return F
 
     def update_zupt(self, sigma_vel: float = 0.02) -> bool:
@@ -95,27 +97,90 @@ class SRESKF:
     ) -> bool:
         """Update state using measurement innovation with Potter QR update and Chi-square gating.
 
+        When m > I.DIM (23), applies whitening and measurement compression via thin QR to reduce
+        the measurement to 23D, turning O(m^3) matrix inversions and large QR updates into fast
+        O(m * n^2) operations with mathematical equivalence.
+
         Returns:
             bool: True if measurement was accepted and updated; False if rejected by gating.
         """
         m = len(innovation)
         S_P = self.S_P
         P = S_P @ S_P.T
+
+        if m > I.DIM:
+            try:
+                # Fast vectorized 2x2 block Cholesky whitening if block-diagonal structure (visual updates)
+                if m % 2 == 0 and R_cov.shape == (m, m):
+                    nb = m // 2
+                    bi = np.arange(nb)
+                    Rb = np.empty((nb, 2, 2), dtype=R_cov.dtype)
+                    Rb[:, 0, 0] = R_cov[2 * bi, 2 * bi]
+                    Rb[:, 0, 1] = R_cov[2 * bi, 2 * bi + 1]
+                    Rb[:, 1, 0] = R_cov[2 * bi + 1, 2 * bi]
+                    Rb[:, 1, 1] = R_cov[2 * bi + 1, 2 * bi + 1]
+                    L00 = np.sqrt(np.maximum(1e-12, Rb[:, 0, 0]))
+                    L10 = Rb[:, 1, 0] / L00
+                    L11 = np.sqrt(np.maximum(1e-12, Rb[:, 1, 1] - L10**2))
+
+                    yb = innovation.reshape(-1, 2)
+                    yw0 = yb[:, 0] / L00
+                    yw1 = (yb[:, 1] - L10 * yw0) / L11
+                    y_white = np.empty(m, dtype=np.float64)
+                    y_white[0::2] = yw0
+                    y_white[1::2] = yw1
+
+                    Hb = H.reshape(-1, 2, I.DIM)
+                    Hw0 = Hb[:, 0, :] / L00[:, None]
+                    Hw1 = (Hb[:, 1, :] - L10[:, None] * Hw0) / L11[:, None]
+                    H_white = np.empty((m, I.DIM), dtype=np.float64)
+                    H_white[0::2] = Hw0
+                    H_white[1::2] = Hw1
+                else:
+                    S_R = np.linalg.cholesky(R_cov)
+                    H_white = np.linalg.solve(S_R, H)
+                    y_white = np.linalg.solve(S_R, innovation)
+
+                Q1, T_H = np.linalg.qr(H_white, mode="reduced")
+                k = T_H.shape[0]  # min(m, I.DIM) == 23
+                z1 = Q1.T @ y_white
+                z2_sq = float(np.dot(y_white, y_white) - np.dot(z1, z1))
+
+                S_meas_comp = T_H @ P @ T_H.T + np.eye(k)
+                inv_S_z1 = np.linalg.solve(S_meas_comp, z1)
+                d_mahalanobis2 = float(z1.T @ inv_S_z1) + max(0.0, z2_sq)
+
+                if d_mahalanobis2 > self.CHI2_THRESHOLD_3D * (m / 3.0) * chi2_mult:
+                    return False
+
+                dx = P @ T_H.T @ inv_S_z1
+                self.state.inject(dx)
+
+                M = np.block([[np.eye(k), T_H @ S_P], [np.zeros((I.DIM, k)), S_P]])
+                _, R_qr = qr(M.T)
+                self.S_P = R_qr[k:, k:].T
+                return True
+            except (np.linalg.LinAlgError, ValueError):
+                return False
+
+        # Low-dimensional measurement (m <= 23, e.g. ZUPT m=3, floor distance m=1, Hub IMU m=3)
         S_meas = H @ P @ H.T + R_cov
+        try:
+            d_mahalanobis2 = innovation.T @ np.linalg.solve(S_meas, innovation)
+            if d_mahalanobis2 > self.CHI2_THRESHOLD_3D * (m / 3.0) * chi2_mult:
+                return False
 
-        d_mahalanobis2 = innovation.T @ np.linalg.solve(S_meas, innovation)
-        if d_mahalanobis2 > self.CHI2_THRESHOLD_3D * (m / 3.0) * chi2_mult:
+            K = P @ H.T @ np.linalg.solve(S_meas, np.eye(m))
+            dx = K @ innovation
+            self.state.inject(dx)
+
+            S_R = np.linalg.cholesky(R_cov)
+            M = np.block([[S_R, H @ S_P], [np.zeros((I.DIM, m)), S_P]])
+            _, R_qr = qr(M.T)
+            self.S_P = R_qr[m:, m:].T
+            return True
+        except (np.linalg.LinAlgError, ValueError):
             return False
-
-        K = P @ H.T @ np.linalg.solve(S_meas, np.eye(m))
-        dx = K @ innovation
-        self.state.inject(dx)
-
-        S_R = np.linalg.cholesky(R_cov)
-        M = np.block([[S_R, H @ S_P], [np.zeros((I.DIM, m)), S_P]])
-        _, R_qr = qr(M.T)
-        self.S_P = R_qr[m:, m:].T
-        return True
 
     @property
     def P(self) -> np.ndarray:

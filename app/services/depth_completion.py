@@ -77,29 +77,51 @@ def fit_vertical_plane_2dof(
     n_pts = len(pts)
     best = None
     best_z = np.inf
-    max_pairs = 2016
-    sampled = 0
     rng = np.random.default_rng(42)
     if n_pts <= 64:
-        pairs = [(i, j) for i in range(n_pts) for j in range(i + 1, n_pts)]
+        i_idx, j_idx = np.triu_indices(n_pts, k=1)
     else:
-        pairs = [tuple(rng.choice(n_pts, 2, replace=False)) for _ in range(200)]
-    for i, j in pairs:
-        sampled += 1
-        if sampled > max_pairs:
-            break
-        v = pts[j] - pts[i]
-        if float(np.linalg.norm(v)) < RANSAC_MIN_SAMPLE_DIST_M:
-            continue
-        nt = np.cross(g, v)
-        nn = float(np.linalg.norm(nt))
-        if nn < 1e-9:
-            continue
-        n = nt / nn
-        D = -float(n @ pts[i])
-        inlier_index = np.flatnonzero(np.abs(pts @ n + D) < PLANE_INLIER_M)
-        if inlier_index.size < PLANE_MIN_INLIERS:
-            continue
+        all_count = n_pts * (n_pts - 1) // 2
+        n_samples = min(2000, all_count)
+        pairs = [tuple(rng.choice(n_pts, 2, replace=False)) for _ in range(n_samples)]
+        pairs_arr = np.asarray(pairs, dtype=np.int64)
+        i_idx = pairs_arr[:, 0]
+        j_idx = pairs_arr[:, 1]
+
+    if len(i_idx) == 0:
+        return None
+    pts_i = pts[i_idx]
+    pts_j = pts[j_idx]
+    v = pts_j - pts_i
+    v_norm = np.linalg.norm(v, axis=1)
+    mask_v = v_norm >= RANSAC_MIN_SAMPLE_DIST_M
+    if not np.any(mask_v):
+        return None
+
+    v = v[mask_v]
+    pts_i = pts_i[mask_v]
+
+    nt = np.cross(g[None, :], v)
+    nn = np.linalg.norm(nt, axis=1)
+    mask_n = nn >= 1e-9
+    if not np.any(mask_n):
+        return None
+
+    nt = nt[mask_n]
+    nn = nn[mask_n]
+    pts_i = pts_i[mask_n]
+
+    N = nt / nn[:, None]
+    D = -np.sum(N * pts_i, axis=1)
+
+    # Vectorize distance computation: R = |pts @ N.T + D| shape (n_pts, P)
+    R = np.abs(pts @ N.T + D)
+    inlier_mask = R < PLANE_INLIER_M
+    inlier_counts = np.sum(inlier_mask, axis=0)
+
+    candidate_indices = np.flatnonzero(inlier_counts >= PLANE_MIN_INLIERS)
+    for c_idx in candidate_indices:
+        inlier_index = np.flatnonzero(inlier_mask[:, c_idx])
         xyz_i = pts[inlier_index]
         med_z = float(np.median(xyz_i[:, 2]))
         # Standoff guard (criterion 3)
@@ -118,7 +140,7 @@ def fit_vertical_plane_2dof(
             continue
         if med_z < best_z:
             best_z = med_z
-            best = {"n": n, "D": D, "inlier_index": inlier_index, "median_z": med_z}
+            best = {"n": N[c_idx], "D": float(D[c_idx]), "inlier_index": inlier_index, "median_z": med_z}
     return best
 
 
@@ -167,8 +189,22 @@ def pregate_sparse_tof(
 
     h, w = out.shape
     dilate_px = max(INLIER_HULL_DILATE_PX, int(round(0.20 * max(h, w))))
-    hull = inlier_support_mask(h, w, inlier_uv, dilate_px=dilate_px)
-    in_hull = hull[rows, cols] > 0
+    in_hull = np.zeros(len(rows), dtype=bool)
+    if inlier_uv is not None and len(inlier_uv) > 0:
+        pts = np.asarray(inlier_uv, dtype=np.float32).reshape(-1, 2)
+        pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+        pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+        if cv2 is not None and len(pts) >= 3:
+            hull_pts = cv2.convexHull(pts)
+            hull_pts = np.asarray(hull_pts, dtype=np.float32)
+            for idx, (c, r) in enumerate(zip(cols, rows)):
+                if cv2.pointPolygonTest(hull_pts, (float(c), float(r)), True) >= -dilate_px:
+                    in_hull[idx] = True
+        elif len(pts) > 0:
+            query_pts = np.column_stack((cols, rows))
+            dists = np.min(np.linalg.norm(query_pts[:, None, :] - pts[None, :, :], axis=2), axis=1)
+            in_hull = dists <= dilate_px
+
     if not np.any(in_hull):
         return out, 0
 

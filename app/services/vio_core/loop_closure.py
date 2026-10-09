@@ -108,9 +108,9 @@ class LoopDetector:
                     if abs(query_kf_id - past_kf_id) >= diff_threshold:
                         word_votes[past_kf_id] = word_votes.get(past_kf_id, 0) + 1
 
-        min_votes = max(3, self.min_inliers // 3)
+        min_votes = max(8, int(self.min_inliers * 0.6))
         candidate_ids = [
-            kf_id for kf_id, votes in sorted(word_votes.items(), key=lambda item: item[1], reverse=True)[:5]
+            kf_id for kf_id, votes in sorted(word_votes.items(), key=lambda item: item[1], reverse=True)[:2]
             if votes >= min_votes
         ]
 
@@ -166,6 +166,7 @@ class LoopDetector:
                 flags=cv2.SOLVEPNP_ITERATIVE,
                 reprojectionError=4.0,
                 confidence=0.99,
+                iterationsCount=50,
             )
 
             if success and inliers is not None and len(inliers) >= self.min_inliers:
@@ -197,6 +198,8 @@ class LoopDetector:
                 if num_inliers > max_inliers:
                     max_inliers = num_inliers
                     best_result = (past_kf_id, query_kf_id, R_ij, t_ij, num_inliers)
+                    if num_inliers >= 20:
+                        break
 
         return best_result
 
