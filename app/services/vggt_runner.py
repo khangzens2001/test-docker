@@ -331,6 +331,33 @@ def run_vggt_inference(
             extrinsic = extrinsic.squeeze(0)
         ext_np = extrinsic.detach().cpu().float().numpy()
 
+        # Release GPU VRAM immediately before CPU-bound Open3D & NPZ steps
+        if "model" in locals() and model is not None:
+            if "orig_aggregator_forward" in locals() and orig_aggregator_forward is not None:
+                model.aggregator.forward = orig_aggregator_forward
+            if should_del_model:
+                model = None
+        orig_aggregator_forward = None
+        _optimized_aggregator_forward = None
+        images = None
+        aggregated_tokens_list = None
+        cam_tokens = None
+        pose_enc_list = None
+        pose_enc = None
+        extrinsic = None
+        intrinsic = None
+        chunk_tokens = None
+        img_chunk = None
+        pts_c = None
+        conf_c = None
+        img_chunk_perm = None
+        all_pts = None
+        all_conf = None
+        all_colors = None
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
         cams = []
         for i, fr in enumerate(frames):
             if i >= len(ext_np):
@@ -405,20 +432,18 @@ def run_vggt_inference(
         return False
     finally:
         # Guarantee full cleanup of model from GPU VRAM
-        if not should_del_model and "model" in locals() and "orig_aggregator_forward" in locals() and orig_aggregator_forward is not None:
-            model.aggregator.forward = orig_aggregator_forward
-        if should_del_model and "model" in locals():
-            del model
-        if "images" in locals():
-            del images
-        if "aggregated_tokens_list" in locals():
-            del aggregated_tokens_list
-        if "all_pts" in locals():
-            del all_pts
-        if "all_conf" in locals():
-            del all_conf
-        if "all_colors" in locals():
-            del all_colors
+        if "model" in locals() and model is not None:
+            if "orig_aggregator_forward" in locals() and orig_aggregator_forward is not None:
+                model.aggregator.forward = orig_aggregator_forward
+            if should_del_model:
+                model = None
+        orig_aggregator_forward = None
+        _optimized_aggregator_forward = None
+        images = None
+        aggregated_tokens_list = None
+        all_pts = None
+        all_conf = None
+        all_colors = None
+        gc.collect()
         if "device" in locals() and device == "cuda":
             torch.cuda.empty_cache()
-        gc.collect()

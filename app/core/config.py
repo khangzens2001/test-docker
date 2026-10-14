@@ -1,14 +1,15 @@
 import os
 
-# DevOps/SRE: Set single-threading env vars programmatically at import time
-# to prevent excessive thread creation by NumPy, OpenBLAS, MKL, PyTorch, Arrow, and ONNX Runtime.
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["ARROW_IO_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["ORT_NUM_THREADS"] = "1"
+# DevOps/SRE: Default threading env vars at import time (optimized for single-job RunPod Serverless worker;
+# override OMP_NUM_THREADS=1 via env var when running multi-worker Celery/API servers).
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("VIO_CV_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("ARROW_IO_THREADS", "2")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "2")
+os.environ.setdefault("ORT_NUM_THREADS", "2")
 
 from typing import List, Optional
 

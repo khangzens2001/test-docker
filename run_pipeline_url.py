@@ -11,7 +11,8 @@ import uuid
 import time
 import argparse
 
-import backend_api_extended_manhattan as backend
+if __name__ != "__mp_main__":
+    import backend_api_extended_manhattan as backend
 
 def run(url: str, batch_id: str = "cli_batch"):
     job_id = f"job_{int(time.time())}_{str(uuid.uuid4())[:6]}"
@@ -61,7 +62,8 @@ def run(url: str, batch_id: str = "cli_batch"):
             job_id=job_id,
             job_dir=job_dir,
             img_dir=img_dir,
-            out_dir=out_dir
+            out_dir=out_dir,
+            create_archive=False,
         )
         pipe_duration = time.time() - t_pipe
         print(f"-> Tái tạo 3D hoàn tất trong {pipe_duration:.2f}s!")

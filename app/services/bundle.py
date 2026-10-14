@@ -30,11 +30,33 @@ from app.services.materials import (
 
 
 def get_available_cpu_count() -> int:
-    """Return available CPU cores considering cgroups/taskset affinity when available."""
+    """Return available CPU cores considering cgroups v1/v2 quotas and taskset affinity."""
     try:
-        return len(os.sched_getaffinity(0))
+        cores = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
-        return os.cpu_count() or 1
+        cores = os.cpu_count() or 1
+
+    try:
+        if os.path.isfile("/sys/fs/cgroup/cpu.max"):
+            with open("/sys/fs/cgroup/cpu.max", "r", encoding="utf-8") as f:
+                parts = f.read().strip().split()
+            if len(parts) == 2 and parts[0] != "max":
+                quota, period = int(parts[0]), int(parts[1])
+                if quota > 0 and period > 0:
+                    cores = min(cores, max(1, quota // period))
+        elif os.path.isfile("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") and os.path.isfile(
+            "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
+        ):
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r", encoding="utf-8") as fq:
+                quota = int(fq.read().strip())
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r", encoding="utf-8") as fp:
+                period = int(fp.read().strip())
+            if quota > 0 and period > 0:
+                cores = min(cores, max(1, quota // period))
+    except Exception:
+        pass
+
+    return max(1, cores)
 
 
 def get_render_worker_count(cores: int | None = None) -> int:

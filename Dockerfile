@@ -50,6 +50,10 @@ RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(
 RUN pip uninstall -y onnxruntime opencv-python opencv-python-headless && \
     pip install --no-cache-dir numpy==1.26.4 scipy==1.15.3 pandas==2.3.3 pyarrow==25.0.1 opencv-python-headless==4.11.0.86 onnxruntime-gpu==1.23.2 ImageHash==4.3.2 pillow==12.3.0
 
+ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/opt/conda/lib/python3.11/site-packages/torch/lib \
+    OMP_NUM_THREADS=4 \
+    VIO_CV_THREADS=4
+
 # 6. Copy core modules, app, weights, floorplan generator, icons, scripts, file API Server chính và handler vào thư mục space
 COPY app /app/vggt-space/app
 COPY keyframe_select /app/vggt-space/keyframe_select
@@ -72,8 +76,10 @@ RUN if [ ! -f /app/vggt-space/weights/depthor.onnx ]; then \
         echo "--> depthor.onnx already exists in build context, skipping download."; \
     fi
 
-# 8. Tạo thư mục để lưu các jobs tạm thời
-RUN mkdir -p /app/vggt_room3d_jobs && chmod -R 777 /app/vggt_room3d_jobs
+# 8. Tạo thư mục để lưu các jobs tạm thời, khởi tạo sẵn Matplotlib font cache & biên dịch Numba JIT cache cho VIO
+RUN mkdir -p /app/vggt_room3d_jobs /tmp/numba_cache && \
+    python -c "import matplotlib.pyplot as plt; from app.services.vio_core.numba_accelerated import warmup_numba_jit; warmup_numba_jit()" && \
+    chmod -R 777 /app/vggt_room3d_jobs /tmp/numba_cache
 
 # Mở port 8000 của API
 EXPOSE 8000

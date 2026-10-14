@@ -69,9 +69,30 @@ if 'project_root = os.path.dirname' not in content:
     target = 'DATABASE_URL = (\n                f\"sqlite+aiosqlite:///{os.path.join(self.DATA_DIR, \'server.db\')}\"\n            )\n'
     if target in content:
         content = content.replace(target, target + snippet)
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        print('  -> Đã cập nhật resolve MODEL_WEIGHTS_PATH trong app/core/config.py')
+
+old_threads = '''os.environ[\"OMP_NUM_THREADS\"] = \"1\"
+os.environ[\"MKL_NUM_THREADS\"] = \"1\"
+os.environ[\"OPENBLAS_NUM_THREADS\"] = \"1\"
+os.environ[\"ARROW_IO_THREADS\"] = \"1\"
+os.environ[\"NUMEXPR_NUM_THREADS\"] = \"1\"
+os.environ[\"VECLIB_MAXIMUM_THREADS\"] = \"1\"
+os.environ[\"ORT_NUM_THREADS\"] = \"1\"'''
+
+new_threads = '''os.environ.setdefault(\"OMP_NUM_THREADS\", \"4\")
+os.environ.setdefault(\"VIO_CV_THREADS\", \"4\")
+os.environ.setdefault(\"MKL_NUM_THREADS\", \"2\")
+os.environ.setdefault(\"OPENBLAS_NUM_THREADS\", \"2\")
+os.environ.setdefault(\"ARROW_IO_THREADS\", \"2\")
+os.environ.setdefault(\"NUMEXPR_NUM_THREADS\", \"2\")
+os.environ.setdefault(\"VECLIB_MAXIMUM_THREADS\", \"2\")
+os.environ.setdefault(\"ORT_NUM_THREADS\", \"2\")'''
+
+if old_threads in content:
+    content = content.replace(old_threads, new_threads)
+
+with open(path, 'w', encoding='utf-8') as f:
+    f.write(content)
+print('  -> Đã cập nhật resolve MODEL_WEIGHTS_PATH, OMP_NUM_THREADS và VIO_CV_THREADS trong app/core/config.py')
 "
 
 echo "📦 6. Đồng bộ app/static/ (icons & fonts)..."
@@ -155,10 +176,68 @@ except ImportError:
             'model.aggregator.forward = _optimized_aggregator_forward',
             'orig_aggregator_forward = getattr(model.aggregator, \"forward\", None)\n    model.aggregator.forward = _optimized_aggregator_forward',
         )
-        c = c.replace(
-            'if \"model\" in locals():\n            del model',
-            'if not should_del_model and \"model\" in locals() and \"orig_aggregator_forward\" in locals() and orig_aggregator_forward is not None:\n            model.aggregator.forward = orig_aggregator_forward\n        if should_del_model and \"model\" in locals():\n            del model',
-        )
+        old_ext = 'ext_np = extrinsic.detach().cpu().float().numpy()'
+        new_ext = '''ext_np = extrinsic.detach().cpu().float().numpy()
+
+        # Release GPU VRAM immediately before CPU-bound Open3D & NPZ steps
+        if \"model\" in locals() and model is not None:
+            if \"orig_aggregator_forward\" in locals() and orig_aggregator_forward is not None:
+                model.aggregator.forward = orig_aggregator_forward
+            if should_del_model:
+                model = None
+        orig_aggregator_forward = None
+        _optimized_aggregator_forward = None
+        images = None
+        aggregated_tokens_list = None
+        cam_tokens = None
+        pose_enc_list = None
+        pose_enc = None
+        extrinsic = None
+        intrinsic = None
+        chunk_tokens = None
+        img_chunk = None
+        pts_c = None
+        conf_c = None
+        img_chunk_perm = None
+        all_pts = None
+        all_conf = None
+        all_colors = None
+        gc.collect()
+        if device == \"cuda\":
+            torch.cuda.empty_cache()'''
+        c = c.replace(old_ext, new_ext, 1)
+
+        old_finally = '''        if \"model\" in locals():
+            del model
+        if \"images\" in locals():
+            del images
+        if \"aggregated_tokens_list\" in locals():
+            del aggregated_tokens_list
+        if \"all_pts\" in locals():
+            del all_pts
+        if \"all_conf\" in locals():
+            del all_conf
+        if \"all_colors\" in locals():
+            del all_colors
+        if \"device\" in locals() and device == \"cuda\":
+            torch.cuda.empty_cache()
+        gc.collect()'''
+        new_finally = '''        if \"model\" in locals() and model is not None:
+            if \"orig_aggregator_forward\" in locals() and orig_aggregator_forward is not None:
+                model.aggregator.forward = orig_aggregator_forward
+            if should_del_model:
+                model = None
+        orig_aggregator_forward = None
+        _optimized_aggregator_forward = None
+        images = None
+        aggregated_tokens_list = None
+        all_pts = None
+        all_conf = None
+        all_colors = None
+        gc.collect()
+        if \"device\" in locals() and device == \"cuda\":
+            torch.cuda.empty_cache()'''
+        c = c.replace(old_finally, new_finally)
 
     with open(path, 'w', encoding='utf-8') as f:
         f.write(c)

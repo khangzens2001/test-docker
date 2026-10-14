@@ -52,8 +52,26 @@ def get_model():
         print(f"Loading VGGT model: {MODEL_ID}")
         print("Device:", device)
         print("Dtype:", dtype)
-        model = VGGT.from_pretrained(MODEL_ID).to(device)
+        model = VGGT.from_pretrained(MODEL_ID).to(device, dtype=dtype)
         model.eval()
+        try:
+            from vggt.heads.utils import create_uv_grid, position_grid_to_embed
+
+            def _patched_apply_pos_embed(self, x: torch.Tensor, W: int, H: int, ratio: float = 0.1) -> torch.Tensor:
+                patch_w = x.shape[-1]
+                patch_h = x.shape[-2]
+                pos_embed = create_uv_grid(patch_w, patch_h, aspect_ratio=W / H, dtype=x.dtype, device=x.device)
+                pos_embed = position_grid_to_embed(pos_embed, x.shape[1])
+                pos_embed = pos_embed.to(x.dtype) * ratio
+                pos_embed = pos_embed.permute(2, 0, 1)[None].expand(x.shape[0], -1, -1, -1)
+                return x + pos_embed
+
+            for head_name in ("point_head", "depth_head"):
+                head = getattr(model, head_name, None)
+                if head is not None:
+                    head._apply_pos_embed = _patched_apply_pos_embed.__get__(head)
+        except Exception:
+            pass
         print("VGGT loaded.")
     return model
 
@@ -77,29 +95,46 @@ def clean_stem(path: Path) -> str:
     return cleaned or "point_cloud"
 
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+_r2_client = None
+_r2_client_lock = threading.Lock()
+
+
 def get_r2_client():
+    global _r2_client
     access_key = os.getenv("R2_ACCESS_KEY_ID")
     secret_key = os.getenv("R2_SECRET_ACCESS_KEY")
     if not R2_ENDPOINT_URL or not access_key or not secret_key:
         raise RuntimeError("Missing R2 config. Set R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY before starting uvicorn.")
-    return boto3.client(
-        "s3",
-        endpoint_url=R2_ENDPOINT_URL,
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-        region_name="auto",
-        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
-    )
+    if _r2_client is None:
+        with _r2_client_lock:
+            if _r2_client is None:
+                _r2_client = boto3.client(
+                    "s3",
+                    endpoint_url=R2_ENDPOINT_URL,
+                    aws_access_key_id=access_key,
+                    aws_secret_access_key=secret_key,
+                    region_name="auto",
+                    config=Config(
+                        signature_version="s3v4",
+                        s3={"addressing_style": "path"},
+                        max_pool_connections=16,
+                    ),
+                )
+    return _r2_client
 
 
 def upload_to_r2(local_path: str, key: str) -> dict:
     access_key = os.getenv("R2_ACCESS_KEY_ID")
     secret_key = os.getenv("R2_SECRET_ACCESS_KEY")
+    file_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
     if not R2_ENDPOINT_URL or not access_key or not secret_key:
         return {
             "bucket": "local",
             "key": key,
-            "size": os.path.getsize(local_path) if os.path.exists(local_path) else 0,
+            "size": file_size,
             "etag": "local",
             "presigned_url": f"file://{os.path.abspath(local_path)}",
             "expires_in": 0,
@@ -107,13 +142,12 @@ def upload_to_r2(local_path: str, key: str) -> dict:
         }
     client = get_r2_client()
     with open(local_path, "rb") as f:
-        client.put_object(
+        put_res = client.put_object(
             Bucket=R2_BUCKET,
             Key=key,
             Body=f,
             ContentType="application/octet-stream",
         )
-    head = client.head_object(Bucket=R2_BUCKET, Key=key)
     url = client.generate_presigned_url(
         "get_object",
         Params={"Bucket": R2_BUCKET, "Key": key},
@@ -122,8 +156,8 @@ def upload_to_r2(local_path: str, key: str) -> dict:
     return {
         "bucket": R2_BUCKET,
         "key": key,
-        "size": int(head.get("ContentLength", os.path.getsize(local_path))),
-        "etag": str(head.get("ETag", "")).strip('\"'),
+        "size": int(file_size),
+        "etag": str(put_res.get("ETag", "")).strip('\"'),
         "presigned_url": url,
         "expires_in": R2_PRESIGN_EXPIRES,
     }
@@ -379,7 +413,15 @@ def write_binary_ply(path: str, points: np.ndarray, colors: np.ndarray) -> None:
         vertex.tofile(f)
 
 
-def export_point_cloud(predictions, image_names: list[str], out_dir: str, conf_threshold: float, max_points: int, hard_max_points: int) -> dict:
+def export_point_cloud(
+    predictions,
+    image_names: list[str],
+    out_dir: str,
+    conf_threshold: float,
+    max_points: int,
+    hard_max_points: int,
+    save_npz: bool = True,
+) -> dict:
     max_points = min(int(max_points), int(hard_max_points), DEFAULT_HARD_MAX_POINTS)
     world_points = tensor_to_numpy(predictions["world_points"])
     world_conf = tensor_to_numpy(predictions["world_points_conf"])
@@ -394,11 +436,12 @@ def export_point_cloud(predictions, image_names: list[str], out_dir: str, conf_t
         img = ((img + 1.0) * 127.5) if img.min() < 0 else (img * 255.0)
         img = np.clip(img, 0, 255).astype(np.uint8)
         mask = np.isfinite(pts).all(axis=-1) & np.isfinite(conf) & (conf > conf_threshold)
-        name = image_names[view_idx] if view_idx < len(image_names) else f"view_{view_idx:03d}.jpg"
-        safe_key = name.replace(".", "_").replace("/", "_").replace(" ", "_")
-        per_view[f"view_points__{safe_key}"] = pts.astype(np.float32)
-        per_view[f"view_conf__{safe_key}"] = conf.astype(np.float32)
-        per_view[f"view_colors__{safe_key}"] = img.astype(np.uint8)
+        if save_npz:
+            name = image_names[view_idx] if view_idx < len(image_names) else f"view_{view_idx:03d}.jpg"
+            safe_key = name.replace(".", "_").replace("/", "_").replace(" ", "_")
+            per_view[f"view_points__{safe_key}"] = pts.astype(np.float32)
+            per_view[f"view_conf__{safe_key}"] = conf.astype(np.float32)
+            per_view[f"view_colors__{safe_key}"] = img.astype(np.uint8)
         if np.any(mask):
             pts_all.append(pts[mask])
             rgb_all.append(img[mask])
@@ -419,14 +462,15 @@ def export_point_cloud(predictions, image_names: list[str], out_dir: str, conf_t
 
     npz_path = os.path.join(out_dir, "project_point_cloud.npz")
     ply_path = os.path.join(out_dir, "project_point_cloud.ply")
-    np.savez_compressed(
-        npz_path,
-        points=points,
-        colors=colors,
-        confidence=conf,
-        image_names=np.array(image_names),
-        **per_view,
-    )
+    if save_npz:
+        np.savez_compressed(
+            npz_path,
+            points=points,
+            colors=colors,
+            confidence=conf,
+            image_names=np.array(image_names),
+            **per_view,
+        )
     write_binary_ply(ply_path, points, colors)
     return {"num_points": int(len(points)), "npz_path": npz_path, "ply_path": ply_path, "max_points": int(max_points)}
 
@@ -465,7 +509,7 @@ def download_and_extract_zip(url: str, job_dir: str, dest_dir: str) -> List[str]
         response = requests.get(url, stream=True, timeout=600)
         response.raise_for_status()
         with open(zip_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
                     
@@ -507,6 +551,14 @@ def find_multisensor_session_dir(root_dir: str) -> Optional[str]:
 
 
 def run_multisensor_pipeline(session_dir: str, batch_id: str, job_id: str, out_dir: str) -> dict:
+    import gc
+    global model
+    if model is not None:
+        model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     from app.pipeline.runner import run_pipeline
     from app.services.cad.contract import layout_to_metrics_mm
 
@@ -518,34 +570,65 @@ def run_multisensor_pipeline(session_dir: str, batch_id: str, job_id: str, out_d
 
     clean_ply_candidates = [
         os.path.join(session_dir, "reconstructed_visual.ply"),
+        os.path.join(session_dir, "reconstructed_whiteflat.ply"),
         os.path.join(session_dir, "whiteflat.ply"),
         os.path.join(session_dir, "reconstructed.ply"),
     ]
     clean_ply_path = next((p for p in clean_ply_candidates if os.path.isfile(p)), None)
     clean_ply_r2 = {}
-    if clean_ply_path:
-        clean_ply_r2 = upload_to_r2(
-            clean_ply_path, f"ply_clean/{object_prefix}/project_point_cloud_clean.ply"
-        )
-
     floorplan_files = {}
     file_candidates = [
         ("floorplan_png", ["FloorPlan_A3.png", "FloorPlan_A4.png", "floorplan.png", "ISO_A3_Floorplan.png", "ISO_A4_Floorplan.png"]),
         ("floorplan_pdf", ["FloorPlan_A3.pdf", "FloorPlan_A4.pdf", "floorplan.pdf", "ISO_A3_Floorplan.pdf", "ISO_A4_Floorplan.pdf"]),
-        ("wall_elevation_png", ["Walls.png", "walls.png"]),
+        ("floorplan_a4_png", ["FloorPlan_A4.png", "ISO_A4_Floorplan.png"]),
+        ("floorplan_a4_pdf", ["FloorPlan_A4.pdf", "ISO_A4_Floorplan.pdf"]),
+        ("floorplan_json", ["floorplan.json"]),
+        ("wall_elevation_png", ["Walls.png", "walls.png", "input_Walls.png"]),
         ("debug_topdown_png", ["debug_topdown.png"]),
         ("room_model_glb", ["room_model_texture.glb", "room_model.glb", "reconstructed.glb"]),
+        ("reconstructed_poisson_glb", ["reconstructed_poisson.glb"]),
+        ("dollhouse_ply", ["reconstructed_dollhouse.ply"]),
+        ("whiteflat_ply", ["reconstructed_whiteflat.ply", "whiteflat.ply"]),
         ("metrics_json", ["metrics.json"]),
+        ("quality_report_json", ["quality_report.json"]),
+        ("cf_png", ["CF.png"]),
+        ("cf_pdf", ["CF.pdf"]),
+        ("cf_chart_png", ["CF_chart.png"]),
+        ("neda_png", ["Neda.png"]),
+        ("neda_pdf", ["Neda.pdf"]),
+        ("neda_chart_png", ["Neda_chart.png"]),
+        ("plywood_png", ["Plywood.png"]),
+        ("plywood_pdf", ["Plywood.pdf"]),
+        ("plywood_chart_png", ["Plywood_chart.png"]),
+        ("tiling_png", ["Tiling.png"]),
+        ("tiling_pdf", ["Tiling.pdf"]),
+        ("tiling_chart_png", ["Tiling_chart.png"]),
+        ("combined_png", ["Combined.png"]),
     ]
+
+    upload_tasks = []
+    if clean_ply_path:
+        upload_tasks.append(("__clean_ply__", clean_ply_path, f"ply_clean/{object_prefix}/project_point_cloud_clean.ply"))
+
     for file_key, cands in file_candidates:
         for c in cands:
             p = os.path.join(session_dir, c)
             if os.path.isfile(p):
                 target_name = "walls.png" if "wall" in file_key else c
-                floorplan_files[file_key] = upload_to_r2(
-                    p, f"ply_clean/{object_prefix}/{target_name}"
-                )
+                upload_tasks.append((file_key, p, f"ply_clean/{object_prefix}/{target_name}"))
                 break
+
+    if upload_tasks:
+        with ThreadPoolExecutor(max_workers=min(6, len(upload_tasks))) as pool:
+            futures = [
+                (k, pool.submit(upload_to_r2, p, r2_k))
+                for k, p, r2_k in upload_tasks
+            ]
+            for k, fut in futures:
+                if k == "__clean_ply__":
+                    clean_ply_r2 = fut.result()
+                else:
+                    floorplan_files[k] = fut.result()
 
     room_metrics = None
     metrics_json_path = os.path.join(session_dir, "metrics.json")
@@ -594,8 +677,11 @@ def run_inference_pipeline(
     job_id: str,
     job_dir: str,
     img_dir: str,
-    out_dir: str
+    out_dir: str,
+    create_archive: bool = True,
+    save_raw_predictions: bool = False,
 ) -> dict:
+    import gc
     image_paths = sorted(image_paths)
     if max_images is not None and max_images > 0:
         image_paths = image_paths[:max_images]
@@ -606,7 +692,7 @@ def run_inference_pipeline(
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     m = get_model()
-    images = load_and_preprocess_images(image_paths).to(device)
+    images = load_and_preprocess_images(image_paths).to(device, dtype=dtype)
     with torch.no_grad():
         if device == "cuda":
             with torch.cuda.amp.autocast(dtype=dtype):
@@ -614,9 +700,23 @@ def run_inference_pipeline(
         else:
             predictions = m(images)
 
-    torch.save(predictions, os.path.join(out_dir, "predictions.pt"))
+    if save_raw_predictions or os.getenv("SAVE_RAW_PREDICTIONS", "0") == "1":
+        torch.save(predictions, os.path.join(out_dir, "predictions.pt"))
+
+    pred_keys = list(predictions.keys())
+    pred_shapes = prediction_shapes(predictions)
+    save_npz = create_archive or (os.getenv("SAVE_NPZ", "0") == "1")
     image_names = [os.path.basename(p) for p in image_paths]
-    cloud_info = export_point_cloud(predictions, image_names, out_dir, conf_threshold, max_points, hard_max_points)
+    cloud_info = export_point_cloud(
+        predictions, image_names, out_dir, conf_threshold, max_points, hard_max_points, save_npz=save_npz
+    )
+
+    # Free GPU/CPU tensors immediately before CPU-bound Open3D & floorplan generation
+    del images, predictions
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
     clean_dir = os.path.join(out_dir, "clean")
     clean_info = clean_ply_file(
         cloud_info["ply_path"],
@@ -629,7 +729,6 @@ def run_inference_pipeline(
     alignment_info = align_clean_ply_to_manhattan(clean_info["output"])
 
     object_prefix = f"{safe_object_part(batch_id)}/{job_id}"
-    clean_r2 = upload_to_r2(clean_info["output"], f"ply_clean/{object_prefix}/project_point_cloud_clean.ply")
     try:
         os.remove(cloud_info["ply_path"])
     except OSError:
@@ -638,6 +737,7 @@ def run_inference_pipeline(
     # ── 3D to 2D Floorplan & Room Metrics Extraction ──
     room_metrics = None
     floorplan_files = {}
+    upload_tasks = [("__clean_ply__", clean_info["output"], f"ply_clean/{object_prefix}/project_point_cloud_clean.ply")]
     try:
         from floorplan_generator.main import generate_floorplan_from_ply
         fp_result = generate_floorplan_from_ply(
@@ -652,30 +752,31 @@ def run_inference_pipeline(
         room_metrics = fp_result.get("metrics")
         fp_files = fp_result.get("files", {})
 
-        # Upload 2D outputs to R2 alongside 3D PLY if files exist
-        if fp_files.get("floorplan_png") and os.path.exists(fp_files["floorplan_png"]):
-            floorplan_files["floorplan_png"] = upload_to_r2(
-                fp_files["floorplan_png"], f"ply_clean/{object_prefix}/floorplan.png"
-            )
-        if fp_files.get("floorplan_pdf") and os.path.exists(fp_files["floorplan_pdf"]):
-            floorplan_files["floorplan_pdf"] = upload_to_r2(
-                fp_files["floorplan_pdf"], f"ply_clean/{object_prefix}/floorplan.pdf"
-            )
-        if fp_files.get("wall_elevation_png") and os.path.exists(fp_files["wall_elevation_png"]):
-            floorplan_files["wall_elevation_png"] = upload_to_r2(
-                fp_files["wall_elevation_png"], f"ply_clean/{object_prefix}/walls.png"
-            )
-        if fp_files.get("debug_topdown_png") and os.path.exists(fp_files["debug_topdown_png"]):
-            floorplan_files["debug_topdown_png"] = upload_to_r2(
-                fp_files["debug_topdown_png"], f"ply_clean/{object_prefix}/debug_topdown.png"
-            )
-        if fp_files.get("metrics_json") and os.path.exists(fp_files["metrics_json"]):
-            floorplan_files["metrics_json"] = upload_to_r2(
-                fp_files["metrics_json"], f"ply_clean/{object_prefix}/metrics.json"
-            )
+        fp_upload_map = [
+            ("floorplan_png", "floorplan.png"),
+            ("floorplan_pdf", "floorplan.pdf"),
+            ("wall_elevation_png", "walls.png"),
+            ("debug_topdown_png", "debug_topdown.png"),
+            ("metrics_json", "metrics.json"),
+        ]
+        for fk, target_name in fp_upload_map:
+            if fp_files.get(fk) and os.path.exists(fp_files[fk]):
+                upload_tasks.append((fk, fp_files[fk], f"ply_clean/{object_prefix}/{target_name}"))
     except Exception as exc:
         print(f"Warning: Failed to extract 2D floorplan metrics on AI server: {exc}")
         traceback.print_exc()
+
+    clean_r2 = {}
+    with ThreadPoolExecutor(max_workers=min(6, len(upload_tasks))) as pool:
+        futures = [
+            (k, pool.submit(upload_to_r2, p, r2_k))
+            for k, p, r2_k in upload_tasks
+        ]
+        for k, fut in futures:
+            if k == "__clean_ply__":
+                clean_r2 = fut.result()
+            else:
+                floorplan_files[k] = fut.result()
 
     meta = {
         "status": "success",
@@ -710,8 +811,8 @@ def run_inference_pipeline(
             "expires_days": round(R2_PRESIGN_EXPIRES / 86400, 2),
         },
         "clean_ply": clean_r2,
-        "prediction_keys": list(predictions.keys()),
-        "shape_info": prediction_shapes(predictions),
+        "prediction_keys": pred_keys,
+        "shape_info": pred_shapes,
         "download_url": f"/download/{job_id}",
         "npz_url": f"/download_npz/{job_id}",
         "job_url": f"/jobs/{job_id}",
@@ -719,7 +820,8 @@ def run_inference_pipeline(
     with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    zip_job(job_dir, job_id)
+    if create_archive:
+        zip_job(job_dir, job_id)
     if device == "cuda":
         torch.cuda.empty_cache()
     return meta

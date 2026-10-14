@@ -5,36 +5,20 @@ from typing import Optional
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
+import gc
+import shutil
 import uuid
 import traceback
-import runpod
-import torch
-from vggt.models.vggt import VGGT
+
+if __name__ != "__mp_main__":
+    import runpod
+    import torch
+    import backend_api_extended_manhattan
 
 # Define global constants matching backend
 MODEL_ID = os.getenv("VGGT_MODEL_ID", "facebook/VGGT-1B")
 BASE_DIR = os.getenv("BASE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "vggt_room3d_jobs"))
 DEFAULT_HARD_MAX_POINTS = 300_000_000
-
-# 1. Khởi tạo & Warm-up Model (Global Scope)
-print("--> Loading VGGT Model to GPU...", flush=True)
-device = "cuda" if torch.cuda.is_available() else "cpu"
-if device == "cuda":
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-else:
-    dtype = torch.float32
-
-# Load and compile weights to GPU VRAM
-model = VGGT.from_pretrained(MODEL_ID).to(device)
-model.eval()
-
-# Inject the model into the backend_api module to prevent reloading
-import backend_api_extended_manhattan
-backend_api_extended_manhattan.model = model
-backend_api_extended_manhattan.device = device
-backend_api_extended_manhattan.dtype = dtype
-
-print("--> Model loaded successfully!", flush=True)
 
 def find_multisensor_session_dir(root_dir: str) -> Optional[str]:
     """Detect if directory contains multi-sensor LiDAR/odometry scan files."""
@@ -87,6 +71,12 @@ def handler(job):
         session_dir = find_multisensor_session_dir(img_dir) or find_multisensor_session_dir(job_dir)
         if session_dir is not None:
             print(f"--> [Job {job_id}] Detected Multi-Sensor LiDAR Session in: {session_dir}. Running standalone pipeline...", flush=True)
+            if getattr(backend_api_extended_manhattan, "model", None) is not None:
+                backend_api_extended_manhattan.model = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
             from app.pipeline.runner import run_pipeline
             from app.services.cad.contract import layout_to_metrics_mm
 
@@ -97,35 +87,66 @@ def handler(job):
             # 1. Clean PLY upload
             clean_ply_candidates = [
                 os.path.join(session_dir, "reconstructed_visual.ply"),
+                os.path.join(session_dir, "reconstructed_whiteflat.ply"),
                 os.path.join(session_dir, "whiteflat.ply"),
                 os.path.join(session_dir, "reconstructed.ply"),
             ]
             clean_ply_path = next((p for p in clean_ply_candidates if os.path.isfile(p)), None)
             clean_ply_r2 = {}
-            if clean_ply_path:
-                clean_ply_r2 = backend_api_extended_manhattan.upload_to_r2(
-                    clean_ply_path, f"ply_clean/{object_prefix}/project_point_cloud_clean.ply"
-                )
-
-            # 2. Floorplan & CAD files upload
             floorplan_files = {}
             file_candidates = [
                 ("floorplan_png", ["FloorPlan_A3.png", "FloorPlan_A4.png", "floorplan.png", "ISO_A3_Floorplan.png", "ISO_A4_Floorplan.png"]),
                 ("floorplan_pdf", ["FloorPlan_A3.pdf", "FloorPlan_A4.pdf", "floorplan.pdf", "ISO_A3_Floorplan.pdf", "ISO_A4_Floorplan.pdf"]),
-                ("wall_elevation_png", ["Walls.png", "walls.png"]),
+                ("floorplan_a4_png", ["FloorPlan_A4.png", "ISO_A4_Floorplan.png"]),
+                ("floorplan_a4_pdf", ["FloorPlan_A4.pdf", "ISO_A4_Floorplan.pdf"]),
+                ("floorplan_json", ["floorplan.json"]),
+                ("wall_elevation_png", ["Walls.png", "walls.png", "input_Walls.png"]),
                 ("debug_topdown_png", ["debug_topdown.png"]),
                 ("room_model_glb", ["room_model_texture.glb", "room_model.glb", "reconstructed.glb"]),
+                ("reconstructed_poisson_glb", ["reconstructed_poisson.glb"]),
+                ("dollhouse_ply", ["reconstructed_dollhouse.ply"]),
+                ("whiteflat_ply", ["reconstructed_whiteflat.ply", "whiteflat.ply"]),
                 ("metrics_json", ["metrics.json"]),
+                ("quality_report_json", ["quality_report.json"]),
+                ("cf_png", ["CF.png"]),
+                ("cf_pdf", ["CF.pdf"]),
+                ("cf_chart_png", ["CF_chart.png"]),
+                ("neda_png", ["Neda.png"]),
+                ("neda_pdf", ["Neda.pdf"]),
+                ("neda_chart_png", ["Neda_chart.png"]),
+                ("plywood_png", ["Plywood.png"]),
+                ("plywood_pdf", ["Plywood.pdf"]),
+                ("plywood_chart_png", ["Plywood_chart.png"]),
+                ("tiling_png", ["Tiling.png"]),
+                ("tiling_pdf", ["Tiling.pdf"]),
+                ("tiling_chart_png", ["Tiling_chart.png"]),
+                ("combined_png", ["Combined.png"]),
             ]
+
+            upload_tasks = []
+            if clean_ply_path:
+                upload_tasks.append(("__clean_ply__", clean_ply_path, f"ply_clean/{object_prefix}/project_point_cloud_clean.ply"))
+
             for file_key, cands in file_candidates:
                 for c in cands:
                     p = os.path.join(session_dir, c)
                     if os.path.isfile(p):
                         target_name = "walls.png" if "wall" in file_key else c
-                        floorplan_files[file_key] = backend_api_extended_manhattan.upload_to_r2(
-                            p, f"ply_clean/{object_prefix}/{target_name}"
-                        )
+                        upload_tasks.append((file_key, p, f"ply_clean/{object_prefix}/{target_name}"))
                         break
+
+            if upload_tasks:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=min(6, len(upload_tasks))) as pool:
+                    futures = [
+                        (k, pool.submit(backend_api_extended_manhattan.upload_to_r2, p, r2_k))
+                        for k, p, r2_k in upload_tasks
+                    ]
+                    for k, fut in futures:
+                        if k == "__clean_ply__":
+                            clean_ply_r2 = fut.result()
+                        else:
+                            floorplan_files[k] = fut.result()
 
             # 3. Room metrics extraction (contract matching new_update.md Section 5)
             room_metrics = None
@@ -175,7 +196,8 @@ def handler(job):
             job_id=job_id,
             job_dir=job_dir,
             img_dir=img_dir,
-            out_dir=out_dir
+            out_dir=out_dir,
+            create_archive=False,
         )
 
         presigned_url = meta["clean_ply"]["presigned_url"]
@@ -201,12 +223,22 @@ def handler(job):
         error_text = traceback.format_exc()
         with open(os.path.join(out_dir, "error.txt"), "w", encoding="utf-8") as f:
             f.write(error_text)
-        try:
-            backend_api_extended_manhattan.zip_job(job_dir, job_id)
-        except Exception:
-            pass
         return {"status": "error", "job_id": job_id, "error": str(e)}
+    finally:
+        r2_configured = bool(
+            getattr(backend_api_extended_manhattan, "R2_ENDPOINT_URL", "")
+            and os.getenv("R2_ACCESS_KEY_ID")
+            and os.getenv("R2_SECRET_ACCESS_KEY")
+        )
+        should_cleanup = os.getenv("CLEANUP_JOB_DIR", "1" if r2_configured else "0").strip() != "0"
+        if should_cleanup and os.path.isdir(job_dir):
+            shutil.rmtree(job_dir, ignore_errors=True)
 
 if __name__ == "__main__":
+    try:
+        from app.services.vio_core.numba_accelerated import warmup_numba_jit
+        warmup_numba_jit()
+    except Exception as e:
+        print(f"Warning: Numba JIT warmup skipped: {e}", flush=True)
     print("Starting RunPod Serverless Worker...", flush=True)
     runpod.serverless.start({"handler": handler})

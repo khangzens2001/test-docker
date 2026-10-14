@@ -1064,13 +1064,20 @@ def run_3d_reconstruction(
     if pose_df.attrs.get("pose_source") != "server_vio":
         _attach_odometry_frame_indices(raw_keyframes, session_dir)
 
+    def _is_readable_image(path: str) -> bool:
+        try:
+            if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+                return False
+            from PIL import Image
+            with Image.open(path) as im:
+                return im.size[0] > 0 and im.size[1] > 0
+        except Exception:
+            return (cv2.imread(path) is not None) if cv2 is not None else False
+
     resolved: list[dict] = []
     for kf in raw_keyframes:
         path = resolve_keyframe_rgb_path(session_dir, kf)
-        if path is None:
-            continue
-        rgb = cv2.imread(path) if cv2 is not None else None
-        if rgb is None:
+        if path is None or not _is_readable_image(path):
             continue
         item = dict(kf)
         item["_rgb_path"] = path
@@ -1084,10 +1091,7 @@ def run_3d_reconstruction(
         resolved = []
         for kf in raw_keyframes:
             path = resolve_keyframe_rgb_path(session_dir, kf)
-            if path is None:
-                continue
-            rgb = cv2.imread(path) if cv2 is not None else None
-            if rgb is None:
+            if path is None or not _is_readable_image(path):
                 continue
             item = dict(kf)
             item["_rgb_path"] = path

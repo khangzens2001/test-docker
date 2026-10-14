@@ -11,3 +11,4 @@ vggt_room3d_jobs/
 data/
 .env
 vggt-space/
+.orca/

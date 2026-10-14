@@ -13,3 +13,4 @@ data/
 .env
 .env.*
 vggt-space/
+.orca/

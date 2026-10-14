@@ -51,4 +51,4 @@ jobs:
             khangzens/vggt-1b:${{ github.ref_name }}
           # Docker caching to speed up consecutive builds
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
