@@ -93,6 +93,7 @@ def build_visual_measurement(
     T_bc: np.ndarray,
     P: np.ndarray,
     image_size: tuple[int, int] | None = None,
+    max_depth: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     """Build stacked visual measurement residual, Jacobian, and effective covariance.
 
@@ -153,7 +154,7 @@ def build_visual_measurement(
 
         p_c = R_wc.T @ (p_w - p_wc)
         X, Y, Z = p_c[0], p_c[1], p_c[2]
-        if Z <= 0.2:
+        if Z <= 0.2 or (max_depth is not None and max_depth > 0 and Z > max_depth):
             continue
 
         u_proj = fx * (X / Z) + cx
@@ -412,6 +413,7 @@ class LandmarkTrackMap:
         R_wc: np.ndarray,
         p_wc: np.ndarray,
         K: np.ndarray,
+        max_depth: float | None = None,
     ) -> None:
         """Triangulate candidate tracks against host pose and promote if parallax >= 1.5 deg.
 
@@ -439,7 +441,7 @@ class LandmarkTrackMap:
         R1 = np.stack([t.R_host for t in batch_tracks]).astype(np.float64)
         t1 = np.stack([t.p_host for t in batch_tracks]).astype(np.float64)
 
-        res = triangulate_dlt_batch(uv1, uv2, R1, t1, R_wc, p_wc, K, min_parallax_deg=MIN_PARALLAX_DEG)
+        res = triangulate_dlt_batch(uv1, uv2, R1, t1, R_wc, p_wc, K, min_parallax_deg=MIN_PARALLAX_DEG, max_depth=max_depth)
 
         for i in np.flatnonzero(res.valid):
             t = batch_tracks[int(i)]
@@ -515,8 +517,9 @@ class LandmarkTrackMap:
                 continue
 
             p_c = R_wc.T @ (p_w - p_wc)
-            p_c_list.append(p_c)
-            uv_list.append(t.uv)
+            if p_c[2] > 0.1 and p_c[2] <= 3.0:
+                p_c_list.append(p_c)
+                uv_list.append(t.uv)
 
         if not p_c_list:
             return np.empty((0, 3), dtype=float), np.empty((0, 2), dtype=float)

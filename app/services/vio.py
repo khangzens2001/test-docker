@@ -341,6 +341,7 @@ class ServerSideVioEstimator:
             finite_odo = np.all(np.isfinite(odo_pos[:, :2]), axis=1)
             if np.any(finite_odo):
                 span_xy_odo = float(np.max(np.ptp(odo_pos[finite_odo, :2], axis=0)))
+
         # Check if small room from SPAD sensor depths
         is_small_room = False
         if spad_lidar_df is not None and not spad_lidar_df.empty:
@@ -351,10 +352,7 @@ class ServerSideVioEstimator:
                     vals = spad_lidar_df[d_cols].to_numpy(dtype=float)
                     valid_vals.append(vals[(vals > 0.05) & np.isfinite(vals)].ravel())
                 except (ValueError, TypeError) as exc:
-                    # A non-numeric column slipped through the name filter; skip the scalar pool
-                    # rather than abort the session (depth_grid is handled separately below).
                     logger.warning("is_small_room: skipping non-numeric SPAD columns %s: %s", d_cols, exc)
-            # Object column of per-frame (8,8) grids (synthetic/test sessions); real sessions use d0..d63.
             if "depth_grid" in spad_lidar_df.columns:
                 for g in spad_lidar_df["depth_grid"].dropna():
                     arr = np.asarray(g, dtype=float).ravel()
@@ -420,7 +418,7 @@ class ServerSideVioEstimator:
         frontend = VisualFrontend(intrinsics=K, dist_coeffs=dist_coeffs)
         track_map = LandmarkTrackMap(K=K)
         smoother = ManifoldRtsSmoother()
-        loop_detector = LoopDetector(min_kf_diff=12)
+        loop_detector = LoopDetector(min_kf_diff=35)
         pgo = PoseGraphOptimizer()
         orb_detector = cv2.ORB_create() if cv2 is not None else None
 
@@ -644,8 +642,9 @@ class ServerSideVioEstimator:
                             cur_v_mag = float(np.linalg.norm(eskf.state.v))
                             if cur_v_mag > 1.2:
                                 eskf.state.v *= (1.2 / cur_v_mag)
-                            eskf.state.v[2] = float(np.clip(eskf.state.v[2], -0.80, 0.80))
-                            eskf.state.p[2] = float(np.clip(eskf.state.p[2], -1.60, 1.20))
+                            if is_small_room:
+                                eskf.state.v[2] = float(np.clip(eskf.state.v[2], -0.80, 0.80))
+                                eskf.state.p[2] = float(np.clip(eskf.state.p[2], -1.60, 1.20))
                         else:
                             F_list.append(np.eye(StateIndex.DIM))
                             pred_states.append(_copy_state(eskf.state))
@@ -738,6 +737,7 @@ class ServerSideVioEstimator:
                                     T_cam_spad=T_cam_spad_eff,
                                     status_mask=status_to_assoc,
                                     image_size=(w_img, h_img),
+                                    max_depth=10.0,
                                     rays=rays,
                                     ray_frame=ray_frame,
                                 )
@@ -805,6 +805,7 @@ class ServerSideVioEstimator:
 
                         # Check optical flow parallax / odometry speed for ZUPT
                         is_stationary = False
+                        w_curr = float(np.linalg.norm(latest_phone_gyro - eskf.state.bg)) if latest_phone_gyro is not None else 1.0
                         if len(matched_pts_prev) >= 10 and len(matched_pts_curr) >= 10:
                             p_norm = (matched_pts_prev - np.array([K[0, 2], K[1, 2]])) / np.array([K[0, 0], K[1, 1]])
                             p_norm_hom = np.hstack([p_norm, np.ones((len(p_norm), 1))])
@@ -815,7 +816,7 @@ class ServerSideVioEstimator:
                                     K[1, 1] * p_derot[:, 1] / p_derot[:, 2] + K[1, 2],
                                 ])
                                 flow_res = np.linalg.norm(matched_pts_curr - u_derot, axis=1)
-                                if np.median(flow_res) < 1.0:
+                                if np.median(flow_res) < 1.0 and w_curr < 0.05:
                                     is_stationary = True
 
                         o_spad = float(np.clip(len(cur_spad_active) / 8.0, 0.0, 1.0))
@@ -825,9 +826,9 @@ class ServerSideVioEstimator:
                             dt_o = max(1e-3, odo_times[idx_odo] - odo_times[idx_odo - 1])
                             dp_odo = odo_pos[idx_odo] - odo_pos[idx_odo - 1]
                             s_odo = float(np.linalg.norm(dp_odo) / max(dt_o, 0.005))
-                            if s_odo < 0.05:
+                            if s_odo < 0.05 and w_curr < 0.05:
                                 is_stationary = True
-                            if s_odo > 2.5 or dt_o < 0.005:
+                            if s_odo > 2.5 or dt_o < 0.005 or float(np.linalg.norm(dp_odo)) > 0.50:
                                 q_motion = 0.0
                             else:
                                 q_motion = float(np.clip(1.0 - max(0.0, s_odo - 1.2), 0.0, 1.0))
@@ -836,26 +837,17 @@ class ServerSideVioEstimator:
                             eskf.state.v[:] = 0.0
                             eskf.update_zupt(sigma_vel=0.01)
                         elif odo_times is not None and len(odo_times) > 1 and q_motion > 0.0:
-                            if len(all_spad_active_ids) >= 50 or len(cur_spad_active) >= 4 or len(cur_active) >= 12:
-                                # When visual/SPAD tracking is stable, minimize odometry drift leakage:
-                                # Anchor scalar speed with low alpha_v to prevent IMU runaway without injecting drifting odometry heading
-                                alpha_v = float(np.clip(0.15 - 0.05 * o_spad, 0.05, 0.15)) * q_motion
+                            alpha_v = float(np.clip(0.70 - 0.10 * o_spad, 0.45, 0.75)) * q_motion
+                            if R_vio_odo is not None:
+                                v_odo_w = R_vio_odo @ (dp_odo / dt_o)
+                                v_odo_w[2] = 0.0
+                                eskf.state.v[:2] = (1.0 - alpha_v) * eskf.state.v[:2] + alpha_v * v_odo_w[:2]
+                                eskf.state.v[2] = float(np.clip(eskf.state.v[2] * (1.0 - 0.5 * alpha_v), -0.40, 0.40))
+                            else:
                                 v_norm = float(np.linalg.norm(eskf.state.v))
                                 if v_norm > 1e-4 and s_odo > 1e-4:
                                     target_speed = (1.0 - alpha_v) * v_norm + alpha_v * min(s_odo, 2.0)
                                     eskf.state.v = (eskf.state.v / v_norm) * target_speed
-                            else:
-                                alpha_v = float(np.clip(0.60 - 0.10 * o_spad, 0.35, 0.60)) * q_motion
-                                if R_vio_odo is not None:
-                                    v_odo_w = R_vio_odo @ (dp_odo / dt_o)
-                                    v_odo_w[2] = 0.0
-                                    eskf.state.v[:2] = (1.0 - alpha_v) * eskf.state.v[:2] + alpha_v * v_odo_w[:2]
-                                    eskf.state.v[2] = float(np.clip(eskf.state.v[2] * (1.0 - 0.5 * alpha_v), -0.40, 0.40))
-                                else:
-                                    v_norm = float(np.linalg.norm(eskf.state.v))
-                                    if v_norm > 1e-4 and s_odo > 1e-4:
-                                        target_speed = (1.0 - alpha_v) * v_norm + alpha_v * min(s_odo, 2.0)
-                                        eskf.state.v = (eskf.state.v / v_norm) * target_speed
 
                             v_cur_speed = float(np.linalg.norm(eskf.state.v))
                             max_allowed_speed = max(1.2 * s_odo, 0.10)
@@ -900,15 +892,12 @@ class ServerSideVioEstimator:
                                     dt_seg = max(1e-3, t_curr - t_prev)
                                     dp_raw = odo_pos[idx_c] - odo_pos[idx_p]
                                     s_seg = float(np.linalg.norm(dp_raw) / max(dt_seg, 0.005))
-                                    if s_seg > 2.5 or dt_seg < 0.005:
+                                    if s_seg > 2.5 or dt_seg < 0.005 or float(np.linalg.norm(dp_raw)) > 0.50:
                                         q_seg = 0.0
                                     else:
                                         q_seg = float(np.clip(1.0 - max(0.0, s_seg - 1.2), 0.0, 1.0))
 
-                                    if len(all_spad_active_ids) >= 50:
-                                        w_odo = 0.0
-                                    else:
-                                        w_odo = float(np.clip(0.80 - 0.20 * o_node, 0.35, 0.85)) * max(q_seg, 0.20)
+                                    w_odo = float(np.clip(0.80 - 0.20 * o_node, 0.35, 0.85)) * q_seg
                                     if w_odo > 0.0:
                                         if R_vio_odo is not None:
                                             dp_w_odo = R_vio_odo @ dp_raw
@@ -923,7 +912,7 @@ class ServerSideVioEstimator:
                                                 t_rel_meas = (t_rel_meas / meas_norm) * d_eff
                                     meas_norm = float(np.linalg.norm(t_rel_meas))
                                     d_raw_norm = float(np.linalg.norm(dp_raw))
-                                    max_step = max(1.2 * d_raw_norm, 0.10 * dt_seg)
+                                    max_step = min(0.35, max(1.2 * d_raw_norm, 0.10 * dt_seg)) if q_seg > 0.0 else 0.15
                                     if meas_norm > max_step and meas_norm > 1e-4:
                                         t_rel_meas = t_rel_meas * (max_step / meas_norm)
                                     t_rel_meas[2] = float(np.clip(t_rel_meas[2], -0.20, 0.20))
@@ -950,18 +939,19 @@ class ServerSideVioEstimator:
                             frames_since_last_node = 0
 
                             p_c, uv = track_map.camera_points_for_loop(R_wc_now, p_wc_now, eskf.state.sl)
-                            if len(p_c) > 0:
-                                pts_2d = uv.reshape(-1, 2)
-                                # Compute real ORB descriptors or generate deterministic descriptors
-                                descriptors = None
-                                is_real_orb = False
-                                node_gray = fres.gray
-                                if node_gray is None:
-                                    img_src = event.data.get("image") if event.data.get("image") is not None else event.data.get("image_path")
-                                    node_gray = decode_gray(img_src)
-                                if cv2 is not None and isinstance(node_gray, np.ndarray) and node_gray.size > 0:
-                                    h_g, w_g = node_gray.shape[:2]
-                                    border = 16
+                            pts_2d = uv.reshape(-1, 2) if len(uv) > 0 else np.empty((0, 2), dtype=float)
+                            descriptors = None
+                            is_real_orb = False
+                            node_gray = fres.gray
+                            if node_gray is None:
+                                img_src = event.data.get("image") if event.data.get("image") is not None else event.data.get("image_path")
+                                node_gray = decode_gray(img_src)
+                            if cv2 is not None and isinstance(node_gray, np.ndarray) and node_gray.size > 0:
+                                h_g, w_g = node_gray.shape[:2]
+                                border = 16
+                                orb = orb_detector if orb_detector is not None else cv2.ORB_create()
+
+                                if len(p_c) >= 12:
                                     valid_m = (
                                         (pts_2d[:, 0] >= border)
                                         & (pts_2d[:, 0] < w_g - border)
@@ -972,7 +962,6 @@ class ServerSideVioEstimator:
                                         sub_pts_2d = pts_2d[valid_m]
                                         sub_p_c = p_c[valid_m]
                                         try:
-                                            orb = orb_detector if orb_detector is not None else cv2.ORB_create()
                                             cv_kps = [
                                                 cv2.KeyPoint(x=float(pt[0]), y=float(pt[1]), size=31)
                                                 for pt in sub_pts_2d
@@ -988,15 +977,46 @@ class ServerSideVioEstimator:
                                                 is_real_orb = True
                                         except Exception:
                                             descriptors = None
-                                del node_gray
 
+                                # Fallback when 3D DLT landmarks are lacking (zero parallax at start/end of scan)
                                 if not is_real_orb:
-                                    num_pts = len(pts_2d)
-                                    descriptors = np.zeros((num_pts, 32), dtype=np.uint8)
-                                    for idx_pt, pt in enumerate(pts_2d):
-                                        seed = int(abs(pt[0] * 1000 + pt[1] * 10 + node_id * 37) % 255)
-                                        descriptors[idx_pt, :] = np.uint8((np.arange(32) + seed) % 256)
+                                    try:
+                                        cv_kps, descs_out = orb.detectAndCompute(node_gray, None)
+                                        if descs_out is not None and len(descs_out) >= 12:
+                                            pts_2d = np.array([[k.pt[0], k.pt[1]] for k in cv_kps], dtype=float)
+                                            p_c = np.empty((0, 3), dtype=float)
+                                            descriptors = descs_out
+                                            is_real_orb = True
+                                    except Exception:
+                                        descriptors = None
+                            del node_gray
 
+                            # Associate SPAD LiDAR depth for keypoint landmarks if 3D points are lacking
+                            has_pts_3d = (p_c is not None and len(p_c) >= 15 and np.count_nonzero(p_c[:, 2] > 0.05) >= 15)
+                            if is_real_orb and not has_pts_3d and latest_spad_depth is not None and len(pts_2d) >= 12:
+                                depth_grid = np.asarray(latest_spad_depth, dtype=np.float64)
+                                if depth_grid.ndim == 2:
+                                    hg_s, wg_s = depth_grid.shape
+                                    gx = np.clip((pts_2d[:, 0] / max(w_img, 1.0) * wg_s).astype(int), 0, wg_s - 1)
+                                    gy = np.clip((pts_2d[:, 1] / max(h_img, 1.0) * hg_s).astype(int), 0, hg_s - 1)
+                                    depth_vals = depth_grid[gy, gx]
+                                    val_m = (depth_vals >= 0.20) & (depth_vals <= 4.0) & np.isfinite(depth_vals)
+                                    if np.count_nonzero(val_m) >= 12:
+                                        p_c = np.zeros((len(pts_2d), 3), dtype=np.float64)
+                                        zv = depth_vals[val_m]
+                                        uv_val = pts_2d[val_m]
+                                        p_c[val_m, 2] = zv
+                                        p_c[val_m, 0] = (uv_val[:, 0] - K[0, 2]) * zv / K[0, 0]
+                                        p_c[val_m, 1] = (uv_val[:, 1] - K[1, 2]) * zv / K[1, 1]
+
+                            if not is_real_orb and len(pts_2d) > 0:
+                                num_pts = len(pts_2d)
+                                descriptors = np.zeros((num_pts, 32), dtype=np.uint8)
+                                for idx_pt, pt in enumerate(pts_2d):
+                                    seed = int(abs(pt[0] * 1000 + pt[1] * 10 + node_id * 37) % 255)
+                                    descriptors[idx_pt, :] = np.uint8((np.arange(32) + seed) % 256)
+
+                            if descriptors is not None and len(descriptors) > 0:
                                 loop_detector.add_keyframe(node_id, descriptors, p_c, K, kps_2d=pts_2d)
 
                                 # Loop detection check ONLY when real ORB descriptors were extracted
@@ -1012,35 +1032,57 @@ class ServerSideVioEstimator:
                                             t_err = float(np.linalg.norm(t_loop - t_rel))
                                             cos_ang = float(np.clip((np.trace(R_rel.T @ R_loop) - 1.0) / 2.0, -1.0, 1.0))
                                             ang_deg = float(np.degrees(np.arccos(cos_ang)))
+
+                                            d_odo_loop = None
+                                            ang_deg_odo = None
+                                            is_unit_t = (abs(float(np.linalg.norm(t_loop)) - 1.0) < 1e-3)
+                                            if odo_times is not None and len(odo_times) > 1:
+                                                t_past = pgo_nodes_meta[past_node_id]["timestamp"]
+                                                t_query = pgo_nodes_meta[query_node_id]["timestamp"]
+                                                idx_p = np.clip(np.searchsorted(odo_times, t_past), 0, len(odo_times) - 1)
+                                                idx_q = np.clip(np.searchsorted(odo_times, t_query), 0, len(odo_times) - 1)
+                                                d_odo_loop = float(np.linalg.norm(odo_pos[idx_q] - odo_pos[idx_p]))
+
+                                                if odo_rots is not None and len(odo_rots) > max(idx_p, idx_q):
+                                                    R_rel_odo = odo_rots[idx_p].T @ odo_rots[idx_q]
+                                                    T_cv_gl = np.diag([1.0, -1.0, -1.0])
+                                                    R_loop_gl = T_cv_gl @ R_loop @ T_cv_gl
+                                                    cos_ang_odo = float(np.clip((np.trace(R_rel_odo.T @ R_loop_gl) - 1.0) / 2.0, -1.0, 1.0))
+                                                    ang_deg_odo = float(np.degrees(np.arccos(cos_ang_odo)))
+
+                                                # If t_loop was unit norm from 2D Essential matrix, scale by ARCore distance
+                                                if is_unit_t:
+                                                    t_loop = t_loop * d_odo_loop
+
                                             t_norm = float(np.linalg.norm(t_loop))
                                             loop_t_norm_max = 2.60 if is_small_room else max(3.5, (float(span_odo) * 1.2) if (span_odo is not None and np.isfinite(span_odo)) else 3.5)
-                                            logger.info("LOOP CANDIDATE: %d -> %d, inliers=%d, t_norm=%.3f, max=%.3f, t_err=%.3f, ang_deg=%.2f", past_node_id, query_node_id, inliers, t_norm, loop_t_norm_max, t_err, ang_deg)
+                                            eff_ang_deg = ang_deg_odo if ang_deg_odo is not None else ang_deg
+                                            logger.info("LOOP CANDIDATE: %d -> %d, inliers=%d, t_norm=%.3f, max=%.3f, t_err=%.3f, ang_deg=%.2f, eff_ang=%.2f", past_node_id, query_node_id, inliers, t_norm, loop_t_norm_max, t_err, ang_deg, eff_ang_deg)
                                             # Physical room bound: adaptively bounded by scan odometry scale
-                                            if t_norm <= loop_t_norm_max:
+                                            # Strict angular consistency: reject any match with eff_ang_deg > 35.0 deg to prevent false matches across opposite/orthogonal walls
+                                            if t_norm <= loop_t_norm_max and eff_ang_deg <= 35.0:
                                                 kf_diff = abs(query_node_id - past_node_id)
                                                 max_allowed_t_err = min(0.8, 0.4 + 0.015 * kf_diff)
 
-                                                if odo_times is not None and len(odo_times) > 1:
-                                                    t_past = pgo_nodes_meta[past_node_id]["timestamp"]
-                                                    t_query = pgo_nodes_meta[query_node_id]["timestamp"]
-                                                    idx_p = np.clip(np.searchsorted(odo_times, t_past), 0, len(odo_times) - 1)
-                                                    idx_q = np.clip(np.searchsorted(odo_times, t_query), 0, len(odo_times) - 1)
-                                                    d_odo_loop = float(np.linalg.norm(odo_pos[idx_q] - odo_pos[idx_p]))
+                                                if d_odo_loop is not None:
                                                     odo_diff = abs(d_odo_loop - t_norm)
-                                                    logger.info("LOOP ODO DEBUG: %d -> %d, inliers=%d, ang=%.2f, d_odo=%.3f, t_norm=%.3f, diff=%.3f", past_node_id, query_node_id, inliers, ang_deg, d_odo_loop, t_norm, odo_diff)
+                                                    logger.info("LOOP ODO DEBUG: %d -> %d, inliers=%d, ang=%.2f, d_odo=%.3f, t_norm=%.3f, diff=%.3f", past_node_id, query_node_id, inliers, eff_ang_deg, d_odo_loop, t_norm, odo_diff)
                                                     is_valid_loop = (
-                                                        (inliers >= 20 and ang_deg <= 25.0)
-                                                        or (inliers >= 20 and ang_deg <= 30.0 and d_odo_loop <= 0.45 and odo_diff <= 0.25)
-                                                        or (inliers >= 12 and ang_deg <= 30.0 and d_odo_loop <= 0.30 and odo_diff <= 0.15)
-                                                        or (inliers >= 12 and ang_deg <= 50.0 and d_odo_loop <= 0.25 and odo_diff <= 0.15)
+                                                        not is_unit_t
+                                                        and (
+                                                            (d_odo_loop <= 0.45 and inliers >= 15 and odo_diff <= 0.25)
+                                                            or (d_odo_loop <= 0.35 and inliers >= 12 and odo_diff <= 0.20)
+                                                            or (d_odo_loop <= 0.50 and inliers >= 20 and odo_diff <= 0.25)
+                                                        )
                                                     )
                                                 else:
-                                                    is_consistent = (t_err <= max_allowed_t_err and ang_deg <= 30.0)
-                                                    is_strong = (inliers >= 25 and ang_deg <= 25.0 and t_err <= 0.8)
-                                                    is_valid_loop = is_consistent or is_strong
+                                                    is_consistent = (t_err <= max_allowed_t_err)
+                                                    is_strong = (inliers >= 20 and t_norm <= 0.45)
+                                                    is_valid_loop = not is_unit_t and (is_consistent or is_strong)
 
                                                 if is_valid_loop:
-                                                    logger.info("LOOP EDGE ADDED: %d -> %d, inliers=%d, ang_deg=%.2f, t_norm=%.3f", past_node_id, query_node_id, inliers, ang_deg, t_norm)
+                                                    t_loop[2] = float(np.clip(t_loop[2], -0.20, 0.20))
+                                                    logger.info("LOOP EDGE ADDED: %d -> %d, inliers=%d, ang_deg=%.2f, t_norm=%.3f", past_node_id, query_node_id, inliers, eff_ang_deg, t_norm)
                                                     info_w = min(20.0, max(5.0, float(inliers) / 2.0))
                                                     info_t = min(50.0, max(10.0, float(inliers)))
                                                     Omega_loop = np.diag([info_w, info_w, info_w, info_t, info_t, info_t])
@@ -1049,9 +1091,11 @@ class ServerSideVioEstimator:
                         camera_snapshots.append({
                             "timestamp": ts,
                             "frame_id": frame_id,
+                            "image_path": event.data.get("image_path"),
                             "device_timestamp_ns": event.data.get("device_timestamp_ns", int(round(ts * 1e9))),
                             "T_wb": (eskf.state.R.copy(), eskf.state.p.copy()),
                             "state_idx": max(0, len(forward_states) - 1),
+                            "spad_depth": latest_spad_depth.copy() if latest_spad_depth is not None else None,
                         })
 
                         fres.gray = None
@@ -1090,15 +1134,12 @@ class ServerSideVioEstimator:
                     dt_seg = max(1e-3, t_curr - t_prev)
                     dp_raw = odo_pos[idx_c] - odo_pos[idx_p]
                     s_seg = float(np.linalg.norm(dp_raw) / max(dt_seg, 0.005))
-                    if s_seg > 2.5 or dt_seg < 0.005:
+                    if s_seg > 2.5 or dt_seg < 0.005 or float(np.linalg.norm(dp_raw)) > 0.50:
                         q_seg = 0.0
                     else:
                         q_seg = float(np.clip(1.0 - max(0.0, s_seg - 1.2), 0.0, 1.0))
 
-                    if len(all_spad_active_ids) >= 50:
-                        w_odo = 0.0
-                    else:
-                        w_odo = float(np.clip(0.80 - 0.20 * o_node, 0.35, 0.85)) * max(q_seg, 0.20)
+                    w_odo = float(np.clip(0.80 - 0.20 * o_node, 0.35, 0.85)) * q_seg
                     if w_odo > 0.0:
                         if R_vio_odo is not None:
                             dp_w_odo = R_vio_odo @ dp_raw
@@ -1113,7 +1154,7 @@ class ServerSideVioEstimator:
                                 t_rel_meas = (t_rel_meas / meas_norm) * d_eff
                     meas_norm = float(np.linalg.norm(t_rel_meas))
                     d_raw_norm = float(np.linalg.norm(dp_raw))
-                    max_step = max(1.2 * d_raw_norm, 0.10 * dt_seg)
+                    max_step = min(0.35, max(1.2 * d_raw_norm, 0.10 * dt_seg)) if q_seg > 0.0 else 0.15
                     if meas_norm > max_step and meas_norm > 1e-4:
                         t_rel_meas = t_rel_meas * (max_step / meas_norm)
                     t_rel_meas[2] = float(np.clip(t_rel_meas[2], -0.20, 0.20))
@@ -1135,6 +1176,248 @@ class ServerSideVioEstimator:
                     "frame_id": last_snap["frame_id"],
                     "snap_idx": last_snap_idx,
                 })
+
+                # Register last node in loop_detector for loop closure
+                if node_id not in loop_detector.db:
+                    try:
+                        last_img_src = last_snap.get("image") or last_snap.get("image_path")
+                        if last_img_src is None and rgb_images:
+                            last_img_src = rgb_images[-1]
+                        last_gray = decode_gray(last_img_src)
+                        if last_gray is not None and last_gray.size > 0:
+                            orb = orb_detector if orb_detector is not None else cv2.ORB_create()
+                            cv_kps, descs_out = orb.detectAndCompute(last_gray, None)
+                            if descs_out is not None and len(descs_out) >= 12:
+                                pts_2d_l = np.array([[k.pt[0], k.pt[1]] for k in cv_kps], dtype=float)
+                                p_c_last = np.empty((0, 3), dtype=float)
+                                if latest_spad_depth is not None:
+                                    depth_grid = np.asarray(latest_spad_depth, dtype=np.float64)
+                                    if depth_grid.ndim == 2:
+                                        hg_s, wg_s = depth_grid.shape
+                                        h_l, w_l = last_gray.shape[:2]
+                                        gx = np.clip((pts_2d_l[:, 0] / max(w_l, 1.0) * wg_s).astype(int), 0, wg_s - 1)
+                                        gy = np.clip((pts_2d_l[:, 1] / max(h_l, 1.0) * hg_s).astype(int), 0, hg_s - 1)
+                                        depth_vals = depth_grid[gy, gx]
+                                        val_m = (depth_vals >= 0.20) & (depth_vals <= 4.0) & np.isfinite(depth_vals)
+                                        if np.count_nonzero(val_m) >= 12:
+                                            p_c_last = np.zeros((len(pts_2d_l), 3), dtype=np.float64)
+                                            zv = depth_vals[val_m]
+                                            uv_val = pts_2d_l[val_m]
+                                            p_c_last[val_m, 2] = zv
+                                            p_c_last[val_m, 0] = (uv_val[:, 0] - K[0, 2]) * zv / K[0, 0]
+                                            p_c_last[val_m, 1] = (uv_val[:, 1] - K[1, 2]) * zv / K[1, 1]
+                                loop_detector.add_keyframe(node_id, descs_out, p_c_last, K, kps_2d=pts_2d_l)
+                    except Exception:
+                        pass
+
+        # Check start-to-end direct loop pairing if zero parallax at start/end prevented open-loop detection
+        if len(pgo_nodes_meta) >= 10:
+            t_start = pgo_nodes_meta[0]["timestamp"]
+            t_end = pgo_nodes_meta[-1]["timestamp"]
+            start_end_loop_count = 0
+            for (i, j, *_) in pgo.edges:
+                if abs(j - i) > 1:
+                    ti = pgo_nodes_meta[i]["timestamp"] if i < len(pgo_nodes_meta) else t_start
+                    tj = pgo_nodes_meta[j]["timestamp"] if j < len(pgo_nodes_meta) else t_end
+                    if (ti <= t_start + 15.0 and tj >= t_end - 10.0) or (tj <= t_start + 15.0 and ti >= t_end - 10.0):
+                        start_end_loop_count += 1
+
+            if start_end_loop_count < 2:
+                early_nodes = [m for m in pgo_nodes_meta if m["timestamp"] <= t_start + 20.0 or m["node_id"] <= 20]
+                late_nodes = [m for m in pgo_nodes_meta if m["timestamp"] >= t_end - 15.0 or m["node_id"] >= len(pgo_nodes_meta) - 15]
+                matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+                orb_se = orb_detector if orb_detector is not None else cv2.ORB_create(nfeatures=1000)
+                se_matches = []
+                node_features_cache: dict[int, tuple[Any, Any, Any]] = {}
+
+                def _get_node_features(meta_node):
+                    nid = meta_node["node_id"]
+                    if nid in node_features_cache:
+                        return node_features_cache[nid]
+
+                    desc = None
+                    kps2d = None
+                    kps3d = None
+
+                    s_idx = meta_node.get("snap_idx", 0)
+                    img_src = None
+                    if s_idx < len(camera_snapshots):
+                        snap = camera_snapshots[s_idx]
+                        img_src = snap.get("image_path") or snap.get("image")
+                    if img_src is None and rgb_images and s_idx < len(rgb_images):
+                        img_src = rgb_images[s_idx]
+
+                    if img_src is not None:
+                        gray = decode_gray(img_src)
+                        if gray is not None and gray.size > 0:
+                            cv_kps, desc_out = orb_se.detectAndCompute(gray, None)
+                            if desc_out is not None and len(desc_out) >= 15:
+                                kps2d = np.array([[k.pt[0], k.pt[1]] for k in cv_kps], dtype=float)
+                                desc = desc_out
+
+                    # Fallback to loop_detector.db if image extraction failed
+                    if desc is None and nid in loop_detector.db:
+                        desc = loop_detector.db[nid].get("descriptors")
+                        kps2d = loop_detector.db[nid].get("kps_2d")
+                        kps3d = loop_detector.db[nid].get("kps_3d")
+
+                    # Associate SPAD LiDAR depth
+                    if desc is not None and kps2d is not None:
+                        spad_src = None
+                        if camera_snapshots:
+                            for offset in [0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 8, -8]:
+                                o_idx = s_idx + offset
+                                if 0 <= o_idx < len(camera_snapshots) and camera_snapshots[o_idx].get("spad_depth") is not None:
+                                    cand_spad = np.asarray(camera_snapshots[o_idx]["spad_depth"], dtype=np.float64)
+                                    val_cnt = np.count_nonzero((cand_spad >= 0.20) & (cand_spad <= 4.0) & np.isfinite(cand_spad))
+                                    if val_cnt >= 10:
+                                        spad_src = cand_spad
+                                        break
+                        if spad_src is None and latest_spad_depth is not None:
+                            cand_spad = np.asarray(latest_spad_depth, dtype=np.float64)
+                            val_cnt = np.count_nonzero((cand_spad >= 0.20) & (cand_spad <= 4.0) & np.isfinite(cand_spad))
+                            if val_cnt >= 10:
+                                spad_src = cand_spad
+
+                        if spad_src is not None and spad_src.ndim == 2:
+                            hg_s, wg_s = spad_src.shape
+                            w_img_ref = float(w_img) if 'w_img' in locals() and w_img else 640.0
+                            h_img_ref = float(h_img) if 'h_img' in locals() and h_img else 360.0
+                            gx = np.clip((kps2d[:, 0] / max(w_img_ref, 1.0) * wg_s).astype(int), 0, wg_s - 1)
+                            gy = np.clip((kps2d[:, 1] / max(h_img_ref, 1.0) * hg_s).astype(int), 0, hg_s - 1)
+                            dvals = spad_src[gy, gx]
+                            val_m = (dvals >= 0.20) & (dvals <= 4.0) & np.isfinite(dvals)
+                            if np.count_nonzero(val_m) >= 15:
+                                kps3d = np.zeros((len(kps2d), 3), dtype=np.float64)
+                                zv = dvals[val_m]
+                                uv_val = kps2d[val_m]
+                                kps3d[val_m, 2] = zv
+                                kps3d[val_m, 0] = (uv_val[:, 0] - K[0, 2]) * zv / K[0, 0]
+                                kps3d[val_m, 1] = (uv_val[:, 1] - K[1, 2]) * zv / K[1, 1]
+
+                    if kps3d is None:
+                        kps3d = np.empty((0, 3), dtype=float)
+
+                    node_features_cache[nid] = (desc, kps2d, kps3d)
+                    return desc, kps2d, kps3d
+
+                early_step = max(1, len(early_nodes) // 15)
+                sub_early = list(early_nodes[::early_step])
+                sub_late = [m for m in late_nodes if m["timestamp"] >= t_end - 4.0 or m["node_id"] >= len(pgo_nodes_meta) - 8]
+                if not sub_late:
+                    sub_late = list(late_nodes[-8:])
+                if early_nodes and early_nodes[0] not in sub_early:
+                    sub_early.insert(0, early_nodes[0])
+                if late_nodes and late_nodes[-1] not in sub_late:
+                    sub_late.append(late_nodes[-1])
+
+                for e_m in sub_early:
+                    e_id = e_m["node_id"]
+                    e_desc, e_2d, e_3d = _get_node_features(e_m)
+                    if e_desc is None or len(e_desc) < 20:
+                        continue
+                    for l_m in sub_late:
+                        l_id = l_m["node_id"]
+                        ip = None
+                        iq = None
+                        if odo_times is not None and len(odo_times) > 1:
+                            te = e_m["timestamp"]
+                            tl = l_m["timestamp"]
+                            ip = np.clip(np.searchsorted(odo_times, te), 0, len(odo_times) - 1)
+                            iq = np.clip(np.searchsorted(odo_times, tl), 0, len(odo_times) - 1)
+                            d_odo_check = float(np.linalg.norm(odo_pos[iq] - odo_pos[ip]))
+                            if d_odo_check > 0.40:
+                                continue
+
+                        l_desc, l_2d, l_3d = _get_node_features(l_m)
+                        if l_desc is None or len(l_desc) < 20:
+                            continue
+                        try:
+                            knn = matcher.knnMatch(e_desc, l_desc, k=2)
+                            good = [m for m, n in knn if len((m, n)) == 2 and m.distance < 0.75 * n.distance]
+                            if len(good) < 20:
+                                continue
+
+                            # 1. Direct metric 3D-2D PnP RANSAC (e -> l or l -> e)
+                            if e_3d is not None and len(e_3d) > 0 and np.count_nonzero(e_3d[:, 2] > 0.05) >= 20:
+                                val_3d = [m for m in good if m.queryIdx < len(e_3d) and e_3d[m.queryIdx, 2] > 0.05 and m.trainIdx < len(l_2d)]
+                                if len(val_3d) >= 20:
+                                    obj_pts = np.array([e_3d[m.queryIdx] for m in val_3d], dtype=np.float64)
+                                    img_pts = np.array([l_2d[m.trainIdx] for m in val_3d], dtype=np.float64)
+                                    success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                                        obj_pts, img_pts, K.astype(np.float64), None, reprojectionError=3.5, iterationsCount=100
+                                    )
+                                    if success and inliers is not None and len(inliers) >= 40:
+                                        inl = len(inliers)
+                                        R_ji, _ = cv2.Rodrigues(rvec)
+                                        t_ji = tvec.reshape(3, 1)
+                                        R_loop_cand = R_ji.T
+                                        t_loop_cand = (-R_ji.T @ t_ji).reshape(3)
+
+                                        if odo_rots is not None and ip is not None and iq is not None and len(odo_rots) > max(ip, iq):
+                                            R_rel_odo = odo_rots[ip].T @ odo_rots[iq]
+                                            T_cv_gl = np.diag([1.0, -1.0, -1.0])
+                                            R_loop_gl = T_cv_gl @ R_loop_cand @ T_cv_gl
+                                            cos_a = float(np.clip((np.trace(R_rel_odo.T @ R_loop_gl) - 1.0) / 2.0, -1.0, 1.0))
+                                            ang_check = float(np.degrees(np.arccos(cos_a)))
+                                        else:
+                                            ang_check = float(np.degrees(np.linalg.norm(so3_log(R_loop_cand))))
+
+                                        t_norm_check = float(np.linalg.norm(t_loop_cand))
+                                        if ang_check <= 15.0 and t_norm_check <= 0.20:
+                                            se_matches.append((e_id, l_id, R_loop_cand, t_loop_cand, inl, True, ang_check, t_norm_check))
+
+                            elif l_3d is not None and len(l_3d) > 0 and np.count_nonzero(l_3d[:, 2] > 0.05) >= 20:
+                                val_3d_rev = [m for m in good if m.trainIdx < len(l_3d) and l_3d[m.trainIdx, 2] > 0.05 and m.queryIdx < len(e_2d)]
+                                if len(val_3d_rev) >= 20:
+                                    obj_pts = np.array([l_3d[m.trainIdx] for m in val_3d_rev], dtype=np.float64)
+                                    img_pts = np.array([e_2d[m.queryIdx] for m in val_3d_rev], dtype=np.float64)
+                                    success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                                        obj_pts, img_pts, K.astype(np.float64), None, reprojectionError=3.5, iterationsCount=100
+                                    )
+                                    if success and inliers is not None and len(inliers) >= 40:
+                                        inl = len(inliers)
+                                        R_el_rot, _ = cv2.Rodrigues(rvec)
+                                        t_el_vec = tvec.reshape(3, 1)
+                                        R_loop_cand = R_el_rot
+                                        t_loop_cand = t_el_vec.reshape(3)
+
+                                        if odo_rots is not None and ip is not None and iq is not None and len(odo_rots) > max(ip, iq):
+                                            R_rel_odo = odo_rots[ip].T @ odo_rots[iq]
+                                            T_cv_gl = np.diag([1.0, -1.0, -1.0])
+                                            R_loop_gl = T_cv_gl @ R_loop_cand @ T_cv_gl
+                                            cos_a = float(np.clip((np.trace(R_rel_odo.T @ R_loop_gl) - 1.0) / 2.0, -1.0, 1.0))
+                                            ang_check = float(np.degrees(np.arccos(cos_a)))
+                                        else:
+                                            ang_check = float(np.degrees(np.linalg.norm(so3_log(R_loop_cand))))
+
+                                        t_norm_check = float(np.linalg.norm(t_loop_cand))
+                                        if ang_check <= 15.0 and t_norm_check <= 0.20:
+                                            se_matches.append((e_id, l_id, R_loop_cand, t_loop_cand, inl, True, ang_check, t_norm_check))
+                        except Exception:
+                            pass
+
+                if se_matches:
+                    se_matches.sort(key=lambda m: (-m[4], m[7]))
+                    existing_edges = set((e[0], e[1]) for e in pgo.edges) | set((e[1], e[0]) for e in pgo.edges)
+                    added_e = set()
+                    added_l = set()
+                    loop_edges_added = 0
+                    for (e_id, l_id, R_loop, t_loop_out, inl, is_metric_pnp, ang_check, t_norm_check) in se_matches:
+                        if (e_id, l_id) in existing_edges or e_id in added_e or l_id in added_l:
+                            continue
+                        t_loop = t_loop_out.copy()
+                        t_loop[2] = float(np.clip(t_loop[2], -0.20, 0.20))
+                        info_w = min(40.0, max(20.0, float(inl) * 0.4))
+                        info_t = min(80.0, max(40.0, float(inl) * 0.8))
+                        Omega_loop = np.diag([info_w, info_w, info_w, info_t, info_t, info_t])
+                        logger.info("DIRECT START-END LOOP EDGE ADDED: %d -> %d, inliers=%d, ang=%.2f, metric_pnp=%s, t_norm=%.3f", e_id, l_id, inl, ang_check, is_metric_pnp, float(np.linalg.norm(t_loop)))
+                        pgo.add_loop_edge(e_id, l_id, R_loop, t_loop, information=Omega_loop)
+                        added_e.add(e_id)
+                        added_l.add(l_id)
+                        loop_edges_added += 1
+                        if loop_edges_added >= 2:
+                            break
 
         del sorted_events
         gc.collect()
@@ -1217,7 +1500,7 @@ class ServerSideVioEstimator:
             has_loop_edges = any(abs(j - i) > 1 for (i, j, *_) in pgo.edges)
             logger.info("PGO: has_loop_edges=%s, total_edges=%d, total_nodes=%d", has_loop_edges, len(pgo.edges), len(pgo.nodes))
             if has_loop_edges and len(pgo.nodes) > 1:
-                pgo.optimize(max_iterations=25)
+                pgo.optimize(max_iterations=30)
 
             # Apply PGO SE(3) spline interpolation onto all camera rows
             if pgo_nodes_meta:
@@ -1665,9 +1948,9 @@ def _aabb_span_decoupled(xyz: np.ndarray) -> tuple[float, float]:
 
 
 def _odometry_aabb_span(session_dir: str) -> tuple[float | None, int]:
-    path = os.path.join(session_dir, "processed_odometry.csv")
+    path = os.path.join(session_dir, "odometry.csv")
     if not os.path.isfile(path):
-        path = os.path.join(session_dir, "odometry.csv")
+        path = os.path.join(session_dir, "processed_odometry.csv")
     if not os.path.isfile(path):
         return None, 0
     try:
@@ -1688,9 +1971,9 @@ def _odometry_aabb_span(session_dir: str) -> tuple[float | None, int]:
 
 
 def _odometry_aabb_span_decoupled(session_dir: str) -> tuple[float | None, float | None, int]:
-    path = os.path.join(session_dir, "processed_odometry.csv")
+    path = os.path.join(session_dir, "odometry.csv")
     if not os.path.isfile(path):
-        path = os.path.join(session_dir, "odometry.csv")
+        path = os.path.join(session_dir, "processed_odometry.csv")
     if not os.path.isfile(path):
         return None, None, 0
     try:
@@ -1948,11 +2231,20 @@ def publish_session_vio(session_dir: str) -> bool:
                 logger.warning("load_session_extrinsics fallback failed: %s", e)
 
         # Load odometry_df for scale anchoring & loop gating if available
-        odo_path = os.path.join(session_dir, "processed_odometry.csv")
-        if not os.path.isfile(odo_path):
-            odo_path = os.path.join(session_dir, "odometry.csv")
+        odo_raw_path = os.path.join(session_dir, "odometry.csv")
+        odo_proc_path = os.path.join(session_dir, "processed_odometry.csv")
+        odo_path = odo_proc_path if os.path.isfile(odo_proc_path) else odo_raw_path
+        if os.path.isfile(odo_raw_path):
+            try:
+                raw_df = pd.read_csv(odo_raw_path)
+                p0 = raw_df[["x", "y", "z"]].iloc[0].to_numpy(dtype=float)
+                pend = raw_df[["x", "y", "z"]].iloc[-1].to_numpy(dtype=float)
+                raw_drift = float(np.linalg.norm(pend - p0))
+                if raw_drift < 0.25:
+                    odo_path = odo_raw_path
+            except Exception:
+                pass
         odometry_df = pd.read_csv(odo_path) if os.path.isfile(odo_path) else None
-
         span_odo, _n_odo = _odometry_aabb_span(session_dir)
 
         remaining_budget = max(0.0, PUBLISH_WALL_S - (time.monotonic() - t_start))

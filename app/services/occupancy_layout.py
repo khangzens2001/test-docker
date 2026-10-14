@@ -79,12 +79,18 @@ def slice_wall_band(points: np.ndarray, height_m: float) -> np.ndarray:
         span_y = float(b[:, 1].max() - b[:, 1].min())
         return max(span_x, span_y) >= 1.0 and min(span_x, span_y) >= 0.5
 
-    for z_lo in (SLICE_Z_MIN_M, 0.3, 0.15):
+    valid_bands = []
+    for z_lo in (0.15, 0.3, SLICE_Z_MIN_M):
         band = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
         if _has_valid_span(band):
-            return band
+            span_x = float(band[:, 0].max() - band[:, 0].min())
+            span_y = float(band[:, 1].max() - band[:, 1].min())
+            valid_bands.append((span_x * span_y, len(band), band))
+    if valid_bands:
+        valid_bands.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return valid_bands[0][2]
 
-    for z_lo in (0.3, 0.15, SLICE_Z_MIN_M):
+    for z_lo in (0.15, 0.3, SLICE_Z_MIN_M):
         band = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
         if len(band) >= SLICE_MIN_POINTS:
             return band
@@ -445,10 +451,25 @@ def rotate_points_2d(
     return out
 
 
+def _lexsort_xy(pts_2d: np.ndarray) -> np.ndarray:
+    """Return canonical lexicographical sort indices by (x, y), using fast single-key argsort when x is unique."""
+    x = pts_2d[:, 0]
+    if len(x) >= 1024:
+        s_sub = np.sort(x[:: max(1, len(x) // 256)])
+        if np.any(s_sub[:-1] == s_sub[1:]):
+            return np.lexsort((pts_2d[:, 1], x))
+    order = np.argsort(x)
+    sx = x[order]
+    if np.any(sx[:-1] == sx[1:]):
+        return np.lexsort((pts_2d[:, 1], x))
+    return order
+
+
 def estimate_manhattan_angle_bbox_sharpness(
     p2d: np.ndarray,
     bin_size_m: float = 0.04,
     max_points: int = 7000,
+    _pre_sorted_order: np.ndarray | None = None,
 ) -> dict:
     """Estimate optimal Manhattan alignment angle maximizing BBox compactness and projection sharpness.
 
@@ -554,11 +575,17 @@ def estimate_manhattan_angle_bbox_sharpness(
 
     points = pts[:, :2]
 
-    # Subsampling optimization: if N > max_points, stride uniformly
+    # Subsampling optimization: if N > max_points, sample deterministically after canonical sort
     n_pts = len(points)
     if n_pts > max_points:
-        stride = max(1, int(math.ceil(n_pts / float(max_points))))
-        points = points[::stride]
+        order_sub = (
+            _pre_sorted_order
+            if (_pre_sorted_order is not None and len(_pre_sorted_order) == n_pts)
+            else _lexsort_xy(points)
+        )
+        rng_sub = np.random.default_rng(42)
+        sub_idx = np.sort(rng_sub.choice(n_pts, size=int(max_points), replace=False))
+        points = points[order_sub[sub_idx]]
         n_pts = len(points)
 
     # Degenerate points guard (all points concentrated within 1mm)
@@ -586,43 +613,50 @@ def estimate_manhattan_angle_bbox_sharpness(
 
     center = np.mean(points, axis=0)
     pts_c = points - center  # (N, 2)
-    x0 = pts_c[:, 0:1]
-    y0 = pts_c[:, 1:2]
-    inv_n2 = 1.0 / (float(n_pts) * float(n_pts))
+    work_dtype = np.float32 if max(float(ptp[0]), float(ptp[1])) < 1e4 else np.float64
+    x0 = np.ascontiguousarray(pts_c[:, 0], dtype=work_dtype)[None, :]
+    y0 = np.ascontiguousarray(pts_c[:, 1], dtype=work_dtype)[None, :]
     bin_size = max(float(bin_size_m), 1e-4)
-    inv_bin = 1.0 / bin_size
-    k1 = int(round(0.01 * (n_pts - 1)))
-    k99 = int(round(0.99 * (n_pts - 1)))
+    inv_bin = work_dtype(1.0 / bin_size)
 
-    def _eval_angles_batch(angles_deg: np.ndarray):
-        rads = np.radians(angles_deg)
-        cos_a = np.cos(rads)
-        sin_a = np.sin(rads)
+    def _eval_angles_batch(angles_deg: np.ndarray, xa: np.ndarray, ya: np.ndarray):
+        n_p = xa.shape[1]
+        inv_n2 = 1.0 / (float(n_p) * float(n_p))
+        k1 = int(round(0.01 * (n_p - 1)))
+        k99 = int(round(0.99 * (n_p - 1)))
+        rads = np.radians(angles_deg).astype(work_dtype)
+        cos_a = np.cos(rads)[:, None]
+        sin_a = np.sin(rads)[:, None]
         k_angles = len(angles_deg)
 
-        # Batch rotation using broadcasting: (N, 1) * (K,) -> (N, K)
-        xs_batch = x0 * cos_a - y0 * sin_a
-        ys_batch = x0 * sin_a + y0 * cos_a
+        # Batch rotation using contiguous (K, N) rows: (K, 1) * (1, N) -> (K, N)
+        xs_batch = cos_a * xa
+        xs_batch -= sin_a * ya
+        ys_batch = sin_a * xa
+        ys_batch += cos_a * ya
 
-        # Robust BBox Area using 1% and 99% percentiles via np.partition
-        part_x = np.partition(xs_batch, (k1, k99), axis=0)
-        lo_x, hi_x = part_x[k1], part_x[k99]
-        part_y = np.partition(ys_batch, (k1, k99), axis=0)
-        lo_y, hi_y = part_y[k1], part_y[k99]
+        # Projection Sharpness via bin_size histogram on contiguous rows
+        min_xs = xs_batch.min(axis=1, keepdims=True)
+        min_ys = ys_batch.min(axis=1, keepdims=True)
+        idx_x_all = ((xs_batch - min_xs) * inv_bin).astype(np.int32)
+        idx_y_all = ((ys_batch - min_ys) * inv_bin).astype(np.int32)
+
+        # In-place 2-key partition along contiguous axis=1 for 1%/99% percentiles
+        xs_batch.partition((k1, k99), axis=1)
+        ys_batch.partition((k1, k99), axis=1)
+        lo_x = xs_batch[:, k1].astype(float)
+        hi_x = xs_batch[:, k99].astype(float)
+        lo_y = ys_batch[:, k1].astype(float)
+        hi_y = ys_batch[:, k99].astype(float)
         spans_x = np.maximum(hi_x - lo_x, 1e-6)
         spans_y = np.maximum(hi_y - lo_y, 1e-6)
         areas = spans_x * spans_y
 
-        # Projection Sharpness via bin_size histogram
-        min_xs = np.min(xs_batch, axis=0)
-        min_ys = np.min(ys_batch, axis=0)
-        idx_x_all = np.maximum(0, ((xs_batch - min_xs) * inv_bin).astype(np.int32))
-        idx_y_all = np.maximum(0, ((ys_batch - min_ys) * inv_bin).astype(np.int32))
         scores = np.empty(k_angles, dtype=float)
         sharpnesses = np.empty(k_angles, dtype=float)
         for i in range(k_angles):
-            cx = np.bincount(idx_x_all[:, i])
-            cy = np.bincount(idx_y_all[:, i])
+            cx = np.bincount(idx_x_all[i])
+            cy = np.bincount(idx_y_all[i])
             sx = float(np.dot(cx, cx)) * inv_n2
             sy = float(np.dot(cy, cy)) * inv_n2
             sharp = sx + sy
@@ -633,21 +667,31 @@ def estimate_manhattan_angle_bbox_sharpness(
 
     # Stage 1: Coarse search [-45°, +45°] with 1.0° step (91 angles)
     coarse_angles = np.arange(-45.0, 45.0001, 1.0)
-    coarse_scores, coarse_areas, coarse_sharp, coarse_sx, coarse_sy = _eval_angles_batch(coarse_angles)
+    if n_pts > 4000:
+        x0_c = np.ascontiguousarray(x0[:, ::2])
+        y0_c = np.ascontiguousarray(y0[:, ::2])
+    else:
+        x0_c, y0_c = x0, y0
+    coarse_scores, _, _, _, _ = _eval_angles_batch(coarse_angles, x0_c, y0_c)
     best_coarse_idx = int(np.argmax(coarse_scores))
     theta_coarse = float(coarse_angles[best_coarse_idx])
 
-    # Extract angle 0.0° baseline from coarse search (coarse_angles contains 0.0° at index 45)
-    zero_idx = int(np.argmin(np.abs(coarse_angles)))
-    base_score = float(coarse_scores[zero_idx])
-    base_area = float(coarse_areas[zero_idx])
-    base_sharpness = float(coarse_sharp[zero_idx])
-    span_x_0 = float(coarse_sx[zero_idx])
-    span_y_0 = float(coarse_sy[zero_idx])
-
-    # Stage 2: Fine search [theta_coarse - 1.5°, theta_coarse + 1.5°] with 0.1° step (31 angles)
+    # Stage 2: Fine search [theta_coarse - 1.5°, theta_coarse + 1.5°] with 0.1° step (31 angles) + 0.0° baseline
     fine_angles = np.arange(theta_coarse - 1.5, theta_coarse + 1.5001, 0.1)
-    fine_scores, fine_areas, fine_sharp, fine_sx, fine_sy = _eval_angles_batch(fine_angles)
+    fine_with_zero = np.append(fine_angles, 0.0)
+    f_scores, f_areas, f_sharp, f_sx, f_sy = _eval_angles_batch(fine_with_zero, x0, y0)
+
+    base_score = float(f_scores[-1])
+    base_area = float(f_areas[-1])
+    base_sharpness = float(f_sharp[-1])
+    span_x_0 = float(f_sx[-1])
+    span_y_0 = float(f_sy[-1])
+
+    fine_scores = f_scores[:-1]
+    fine_areas = f_areas[:-1]
+    fine_sharp = f_sharp[:-1]
+    fine_sx = f_sx[:-1]
+    fine_sy = f_sy[:-1]
     best_fine_idx = int(np.argmax(fine_scores))
     best_angle = float(fine_angles[best_fine_idx])
 
@@ -670,6 +714,17 @@ def estimate_manhattan_angle_bbox_sharpness(
         final_sharp = float(fine_sharp[best_fine_idx])
         final_span_x = float(fine_sx[best_fine_idx])
         final_span_y = float(fine_sy[best_fine_idx])
+
+        # Sharpness Gate: if large rotation (|best_angle| >= 10.0°) degrades projection sharpness
+        # compared to 0.0° unrotated baseline, the score is dominated by a diagonal bounding box
+        # shrinkage artifact rather than true wall alignment. Reject and revert to 0.0°.
+        if abs(best_angle) >= 10.0 and final_sharp < base_sharpness:
+            best_angle = 0.0
+            final_score = base_score
+            final_area = base_area
+            final_sharp = base_sharpness
+            final_span_x = span_x_0
+            final_span_y = span_y_0
 
     improvement = (base_area - final_area) / base_area if base_area > 0 else 0.0
 
@@ -718,31 +773,38 @@ def apply_hough_yaw(points_xyz: np.ndarray) -> tuple[np.ndarray, float, int]:
         return points_xyz, 0.0, 0
 
     p2d = pts[:, :2]
+    order_p2d = _lexsort_xy(p2d) if len(p2d) > 7000 else None
 
     # --- Stage 1: Global Objective Alignment ---
-    stage1 = estimate_manhattan_angle_bbox_sharpness(p2d, max_points=7000)
+    stage1 = estimate_manhattan_angle_bbox_sharpness(
+        p2d, max_points=7000, _pre_sorted_order=order_p2d
+    )
     theta_global = float(stage1.get("best_angle_deg", stage1.get("angle_deg", 0.0)))
 
-    # Rotate 2D coordinates to intermediate Stage 1 alignment around origin (0, 0)
+    # Subsample canonically BEFORE Stage 1 rotation so we only rotate <=10k points for Stage 2 grid
+    if len(p2d) <= 10000:
+        p2d_sub = p2d
+    else:
+        p2d_sub = p2d[order_p2d[:: max(1, len(p2d) // 10000)]]
+
     if abs(theta_global) >= 1e-6:
         th1 = np.radians(theta_global)
         c1, s1 = np.cos(th1), np.sin(th1)
         R1 = np.array([[c1, -s1], [s1, c1]], dtype=float)
-        p2d_rot = p2d @ R1.T
-        out_stage1 = pts.copy()
-        out_stage1[:, :2] = p2d_rot
+        p2d_grid = p2d_sub @ R1.T
     else:
-        p2d_rot = p2d
-        out_stage1 = pts
+        p2d_grid = p2d_sub
 
     # --- Stage 2: Residual Hough Refinement ---
     delta_theta = 0.0
     line_count = 0
 
-    if not np.all(np.isfinite(p2d_rot)):
-        return out_stage1, float(theta_global), 0
-
-    p2d_grid = p2d_rot if len(p2d_rot) <= 10000 else p2d_rot[::max(1, len(p2d_rot) // 10000)]
+    if not np.all(np.isfinite(p2d_grid)):
+        if abs(theta_global) >= 1e-6:
+            out_stage1 = pts.copy()
+            out_stage1[:, :2] = p2d @ R1.T
+            return out_stage1, float(theta_global), 0
+        return pts, float(theta_global), 0
     x_min, y_min = p2d_grid.min(axis=0)
     x_max, y_max = p2d_grid.max(axis=0)
     resolution = OCCUPANCY_RESOLUTION_M
@@ -750,13 +812,21 @@ def apply_hough_yaw(points_xyz: np.ndarray) -> tuple[np.ndarray, float, int]:
     span_y = (y_max - y_min) / resolution
 
     if not (np.isfinite(span_x) and np.isfinite(span_y)):
-        return out_stage1, float(theta_global), 0
+        if abs(theta_global) >= 1e-6:
+            out_stage1 = pts.copy()
+            out_stage1[:, :2] = p2d @ R1.T
+            return out_stage1, float(theta_global), 0
+        return pts, float(theta_global), 0
 
     width = int(np.ceil(span_x)) + 2
     height = int(np.ceil(span_y)) + 2
 
     if not (0 < width <= 10000 and 0 < height <= 10000):
-        return out_stage1, float(theta_global), 0
+        if abs(theta_global) >= 1e-6:
+            out_stage1 = pts.copy()
+            out_stage1[:, :2] = p2d @ R1.T
+            return out_stage1, float(theta_global), 0
+        return pts, float(theta_global), 0
 
     if 32 <= width <= OCCUPANCY_MAX_PX and 32 <= height <= OCCUPANCY_MAX_PX:
         grid = np.zeros((height, width), dtype=np.uint8)
@@ -817,10 +887,10 @@ def apply_hough_yaw(points_xyz: np.ndarray) -> tuple[np.ndarray, float, int]:
     if abs(theta_total) < 1e-6:
         return pts, 0.0, int(line_count)
 
+    out = pts.copy()
     theta_rad = np.radians(theta_total)
     c, s = np.cos(theta_rad), np.sin(theta_rad)
     R_total = np.array([[c, -s], [s, c]], dtype=float)
-    out = pts.copy()
     out[:, :2] = p2d @ R_total.T
     return out, float(theta_total), int(line_count)
 
@@ -875,6 +945,12 @@ def choke_doorway_tails(
         return pts, empty_info
     pre = [float((xs.max() - xs.min()) * resolution), float((ys.max() - ys.min()) * resolution)]
     bridge_px = _odd_px(DOORWAY_BRIDGE_M, resolution, 11)
+    if max(pre) >= 2.5:
+        test_k = cv2.getStructuringElement(cv2.MORPH_RECT, (bridge_px, bridge_px))
+        test_closed = cv2.morphologyEx(np.pad(support, bridge_px + 2, mode="constant"), cv2.MORPH_CLOSE, test_k)
+        cnts, _ = cv2.findContours(test_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts or (max([cv2.contourArea(c) for c in cnts]) * (resolution ** 2) < 1.0):
+            bridge_px = _odd_px(1.10, resolution, 11)
     choke_m = min(DOORWAY_CHOKE_M, max(0.40, min(pre) * 0.70))
     kernel_px = max(11, _odd_px(choke_m, resolution, 11))
     info = {
@@ -1039,6 +1115,12 @@ def choke_doorway_tails(
         if cavity_area_m2 < SMALL_ROOM_AREA_M2 and discarded_cavity_ratio > max_discard:
             info["doorway_choke_applied"] = False
             info["choke_guard_reason"] = "small_room_discard_cap"
+            pts_clip, info_clip = _clip_doorway_profile_tails(
+                pts, support, x_min, y_min, resolution, width, height, dict(info), trajectory=trajectory
+            )
+            if info_clip.get("doorway_choke_applied"):
+                info_clip["choke_guard_reason"] = None
+                return pts_clip, info_clip
             return pts, info
         mask_d = cv2.dilate(
             mask_cav, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px, dilate_px))
@@ -1056,6 +1138,12 @@ def choke_doorway_tails(
             if is_small_room and (min(post) < 0.80 or (min(pre) > 1.10 and post[0] * post[1] < 1.60)):
                 info["doorway_choke_applied"] = False
                 info["choke_guard_reason"] = "small_room_post_bbox_too_small"
+                pts_clip, info_clip = _clip_doorway_profile_tails(
+                    pts, support, x_min, y_min, resolution, width, height, dict(info), trajectory=trajectory
+                )
+                if info_clip.get("doorway_choke_applied"):
+                    info_clip["choke_guard_reason"] = None
+                    return pts_clip, info_clip
                 return pts, info
             reduction = max(pre[0] - post[0], pre[1] - post[1])
             if reduction >= MIN_CHOKE_BBOX_REDUCTION_M:
@@ -2202,7 +2290,18 @@ def classify_occupancy_necks(
     cav_cells = int(np.count_nonzero(cavity)) if cavity is not None else 0
     if cavity is None or cav_cells * resolution * resolution < 0.20 * max(bbox_area, 1.0):
         occupied, x_min, y_min, resolution, width, height = _raster_u8(pts[:, :2])
-        bridge_px = _odd_px(DOORWAY_BRIDGE_M, resolution, 11)
+        bridge_m = DOORWAY_BRIDGE_M
+        if max(bbox_w, bbox_h) >= 2.5:
+            test_px = _odd_px(bridge_m, resolution, 11)
+            test_closed = cv2.morphologyEx(
+                occupied,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (test_px, test_px)),
+            )
+            cnts, _ = cv2.findContours(test_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts or (max([cv2.contourArea(c) for c in cnts]) * (resolution ** 2) < 1.0):
+                bridge_m = 1.10
+        bridge_px = _odd_px(bridge_m, resolution, 11)
         closed = cv2.morphologyEx(
             occupied,
             cv2.MORPH_CLOSE,

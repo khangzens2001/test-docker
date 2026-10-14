@@ -61,7 +61,7 @@ class LoopDetector:
 
         self.db[kf_id] = {
             "descriptors": descriptors.copy(),
-            "kps_3d": kps_3d.copy(),
+            "kps_3d": kps_3d.copy() if kps_3d is not None and len(kps_3d) > 0 else np.empty((0, 3), dtype=np.float64),
             "K": K.copy(),
             "kps_2d": kps_2d.copy() if kps_2d is not None else None,
         }
@@ -110,7 +110,7 @@ class LoopDetector:
 
         min_votes = max(8, int(self.min_inliers * 0.6))
         candidate_ids = [
-            kf_id for kf_id, votes in sorted(word_votes.items(), key=lambda item: item[1], reverse=True)[:2]
+            kf_id for kf_id, votes in sorted(word_votes.items(), key=lambda item: item[1], reverse=True)[:5]
             if votes >= min_votes
         ]
 
@@ -128,6 +128,7 @@ class LoopDetector:
             past_kf = self.db[past_kf_id]
             past_desc = past_kf["descriptors"]
             past_3d = past_kf["kps_3d"]
+            past_2d = past_kf.get("kps_2d")
 
             if len(past_desc) < self.min_inliers:
                 continue
@@ -153,53 +154,72 @@ class LoopDetector:
             if len(good_matches) < self.min_inliers:
                 continue
 
-            # Construct 3D-2D correspondences for PnP RANSAC
-            obj_pts = np.array([past_3d[m.queryIdx] for m in good_matches], dtype=np.float64)
-            img_pts = np.array([query_kps_2d[m.trainIdx] for m in good_matches], dtype=np.float64)
+            used_pnp = False
+            # 1. 3D-2D PnP RANSAC geometric verification when 3D landmarks are available
+            if len(past_3d) >= self.min_inliers:
+                valid_3d = [
+                    m for m in good_matches
+                    if m.queryIdx < len(past_3d) and past_3d[m.queryIdx, 2] > 0.05 and m.trainIdx < len(query_kps_2d)
+                ]
+                if len(valid_3d) >= self.min_inliers:
+                    obj_pts = np.array([past_3d[m.queryIdx] for m in valid_3d], dtype=np.float64)
+                    img_pts = np.array([query_kps_2d[m.trainIdx] for m in valid_3d], dtype=np.float64)
 
-            # PnP RANSAC geometric verification
-            success, rvec, tvec, inliers = cv2.solvePnPRansac(
-                objectPoints=obj_pts,
-                imagePoints=img_pts,
-                cameraMatrix=K.astype(np.float64),
-                distCoeffs=None,
-                flags=cv2.SOLVEPNP_ITERATIVE,
-                reprojectionError=4.0,
-                confidence=0.99,
-                iterationsCount=50,
-            )
+                    success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                        objectPoints=obj_pts,
+                        imagePoints=img_pts,
+                        cameraMatrix=K.astype(np.float64),
+                        distCoeffs=None,
+                        flags=cv2.SOLVEPNP_ITERATIVE,
+                        reprojectionError=4.0,
+                        confidence=0.99,
+                        iterationsCount=50,
+                    )
 
-            if success and inliers is not None and len(inliers) >= self.min_inliers:
-                num_inliers = len(inliers)
-                if not np.all(np.isfinite(rvec)) or not np.all(np.isfinite(tvec)):
-                    continue
+                    if success and inliers is not None and len(inliers) >= self.min_inliers:
+                        num_inliers = len(inliers)
+                        if np.all(np.isfinite(rvec)) and np.all(np.isfinite(tvec)):
+                            if (len(inliers) / max(len(valid_3d), 1)) >= 0.25:
+                                R_ji, _ = cv2.Rodrigues(rvec)
+                                t_ji = tvec.reshape(3, 1)
+                                R_ij = R_ji.T
+                                t_ij = (-R_ji.T @ t_ji).reshape(3)
 
-                # Inlier ratio sanity check (must have at least 25% geometric inliers)
-                if len(inliers) / max(len(good_matches), 1) < 0.25:
-                    continue
+                                t_norm = float(np.linalg.norm(t_ij))
+                                rot_norm = float(np.linalg.norm(rvec))
+                                if np.isfinite(t_norm) and t_norm <= 5.0 and np.isfinite(rot_norm) and rot_norm <= np.pi + 0.1:
+                                    used_pnp = True
+                                    if num_inliers > max_inliers:
+                                        max_inliers = num_inliers
+                                        best_result = (past_kf_id, query_kf_id, R_ij, t_ij, num_inliers)
+                                        if num_inliers >= 20:
+                                            break
 
-                # Convert rvec to rotation matrix R_ji (from past frame i to query frame j)
-                R_ji, _ = cv2.Rodrigues(rvec)
-                t_ji = tvec.reshape(3, 1)
-
-                # Compute relative transformation T_ij = (R_ij, t_ij) from frame i to frame j
-                # T_ij = T_ji^-1 -> R_ij = R_ji^T, t_ij = -R_ji^T * t_ji
-                R_ij = R_ji.T
-                t_ij = (-R_ji.T @ t_ji).reshape(3)
-
-                t_norm = float(np.linalg.norm(t_ij))
-                if not np.isfinite(t_norm) or t_norm > 5.0:
-                    continue
-
-                rot_norm = float(np.linalg.norm(rvec))
-                if not np.isfinite(rot_norm) or rot_norm > np.pi + 0.1:
-                    continue
-
-                if num_inliers > max_inliers:
-                    max_inliers = num_inliers
-                    best_result = (past_kf_id, query_kf_id, R_ij, t_ij, num_inliers)
-                    if num_inliers >= 20:
-                        break
+            # 2. 2D-2D Essential Matrix verification when 3D points are lacking (zero parallax at start/end)
+            if not used_pnp and past_2d is not None and len(past_2d) >= self.min_inliers and query_kps_2d is not None and len(query_kps_2d) >= self.min_inliers:
+                valid_2d = [m for m in good_matches if m.queryIdx < len(past_2d) and m.trainIdx < len(query_kps_2d)]
+                if len(valid_2d) >= self.min_inliers:
+                    pts1 = np.array([past_2d[m.queryIdx] for m in valid_2d], dtype=np.float64)
+                    pts2 = np.array([query_kps_2d[m.trainIdx] for m in valid_2d], dtype=np.float64)
+                    E, mask = cv2.findEssentialMat(
+                        pts1, pts2, K.astype(np.float64), method=cv2.RANSAC, prob=0.999, threshold=2.0
+                    )
+                    if mask is not None and np.sum(mask) >= self.min_inliers:
+                        retval, R_loop_rel, t_loop_rel, pose_mask = cv2.recoverPose(
+                            E, pts1, pts2, K.astype(np.float64), mask=mask
+                        )
+                        num_inliers = int(np.sum(pose_mask > 0)) if pose_mask is not None else int(np.sum(mask))
+                        if num_inliers >= self.min_inliers and (num_inliers / max(len(valid_2d), 1)) >= 0.25:
+                            R_ij = R_loop_rel.T
+                            t_unit = (-R_loop_rel.T @ t_loop_rel).reshape(3)
+                            t_unit_norm = float(np.linalg.norm(t_unit))
+                            if t_unit_norm > 1e-6:
+                                t_unit = t_unit / t_unit_norm
+                            if num_inliers > max_inliers:
+                                max_inliers = num_inliers
+                                best_result = (past_kf_id, query_kf_id, R_ij, t_unit, num_inliers)
+                                if num_inliers >= 20:
+                                    break
 
         return best_result
 

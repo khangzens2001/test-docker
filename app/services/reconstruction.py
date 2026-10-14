@@ -289,7 +289,7 @@ class ReconstructionService:
                     vggt_prior, layout, gravity, reference_points=ref_pts
                 )
                 if len(pcd_room.points) > 0:
-                    # 1. Export dense point clouds
+                    # 1. Export dense point clouds (VGGT dense cloud only, keep TSDF reconstructed.ply intact)
                     write_visual_ply(pcd_room, session_dir, "reconstructed_vggt_dense.ply")
 
                     visual, dollhouse = build_visual_clouds(
@@ -298,24 +298,23 @@ class ReconstructionService:
                     write_visual_ply(visual, session_dir, "reconstructed_visual.ply")
                     write_visual_ply(dollhouse, session_dir, "reconstructed_dollhouse.ply")
 
-                    # 2. Build Poisson surface reconstruction mesh
-                    cloud_for_mesh = visual if (visual is not None and len(visual.points) >= 100) else pcd_room
+                    # 2. Build Poisson surface reconstruction mesh (saved as reconstructed_poisson.glb, keep TSDF reconstructed.glb intact)
+                    cloud_for_mesh = pcd_room if (pcd_room is not None and len(pcd_room.points) >= 100) else visual
                     poisson_mesh = build_poisson_mesh_from_cloud(cloud_for_mesh, layout=layout, depth=8)
                     if len(poisson_mesh.vertices) > 0 and len(poisson_mesh.triangles) > 0:
-                        glb_tmp = os.path.join(session_dir, "reconstructed.tmp.glb")
+                        glb_poisson = os.path.join(session_dir, "reconstructed_poisson.glb")
+                        write_triangle_mesh_glb(poisson_mesh, glb_poisson)
+                        logger.info(
+                            "Exported Poisson mesh (%d triangles) to reconstructed_poisson.glb for session %s",
+                            len(poisson_mesh.triangles), session_dir,
+                        )
+                        # Keep TSDF outputs intact: only write reconstructed.glb/reconstructed.ply if they don't exist
                         glb_final = os.path.join(session_dir, "reconstructed.glb")
-                        ply_tmp = os.path.join(session_dir, "reconstructed.tmp.ply")
+                        if not os.path.isfile(glb_final):
+                            write_triangle_mesh_glb(poisson_mesh, glb_final)
                         ply_final = os.path.join(session_dir, "reconstructed.ply")
-                        ok_glb = write_triangle_mesh_glb(poisson_mesh, glb_tmp)
-                        if ok_glb and os.path.isfile(glb_tmp) and os.path.getsize(glb_tmp) > 0:
-                            os.replace(glb_tmp, glb_final)
-                            logger.info(
-                                "Replaced reconstructed.glb with Poisson mesh (%d triangles) for session %s",
-                                len(poisson_mesh.triangles), session_dir,
-                            )
-                            # Export dense metric VGGT cloud in VIO coordinates for reconstructed.ply
-                            if len(pcd_vio.points) > 0:
-                                write_visual_ply(pcd_vio, session_dir, "reconstructed.ply")
+                        if not os.path.isfile(ply_final):
+                            write_visual_ply(pcd_room if len(pcd_room.points) > 0 else visual, session_dir, "reconstructed.ply")
                     return
 
             visual, dollhouse = build_visual_clouds(

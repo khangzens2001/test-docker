@@ -119,6 +119,27 @@ class VisualFrontend:
                 pts_prev = self._prev_pts[good].reshape(-1, 2)
                 pts_curr = fwd[good].reshape(-1, 2)
 
+                # Parallax consistency / opposite-flow rejection using R_prev_curr
+                if R_prev_curr is not None and len(pts_prev) >= 8:
+                    pts_hom = np.hstack([pts_prev, np.ones((len(pts_prev), 1))])
+                    H_gyro = self.K @ R_prev_curr @ self.K_inv
+                    proj_hom = (H_gyro @ pts_hom.T).T
+                    z = np.clip(proj_hom[:, 2:], 1e-6, None)
+                    p_rot = (proj_hom[:, :2] / z).astype(np.float32)
+                    d = pts_curr - p_rot
+                    d_med = np.median(d, axis=0)
+                    s_med = float(np.linalg.norm(d_med))
+                    if s_med >= 0.8:
+                        d_norms = np.linalg.norm(d, axis=1)
+                        moving_mask = d_norms >= 1.0
+                        cos_align = np.sum(d * d_med, axis=1) / (np.maximum(d_norms, 1e-6) * s_med)
+                        opposing = moving_mask & (cos_align <= -0.2)
+                        if np.any(opposing):
+                            keep = ~opposing
+                            if np.sum(keep) >= 8:
+                                pts_prev = pts_prev[keep]
+                                pts_curr = pts_curr[keep]
+
                 # RANSAC essential matrix filter
                 mask = self._ransac_filter(pts_prev, pts_curr)
                 pts_prev = pts_prev[mask]
@@ -199,16 +220,34 @@ class VisualFrontend:
         return selected_pts[:quota]
 
     def _ransac_filter(self, pts1: np.ndarray, pts2: np.ndarray) -> np.ndarray:
-        """Perform RANSAC filtering using Essential Matrix to remove flow outliers."""
+        """Perform RANSAC filtering using Essential Matrix and chirality check to remove flow outliers."""
         if len(pts1) < 8:
             return np.ones(len(pts1), dtype=bool)
 
-        _, mask = cv2.findEssentialMat(
+        E, mask = cv2.findEssentialMat(
             pts1, pts2, self.K, method=cv2.RANSAC, prob=0.999, threshold=1.0
         )
-        if mask is not None:
-            return mask.ravel().astype(bool)
-        return np.ones(len(pts1), dtype=bool)
+        if mask is None or E is None:
+            return np.ones(len(pts1), dtype=bool)
+
+        inlier_mask = mask.ravel().astype(bool)
+        if np.sum(inlier_mask) < 8:
+            return inlier_mask
+
+        # Chirality check via recoverPose to ensure triangulated 3D points lie strictly in front of both cameras
+        try:
+            E_mat = E[:3, :3] if E.shape[0] >= 3 else E
+            retval, R_est, t_est, pose_mask = cv2.recoverPose(
+                E_mat, pts1, pts2, self.K, mask=mask.copy()
+            )
+            if pose_mask is not None:
+                chiral_mask = pose_mask.ravel() > 0
+                if np.sum(chiral_mask) >= max(8, int(0.5 * np.sum(inlier_mask))):
+                    return chiral_mask
+        except Exception:
+            pass
+
+        return inlier_mask
 
     def get_tracks(self) -> list[list[tuple]]:
         return self._tracks

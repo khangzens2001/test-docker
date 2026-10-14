@@ -23,6 +23,7 @@ from dataclasses import dataclass
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import cv2
 import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation
@@ -58,6 +59,18 @@ def extract_yaw_deg(qx: float, qy: float, qz: float, qw: float, is_server_vio: b
         return float(np.degrees(np.arctan2(fwd[0], fwd[2])) % 360.0)
 
 
+def extract_elevation_deg(qx: float, qy: float, qz: float, qw: float, is_server_vio: bool = False) -> float:
+    R = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
+    if is_server_vio:
+        # VIO world (+Z up), OpenCV camera convention (+Z optical axis forward)
+        fwd = R @ np.array([0.0, 0.0, 1.0])
+        return float(np.degrees(np.arctan2(fwd[2], np.hypot(fwd[0], fwd[1]))))
+    else:
+        # ARCore world (+Y up), OpenGL camera convention (-Z optical axis forward)
+        fwd = R @ np.array([0.0, 0.0, -1.0])
+        return float(np.degrees(np.arctan2(fwd[1], np.hypot(fwd[0], fwd[2]))))
+
+
 def opengl_yaw_deg(qx, qy, qz, qw) -> float:
     return extract_yaw_deg(qx, qy, qz, qw, is_server_vio=False)
 
@@ -67,6 +80,7 @@ def yaw_coverage_subsample(
     max_n: int = N_VGGT_MAX,
     target_yaw_deg: float | None = None,
     min_target_count: int = 6,
+    max_safe_gap: int = 120,
 ) -> list[dict]:
     kept = list(records)
     if len(kept) <= max_n:
@@ -91,9 +105,50 @@ def yaw_coverage_subsample(
                     chosen_b = alt_b
                     break
 
-        drop_i = min(bins[chosen_b], key=lambda i: float(kept[i]["sharpness_score"]))
+        has_src = all("source_frame_index" in kept[i] for i in bins[chosen_b])
+        if has_src and len(kept) > 2:
+            safe_cands = []
+            for i in bins[chosen_b]:
+                if 0 < i < len(kept) - 1:
+                    gap = kept[i + 1]["source_frame_index"] - kept[i - 1]["source_frame_index"]
+                    if gap <= max_safe_gap:
+                        safe_cands.append(i)
+            if safe_cands:
+                drop_i = min(safe_cands, key=lambda i: float(kept[i]["sharpness_score"]))
+            else:
+                found_alt = False
+                for alt_b in cand_bins[1:]:
+                    if len(bins[alt_b]) > 2:
+                        alt_safe = [
+                            i for i in bins[alt_b]
+                            if 0 < i < len(kept) - 1 and (kept[i + 1]["source_frame_index"] - kept[i - 1]["source_frame_index"] <= max_safe_gap)
+                        ]
+                        if alt_safe:
+                            drop_i = min(alt_safe, key=lambda i: float(kept[i]["sharpness_score"]))
+                            found_alt = True
+                            break
+                if not found_alt:
+                    mid_cands = [i for i in bins[chosen_b] if 0 < i < len(kept) - 1]
+                    cands = mid_cands if mid_cands else bins[chosen_b]
+                    drop_i = min(cands, key=lambda i: float(kept[i]["sharpness_score"]))
+        else:
+            drop_i = min(bins[chosen_b], key=lambda i: float(kept[i]["sharpness_score"]))
+
         kept.pop(drop_i)
     return kept
+
+
+def uniform_trajectory_subsample(
+    records: list[dict],
+    max_n: int = N_VGGT_MAX,
+) -> list[dict]:
+    """Sample <=max_n keyframes with uniform linspace spacing along the trajectory."""
+    kept = list(records)
+    if len(kept) <= max_n:
+        return kept
+
+    indices = np.round(np.linspace(0, len(kept) - 1, max_n)).astype(int)
+    return [kept[idx] for idx in indices]
 
 
 class _FallbackKeyframeRecord:
@@ -168,12 +223,11 @@ def _stage_island(session_dir: str, pose_df: pd.DataFrame, staging: str) -> None
     if not os.path.isdir(rgb_src):
         return
 
-    # Write the active trajectory (from pose_df, which contains server_vio or island odometry)
-    # as odometry.csv in staging directory so keyframe selector evaluates the actual trajectory.
     if "frame" in pose_df.columns:
         frames = set(int(f) for f in pose_df["frame"].to_numpy() if np.isfinite(f))
     else:
         frames = None
+
     pose_df.to_csv(os.path.join(staging, "odometry.csv"), index=False)
 
     for name in os.listdir(rgb_src):
@@ -191,8 +245,12 @@ def _stage_island(session_dir: str, pose_df: pd.DataFrame, staging: str) -> None
         shutil.copy2(src, os.path.join(rgb_dst, dst_name))
 
 
-def export_vggt_keyframes(session_dir: str) -> KeyframeExport:
-    pose_df = load_pose_table_for_tsdf(session_dir)
+def export_vggt_keyframes(
+    session_dir: str,
+    subsample_method: str = "yaw",
+    prefer_server_vio: bool = True,
+) -> KeyframeExport:
+    pose_df = load_pose_table_for_tsdf(session_dir, prefer_server_vio=prefer_server_vio)
     empty = KeyframeExport(0, 0, None, None, None, pose_df.attrs.get("pose_source") if hasattr(pose_df, "attrs") else None)
     if pose_df is None or pose_df.empty:
         return empty
@@ -224,12 +282,15 @@ def export_vggt_keyframes(session_dir: str) -> KeyframeExport:
             row = odo_by_frame.get(int(r.source_frame_index))
             if row is None:
                 yaw = 0.0
+                elev = 0.0
             else:
                 yaw = extract_yaw_deg(row["qx"], row["qy"], row["qz"], row["qw"], is_server_vio=is_server_vio)
+                elev = extract_elevation_deg(row["qx"], row["qy"], row["qz"], row["qw"], is_server_vio=is_server_vio)
             recs.append(
                 {
                     "record": r,
                     "yaw_deg": yaw,
+                    "elevation_deg": elev,
                     "sharpness_score": float(getattr(r, "sharpness_score", 0.0)),
                     "source_frame_index": int(r.source_frame_index),
                     "source_filename": r.source_filename,
@@ -254,11 +315,19 @@ def export_vggt_keyframes(session_dir: str) -> KeyframeExport:
                 except Exception:
                     target_yaw = None
 
-        sent = (
-            yaw_coverage_subsample(recs, max_n=N_VGGT_MAX, target_yaw_deg=target_yaw, min_target_count=8)
-            if n_selected > N_VGGT_MAX
-            else recs
-        )
+        if subsample_method == "yaw":
+            sent = (
+                yaw_coverage_subsample(recs, max_n=N_VGGT_MAX, target_yaw_deg=target_yaw, min_target_count=8)
+                if n_selected > N_VGGT_MAX
+                else recs
+            )
+        else:
+            sent = (
+                uniform_trajectory_subsample(recs, max_n=N_VGGT_MAX)
+                if n_selected > N_VGGT_MAX
+                else recs
+            )
+
         img_dir = os.path.join(session_dir, "keyframes_selected", "images")
         if os.path.isdir(img_dir):
             shutil.rmtree(img_dir)
@@ -275,7 +344,9 @@ def export_vggt_keyframes(session_dir: str) -> KeyframeExport:
             src_path = os.path.join(staging, "rgb", src_name)
             if not os.path.isfile(src_path):
                 src_path = os.path.join(staging, "rgb", f"{src_idx:06d}.jpg")
-            shutil.copy2(src_path, os.path.join(img_dir, vggt_filename))
+            dst_path = os.path.join(img_dir, vggt_filename)
+            shutil.copy2(src_path, dst_path)
+
             prow = pose_by_frame.get(src_idx)
             if prow is None and len(pose_df):
                 prow = pose_df.iloc[min(i, len(pose_df) - 1)]

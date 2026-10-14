@@ -235,10 +235,10 @@ class PoseGraphOptimizer:
                     max_dphi = dphi_n
 
             step_scale = 1.0
-            if max_dphi > 0.20:
-                step_scale = min(step_scale, 0.20 / max_dphi)
-            if max_dp > 0.50:
-                step_scale = min(step_scale, 0.50 / max_dp)
+            if max_dphi > 0.50:
+                step_scale = min(step_scale, 0.50 / max_dphi)
+            if max_dp > 0.80:
+                step_scale = min(step_scale, 0.80 / max_dp)
 
             # Retract state update on manifold with trust region scaling
             self._update_nodes(node_ids, id_to_idx, dx * step_scale)

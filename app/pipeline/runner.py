@@ -199,6 +199,9 @@ def select_best_tracking_island(
             {"tracking_islands_detected": 0, "discarded_frames": 0, "island_fail_open_reason": "empty"},
         )
     df = pose_df.copy()
+    if "device_timestamp_ns" not in df.columns and "timestamp" in df.columns:
+        raw_t = df["timestamp"].to_numpy(dtype=np.float64)
+        df["device_timestamp_ns"] = (raw_t * 1e9).astype(np.int64) if (len(raw_t) > 0 and raw_t[0] < 1e12) else raw_t.astype(np.int64)
     for c in req_cols:
         if c not in df.columns:
             return _apply_island_attrs(
@@ -413,8 +416,52 @@ def load_pose_table_for_tsdf(
         if not vio_df.empty and vio_required.issubset(set(vio_df.columns)):
             vio_cols = list(vio_required)
             if np.all(np.isfinite(vio_df[vio_cols].to_numpy(dtype=np.float64))):
-                vio_df.attrs["pose_source"] = "server_vio"
-                return vio_df
+                use_vio = True
+                if os.path.isfile(odo_path) and os.path.getsize(odo_path) > 0:
+                    try:
+                        odo_raw = pd.read_csv(odo_path)
+                        if (
+                            not odo_raw.empty
+                            and {"x", "y", "z", "qx", "qy", "qz", "qw"}.issubset(set(odo_raw.columns))
+                            and len(odo_raw) > 1
+                            and len(vio_df) > 1
+                        ):
+                            from scipy.spatial.transform import Rotation
+
+                            p_v0 = vio_df[["x", "y", "z"]].iloc[0].to_numpy(dtype=np.float64)
+                            p_v1 = vio_df[["x", "y", "z"]].iloc[-1].to_numpy(dtype=np.float64)
+                            vio_drift_m = float(np.linalg.norm(p_v1 - p_v0))
+
+                            q_v0 = vio_df[["qx", "qy", "qz", "qw"]].iloc[0].to_numpy(dtype=np.float64)
+                            q_v1 = vio_df[["qx", "qy", "qz", "qw"]].iloc[-1].to_numpy(dtype=np.float64)
+                            r_v_rel = Rotation.from_quat(q_v0).inv() * Rotation.from_quat(q_v1)
+                            vio_yaw_deg = float(abs(np.degrees(r_v_rel.as_euler("zyx")[0])))
+
+                            p_o0 = odo_raw[["x", "y", "z"]].iloc[0].to_numpy(dtype=np.float64)
+                            p_o1 = odo_raw[["x", "y", "z"]].iloc[-1].to_numpy(dtype=np.float64)
+                            odo_drift_m = float(np.linalg.norm(p_o1 - p_o0))
+
+                            odo_xyz = odo_raw[["x", "y", "z"]].to_numpy(dtype=np.float64)
+                            diffs = np.linalg.norm(np.diff(odo_xyz, axis=0), axis=1)
+                            max_odo_jump = float(np.max(diffs)) if len(diffs) > 0 else 0.0
+                            if max_odo_jump > 0.50:
+                                odo_drift_m = 999.0
+
+                            if (vio_drift_m > 0.30 or vio_yaw_deg > 15.0) and odo_drift_m < 0.15:
+                                logger.warning(
+                                    "VIO sanity gate triggered: vio_drift=%.3fm, vio_yaw_drift=%.1fdeg vs odo_drift=%.3fm. Fallback to ARCore odometry for TSDF.",
+                                    vio_drift_m,
+                                    vio_yaw_deg,
+                                    odo_drift_m,
+                                )
+                                use_vio = False
+                                apply_island_filter = False
+                    except Exception as gate_err:
+                        logger.warning("Error evaluating VIO sanity gate: %s", gate_err)
+
+                if use_vio:
+                    vio_df.attrs["pose_source"] = "server_vio"
+                    return vio_df
     if not os.path.isfile(odo_path) or os.path.getsize(odo_path) == 0:
         return pd.DataFrame()
     odo_df = pd.read_csv(odo_path)
@@ -909,7 +956,8 @@ def run_sensor_ingestion(session_dir: str) -> dict[str, Any]:
             logger.warning("Hub IMU Wahba estimation failed with %s: %s", type(exc).__name__, exc)
 
     if len(odo_data) > 0:
-        odo_data.to_csv(os.path.join(session_dir, "processed_odometry.csv"), index=False)
+        odo_stitched = select_best_tracking_island(odo_data, imu_df=processed_phone)
+        odo_stitched.to_csv(os.path.join(session_dir, "processed_odometry.csv"), index=False)
 
     lidar_cols = ["device_timestamp_ns", "mcu_timestamp_ns"]
     lidar_cols += [f"distance_{i}" for i in range(64)]
@@ -989,6 +1037,7 @@ def run_3d_reconstruction(
     enable_server_vio: bool = True,
     enable_tof_pipeline: bool = True,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    stage_callback: Optional[Callable[[int, str, int], None]] = None,
     enable_parallel: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Execute pure 3D reconstruction and spatial measurement chain on session_dir."""
@@ -1078,7 +1127,7 @@ def run_3d_reconstruction(
     z_max_ghost = max(GHOST_RANGE_FLOOR_M, diag + GHOST_TRAJ_MARGIN_M)
 
     enable_vggt = is_vggt_enabled()
-    force_vggt = (pose_df.attrs.get("pose_source") == "server_vio")
+    force_vggt = (pose_df.attrs.get("pose_source") == "server_vio") or (os.getenv("FORCE_VGGT", "0") == "1")
 
     can_parallel = False
     parallel_reason = ""
@@ -1466,6 +1515,7 @@ class PipelineRunner:
         enable_parallel: Optional[bool] = None,
         recalculate_params: dict[str, Any] | None = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        stage_callback: Optional[Callable[[int, str, int], None]] = None,
         force_ingest: bool = False,
     ):
         self.enable_server_vio = enable_server_vio
@@ -1473,6 +1523,7 @@ class PipelineRunner:
         self.enable_parallel = enable_parallel
         self.recalculate_params = recalculate_params or dict(DEFAULT_RECALCULATE_PARAMS)
         self.progress_callback = progress_callback
+        self.stage_callback = stage_callback
         self.force_ingest = force_ingest
 
     def run_timesync(self, session_dir: str) -> dict[str, Any]:
@@ -1482,6 +1533,7 @@ class PipelineRunner:
         self,
         session_dir: str,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        stage_callback: Optional[Callable[[int, str, int], None]] = None,
         enable_parallel: Optional[bool] = None,
     ) -> dict[str, Any]:
         eff_parallel = self.enable_parallel if enable_parallel is None else enable_parallel
@@ -1490,6 +1542,7 @@ class PipelineRunner:
             enable_server_vio=self.enable_server_vio,
             enable_tof_pipeline=self.enable_tof_pipeline,
             progress_callback=progress_callback or self.progress_callback,
+            stage_callback=stage_callback or self.stage_callback,
             enable_parallel=eff_parallel,
         )
 
@@ -1530,7 +1583,11 @@ class PipelineRunner:
             # 2. 3D Reconstruction Chain
             t1 = time.time()
             logger.info("PipelineRunner: Executing 3D Reconstruction & Floorplan for %s", session_dir)
-            recon_res = self.run_reconstruction(session_dir, progress_callback=self.progress_callback)
+            recon_res = self.run_reconstruction(
+                session_dir,
+                progress_callback=self.progress_callback,
+                stage_callback=self.stage_callback,
+            )
             timings["reconstruction_sec"] = round(time.time() - t1, 3)
 
             # 3. Material Estimation & Bundle Export

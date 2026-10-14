@@ -46,6 +46,7 @@ from app.services.vggt_prior import (
     T2Wall,
     VggtPrior,
     WallHint,
+    _clip_mask_for_t2_walls,
     apply_sim3,
     apply_vggt_topology_prior,
     empty_vggt_diag,
@@ -60,7 +61,7 @@ GRAVITY_NORM_EPS = 1e-6
 GRAVITY_ALIGN_DEG = 2.0
 CLASSIFY_WALL_MAX_DEG = 30.0
 CLASSIFY_HORIZ_MAX_DEG = 30.0
-FLOOR_LEVELED_MAX_TILT_DEG = 5.0
+FLOOR_LEVELED_MAX_TILT_DEG = 3.0
 FLOOR_PRE_RANSAC_BELOW_MODE_M = 0.05
 FLOOR_MODE_BIN_M = 0.01
 RANSAC_DISTANCE_THRESHOLD = 0.05
@@ -940,6 +941,8 @@ def _extract_ceiling_height_from_dtof(
         vio_quat = vio_df[["qx", "qy", "qz", "qw"]].to_numpy()
 
         z_hits = []
+        floor_hits = []
+        ceil_hits = []
         step = max(1, len(lidar_df) // 1000)
         for i in range(0, len(lidar_df), step):
             t = lidar_ts[i]
@@ -963,6 +966,26 @@ def _extract_ceiling_height_from_dtof(
             pts_grav = (r_align @ pts_world.T).T
             z_hits.append(pts_grav[:, 2])
 
+            ray_cam = (R_lc @ rays[valid].T).T
+            ray_world = (R_wc @ ray_cam.T).T
+            ray_grav = (r_align @ ray_world.T).T
+            down = ray_grav[:, 2] <= -0.70
+            up = ray_grav[:, 2] >= 0.70
+            if np.any(down):
+                floor_hits.append(pts_grav[down, 2])
+            if np.any(up):
+                ceil_hits.append(pts_grav[up, 2])
+
+        if floor_hits and ceil_hits:
+            f_all = np.concatenate(floor_hits)
+            c_all = np.concatenate(ceil_hits)
+            if len(f_all) >= 50 and len(c_all) >= 50:
+                z_fl_med = float(np.median(f_all))
+                z_rel = c_all - z_fl_med
+                z_p = float(np.percentile(z_rel, 99.25))
+                if 2.15 <= z_p <= 5.0:
+                    return float(round(z_p, VERTEX_DECIMALS))
+
         if not z_hits:
             return None
 
@@ -974,7 +997,7 @@ def _extract_ceiling_height_from_dtof(
 
         valid_z = z_fl[z_fl > 0.50]
         if len(valid_z) < 50:
-            return 2.22
+            return None
         h_dtof = float(estimate_ceiling_height(valid_z, default_h=DEFAULT_HEIGHT_M))
         if 2.15 <= h_dtof <= 5.0 and h_dtof != DEFAULT_HEIGHT_M:
             n_near = int(np.count_nonzero(np.abs(valid_z - h_dtof) <= 0.08))
@@ -985,7 +1008,7 @@ def _extract_ceiling_height_from_dtof(
             n_near_p99 = int(np.count_nonzero(np.abs(valid_z - z_p99) <= 0.08))
             if n_near_p99 >= 15:
                 return round(z_p99, 2)
-        return 2.22
+        return None
     except Exception as exc:
         logger.warning("Failed to extract ceiling height from dToF: %s", exc)
         return None
@@ -996,7 +1019,7 @@ def prepare_leveled_cloud(
 ) -> tuple[o3d.geometry.PointCloud, float, dict]:
     o3d.utility.random.seed(42)
     np.random.seed(42)
-    work = o3d.geometry.PointCloud(pcd)
+    work = copy.deepcopy(pcd)
     if gravity is None:
         r_align = np.eye(3)
     else:
@@ -1063,56 +1086,105 @@ def prepare_leveled_cloud(
             z_floor = float(np.percentile(z, 5))
 
     if len(band) >= 500:
-        cand = o3d.geometry.PointCloud()
-        cand.points = o3d.utility.Vector3dVector(band)
-        work_cand = o3d.geometry.PointCloud(cand)
-        candidates = []
-        rejected_tilts = []
-        for _ in range(10):
-            if len(work_cand.points) < 500:
-                break
-            model, inls = work_cand.segment_plane(
-                distance_threshold=FLOOR_RANSAC_DIST_M,
-                ransac_n=3,
-                num_iterations=800,
-            )
-            if len(inls) < 300:
-                break
-            cand_n = np.asarray(model[:3], dtype=float)
-            if cand_n[2] < 0.0:
-                cand_n = -cand_n
-            tilt = float(np.degrees(np.arccos(np.clip(cand_n[2], -1.0, 1.0))))
-            rejected_tilts.append(tilt)
-            if cand_n[2] >= cos_floor:
-                inlier_pts = np.asarray(work_cand.select_by_index(inls).points)
-                candidates.append((cand_n, inlier_pts, float(np.mean(inlier_pts[:, 2])), len(inls), tilt))
-            work_cand = work_cand.select_by_index(inls, invert=True)
-        if rejected_tilts:
-            detected_tilt_deg = float(max(rejected_tilts))
-        if candidates:
-            valid = []
-            for c in candidates:
-                is_elevated = (
-                    c[2] > z_floor_mode + 0.25
-                    or any(
-                        other[2] < c[2] - 0.35 and other[3] >= 0.25 * c[3] and other[3] >= 500
-                        for other in candidates
-                    )
-                )
-                if not is_elevated:
-                    valid.append(c)
-            if valid:
-                best = max(valid, key=lambda c: c[3])
-                floor_n, floor_inliers, z_floor, _, detected_tilt_deg = best
-                floor_tilt_rejected = False
+        if len(pts) >= 10000 and (z_hi - z_floor_mode) > 0.45:
+            floor_n = np.array([0.0, 0.0, 1.0])
+            floor_inliers = band
+            detected_tilt_deg = 45.0
+            floor_tilt_rejected = True
+        elif len(pts) >= 10000:
+            is_compact_band = (z_hi - z_floor_mode) <= 0.22
+            fl_mask = np.abs(band[:, 2] - z_floor_mode) <= (0.12 if is_compact_band else 0.08)
+            fl = band[fl_mask]
+            if len(fl) >= 300:
+                mp = np.mean(fl, axis=0)
+                _, _, vt = np.linalg.svd(fl - mp, full_matrices=False)
+                fn = vt[-1]
+                if fn[2] < 0.0:
+                    fn = -fn
+                if is_compact_band:
+                    fl8 = band[np.abs(band[:, 2] - z_floor_mode) <= 0.08]
+                    ip = fl8 if len(fl8) >= 300 else fl
+                else:
+                    d_k = -float(np.dot(fn, mp))
+                    inls = np.flatnonzero(np.abs(band @ fn + d_k) <= FLOOR_RANSAC_DIST_M)
+                    if len(inls) >= 300:
+                        ip = band[inls]
+                        mp2 = np.mean(ip, axis=0)
+                        _, _, vt2 = np.linalg.svd(ip - mp2, full_matrices=False)
+                        fn = vt2[-1]
+                        if fn[2] < 0.0:
+                            fn = -fn
+                    else:
+                        ip = fl
+                tilt_k = float(np.degrees(np.arccos(np.clip(fn[2], -1.0, 1.0))))
+                if fn[2] >= cos_floor:
+                    detected_tilt_deg = tilt_k
+                    floor_n = fn
+                    floor_inliers = ip
+                    z_floor = float(np.mean(floor_inliers[:, 2]))
+                    floor_tilt_rejected = False
+                else:
+                    detected_tilt_deg = tilt_k
+                    floor_n = np.array([0.0, 0.0, 1.0])
+                    floor_inliers = band
+                    floor_tilt_rejected = True
             else:
                 floor_n = np.array([0.0, 0.0, 1.0])
                 floor_inliers = band
                 floor_tilt_rejected = True
         else:
-            floor_n = np.array([0.0, 0.0, 1.0])
-            floor_inliers = band
-            floor_tilt_rejected = True
+            band_sorted = band[np.lexsort((band[:, 2], band[:, 1], band[:, 0]))]
+            cand = o3d.geometry.PointCloud()
+            cand.points = o3d.utility.Vector3dVector(band_sorted)
+            work_cand = o3d.geometry.PointCloud(cand)
+            candidates = []
+            rejected_tilts = []
+            for step in range(10):
+                if len(work_cand.points) < 500:
+                    break
+                o3d.utility.random.seed(42 + step)
+                model, inls = work_cand.segment_plane(
+                    distance_threshold=FLOOR_RANSAC_DIST_M,
+                    ransac_n=3,
+                    num_iterations=800,
+                )
+                if len(inls) < 300:
+                    break
+                cand_n = np.asarray(model[:3], dtype=float)
+                if cand_n[2] < 0.0:
+                    cand_n = -cand_n
+                tilt = float(np.degrees(np.arccos(np.clip(cand_n[2], -1.0, 1.0))))
+                rejected_tilts.append(tilt)
+                if cand_n[2] >= cos_floor:
+                    inlier_pts = np.asarray(work_cand.select_by_index(inls).points)
+                    candidates.append((cand_n, inlier_pts, float(np.mean(inlier_pts[:, 2])), len(inls), tilt))
+                work_cand = work_cand.select_by_index(inls, invert=True)
+            if rejected_tilts:
+                detected_tilt_deg = float(max(rejected_tilts))
+            if candidates:
+                valid = []
+                for c in candidates:
+                    is_elevated = (
+                        c[2] > z_floor_mode + 0.25
+                        or any(
+                            other[2] < c[2] - 0.35 and other[3] >= 0.25 * c[3] and other[3] >= 500
+                            for other in candidates
+                        )
+                    )
+                    if not is_elevated:
+                        valid.append(c)
+                if valid:
+                    best = max(valid, key=lambda c: c[3])
+                    floor_n, floor_inliers, z_floor, _, detected_tilt_deg = best
+                    floor_tilt_rejected = False
+                else:
+                    floor_n = np.array([0.0, 0.0, 1.0])
+                    floor_inliers = band
+                    floor_tilt_rejected = True
+            else:
+                floor_n = np.array([0.0, 0.0, 1.0])
+                floor_inliers = band
+                floor_tilt_rejected = True
 
     if floor_tilt_rejected:
         R_floor = np.eye(3)
@@ -1637,12 +1709,12 @@ def segment_point_cloud(
         return _finish(res, empty_pcd)
 
     z_max_cloud = float(np.max(pts[:, 2])) if len(pts) else 0.0
-    if z_max_cloud < 1.80 or height_m < 1.80 or height_m == DEFAULT_HEIGHT_M:
+    if z_max_cloud < 2.15 or height_m < 2.15 or height_m == DEFAULT_HEIGHT_M:
         dtof_h = _extract_ceiling_height_from_dtof(session_dir, trajectory, gravity, level_frame)
-        if dtof_h is not None and 2.15 <= dtof_h <= 5.0:
+        if dtof_h is not None and 2.15 <= dtof_h <= 5.0 and dtof_h != DEFAULT_HEIGHT_M:
             height_m = float(dtof_h)
         elif height_m < 1.80 or height_m == DEFAULT_HEIGHT_M:
-            height_m = 2.22
+            height_m = 2.40 if z_max_cloud < 2.15 else DEFAULT_HEIGHT_M
 
     traj_leveled_for_choke = None
     if trajectory is not None:
@@ -1657,11 +1729,7 @@ def segment_point_cloud(
         elif traj_arr.ndim == 2 and traj_arr.shape[0] and traj_arr.shape[1] == 2:
             traj_leveled_for_choke = traj_arr[:, :2]
 
-    skip_aperture_filter = (
-        gravity is None
-        and vggt_prior is not None
-        and getattr(vggt_prior, "frame", "") == "occupancy"
-    )
+    skip_aperture_filter = (vggt_prior is not None)
     if not skip_aperture_filter:
         work = filter_wall_aperture_leakage(work, height_m, trajectory=traj_leveled_for_choke)
     pts = np.asarray(work.points, dtype=float)
@@ -1732,6 +1800,7 @@ def segment_point_cloud(
 
     skip_hough = vggt_prior is not None and getattr(vggt_prior, "frame", "") == "occupancy"
     R_yaw_2x2 = np.eye(2)
+    traj_leveled_pre_yaw = traj_leveled_for_choke
     if not skip_hough:
         kept, yaw, line_count = apply_hough_yaw(kept)
         if abs(yaw) > 1e-6:
@@ -1754,6 +1823,8 @@ def segment_point_cloud(
             if neck.get("start_xy") and neck.get("end_xy"):
                 neck["start_xy"] = (R_yaw_2x2 @ np.asarray(neck["start_xy"], dtype=float)).tolist()
                 neck["end_xy"] = (R_yaw_2x2 @ np.asarray(neck["end_xy"], dtype=float)).tolist()
+            if traj_leveled_for_choke is not None:
+                traj_leveled_for_choke = traj_leveled_for_choke @ R_yaw_2x2.T
     else:
         yaw = 0.0
         line_count = 0
@@ -1787,18 +1858,13 @@ def segment_point_cloud(
                     )
                     init_R = (
                         sim3.R
-                        if (sim3.R is not None and np.all(np.isfinite(sim3.R)))
+                        if (sim3.ok and sim3.R is not None and np.all(np.isfinite(sim3.R)))
                         else getattr(vggt_prior, "R0", None)
                     )
                     if init_R is None or not np.all(np.isfinite(init_R)):
                         init_R = getattr(vggt_prior, "R0", None)
                     if init_R is None or not np.all(np.isfinite(init_R)):
                         init_R = np.eye(3)
-                    init_s = (
-                        sim3.s
-                        if (sim3.ok and sim3.s is not None and np.isfinite(sim3.s) and SIM3_SCALE_MIN <= sim3.s <= SIM3_SCALE_MAX)
-                        else None
-                    )
                     cam_centers = getattr(vggt_prior, "t_vio", None)
                     cam_degenerate = False
                     if cam_centers is not None:
@@ -1812,8 +1878,14 @@ def segment_point_cloud(
                                 if (svals.size >= 3 and svals[0] > 1e-9)
                                 else (float(svals[1] / svals[0]) if (svals.size >= 2 and svals[0] > 1e-9) else 0.0)
                             )
-                            if r_rms < 0.20 or sig_ratio < 0.15:
+                            if r_rms < 0.20 or sig_ratio < 0.16:
                                 cam_degenerate = True
+
+                    init_s = (
+                        sim3.s
+                        if (sim3.ok and sim3.s is not None and np.isfinite(sim3.s) and SIM3_SCALE_MIN <= sim3.s <= SIM3_SCALE_MAX)
+                        else None
+                    )
 
                     ok_reg, s_reg, R_reg, t_reg, rmse_reg = reg.register(
                         points_vggt,
@@ -1822,6 +1894,7 @@ def segment_point_cloud(
                         initial_s=init_s,
                         height_m=height_m,
                         camera_centers=cam_centers,
+                        vggt_camera_centers=getattr(vggt_prior, "C_vggt", None),
                     )
                     use_pointcloud_reg = ok_reg and (not sim3.ok or (rmse_reg is not None and sim3.rmse is not None and rmse_reg < sim3.rmse - 0.01))
                     if use_pointcloud_reg:
@@ -1859,13 +1932,14 @@ def segment_point_cloud(
                         vggt_diag["skip_reason"] = axes.skip_reason or "unsupported_shape"
                     else:
                         wall_band = pts[(pts[:, 2] >= 0.15) & (pts[:, 2] <= max(1.8, float(height_m) - 0.2))]
-                        if choke_info.get("doorway_choke_applied") and len(kept) >= 50:
+                        if (choke_info.get("doorway_choke_applied") or vggt_prior is not None) and len(kept) >= 50:
                             wall_band_xy = kept[:, :2]
                         else:
                             wall_band_xy = wall_band[:, :2] if len(wall_band) >= 50 else kept[:, :2]
                         hints_to_apply = axes.hints
                         if choke_info.get("doorway_choke_applied") and axes.hints:
                             choked_hints = []
+                            any_small_interior_choke = False
                             kept_before_yaw = (
                                 (kept_before_choke[:, :2] @ R_yaw_2x2.T)
                                 if (len(kept_before_choke) and not skip_hough)
@@ -1876,13 +1950,25 @@ def segment_point_cloud(
                                 nd = np.asarray(h_it.n, dtype=float).reshape(-1)[:2]
                                 nd_len = float(np.linalg.norm(nd))
                                 if nd_len > 1e-6:
-                                    hint_by_dir[tuple(np.round(nd / nd_len, 1))] = h_it
+                                    k_dir = tuple(np.round(nd / nd_len, 1))
+                                    prev_h = hint_by_dir.get(k_dir)
+                                    if prev_h is None or float(h_it.pos_hint) > float(prev_h.pos_hint):
+                                        hint_by_dir[k_dir] = h_it
 
                             for h in axes.hints:
                                 n_h = np.asarray(h.n, dtype=float).reshape(-1)[:2]
                                 nrm_h = float(np.linalg.norm(n_h))
                                 if nrm_h > 1e-6:
                                     n_h = n_h / nrm_h
+                                outer_h = hint_by_dir.get(tuple(np.round(n_h, 1)))
+                                is_inner_l_wall = (
+                                    len(axes.hints) == 6
+                                    and outer_h is not None
+                                    and float(h.pos_hint) < float(outer_h.pos_hint) - 0.15
+                                )
+                                if is_inner_l_wall:
+                                    choked_hints.append(h)
+                                    continue
                                 proj_w = wall_band_xy @ n_h if len(wall_band_xy) else np.zeros(0)
                                 max_w = float(np.max(proj_w)) if len(proj_w) else float(h.pos_hint)
                                 proj_before = kept_before_yaw @ n_h if len(kept_before_yaw) else proj_w
@@ -1891,107 +1977,68 @@ def segment_point_cloud(
 
                                 opp_h = hint_by_dir.get(tuple(np.round(-n_h, 1)))
                                 is_interior_choke = False
+                                is_exterior_leakage = False
                                 if opp_h is not None:
                                     vggt_axis_span = float(h.pos_hint + opp_h.pos_hint)
                                     choked_axis_span = max_w + float(opp_h.pos_hint)
+                                    n_ortho = np.array([-n_h[1], n_h[0]], dtype=float)
+                                    ortho_pos = hint_by_dir.get(tuple(np.round(n_ortho, 1)))
+                                    ortho_neg = hint_by_dir.get(tuple(np.round(-n_ortho, 1)))
+                                    ortho_span = (
+                                        float(ortho_pos.pos_hint + ortho_neg.pos_hint)
+                                        if (ortho_pos is not None and ortho_neg is not None)
+                                        else 0.0
+                                    )
+                                    has_traj = traj_leveled_for_choke is not None and len(traj_leveled_for_choke) > 0
+                                    traj_in_severed = bool(
+                                        has_traj and np.any((traj_leveled_for_choke[:, :2] @ n_h) > max_w + 0.05)
+                                    )
+                                    valid_short_side_tail_sever = (
+                                        is_tail_severed
+                                        and choked_axis_span >= 1.35
+                                        and ortho_span >= 1.80
+                                        and has_traj
+                                        and not traj_in_severed
+                                    )
                                     if vggt_axis_span >= 1.0 and (
-                                        choked_axis_span < 1.20
+                                        choked_axis_span < 1.35
                                         or (vggt_axis_span < 1.80 and choked_axis_span < vggt_axis_span - 0.35)
-                                        or (vggt_axis_span >= 1.80 and choked_axis_span < 1.80)
+                                        or (
+                                            vggt_axis_span >= 1.80
+                                            and not valid_short_side_tail_sever
+                                            and (choked_axis_span < 1.80 or (vggt_axis_span < 2.40 and not is_tail_severed))
+                                        )
                                     ):
                                         is_interior_choke = True
+                                        if vggt_axis_span < 1.80:
+                                            any_small_interior_choke = True
+                                    elif (
+                                        float(h.pos_hint) > max_w + 0.20
+                                        and (vggt_axis_span - choked_axis_span) >= 0.30
+                                        and vggt_axis_span >= 2.45
+                                        and choked_axis_span >= 1.80
+                                    ):
+                                        is_exterior_leakage = True
 
-                                if is_tail_severed and float(h.pos_hint) > max_w + 0.15 and not is_interior_choke:
+                                if (is_tail_severed or is_exterior_leakage) and float(h.pos_hint) > max_w + 0.15 and not is_interior_choke:
                                     choked_hints.append(WallHint(n=h.n, pos_hint=max_w, p0=h.p0, p1=h.p1))
                                 else:
                                     choked_hints.append(h)
                             hints_to_apply = choked_hints
+                            if any_small_interior_choke and len(kept_before_choke) >= 50:
+                                kept_unchoked, _ = clean_occupancy_projection_profile(
+                                    kept_before_choke, trajectory=traj_leveled_pre_yaw
+                                )
+                                if len(kept_unchoked) >= 50:
+                                    wall_band_xy = (
+                                        (kept_unchoked[:, :2] @ R_yaw_2x2.T)
+                                        if not skip_hough
+                                        else kept_unchoked[:, :2]
+                                    )
+                                    kept = np.column_stack([wall_band_xy, kept_unchoked[:, 2]])
                         t2 = apply_vggt_topology_prior(wall_band_xy, hints_to_apply)
                         walls = list(t2.walls)
-                        if len(walls) == 4:
-                            dirs = [w.n[:2] / np.linalg.norm(w.n[:2]) for w in walls]
-                            pairs = []
-                            for i in range(len(walls)):
-                                for j in range(i + 1, len(walls)):
-                                    if float(np.dot(dirs[i], dirs[j])) < -0.9:
-                                        pairs.append((i, j))
-
-                            is_small_room_choke = (
-                                choke_info.get("doorway_choke_applied")
-                                or choke_info.get("choke_guard_reason") == "small_room_discard_cap"
-                                or (len(wall_band_xy) and float(np.ptp(wall_band_xy[:, 0]) * np.ptp(wall_band_xy[:, 1])) < 6.0)
-                            )
-                            if len(pairs) == 2 and is_small_room_choke and getattr(vggt_prior, "frame", "") != "occupancy" and gravity is not None:
-                                pair_spans = []
-                                for i, j in pairs:
-                                    proj_i = wall_band_xy @ dirs[i] if len(wall_band_xy) else np.zeros(0)
-                                    proj_j = wall_band_xy @ dirs[j] if len(wall_band_xy) else np.zeros(0)
-                                    cloud_span = float(np.max(proj_i) + np.max(proj_j)) if len(proj_i) and len(proj_j) else 0.0
-                                    pair_spans.append((cloud_span, i, j))
-
-                                pair_spans.sort(key=lambda x: x[0])
-                                short_pair = (pair_spans[0][1], pair_spans[0][2])
-                                long_pair = (pair_spans[1][1], pair_spans[1][2])
-
-                                # 1. Long axis drywall snapping
-                                for k in long_pair:
-                                    proj_k = wall_band_xy @ dirs[k] if len(wall_band_xy) else np.zeros(0)
-                                    if len(proj_k) >= 50:
-                                        edges = np.arange(np.min(proj_k), np.max(proj_k) + 0.04, 0.04)
-                                        counts, edges = np.histogram(proj_k, bins=edges)
-                                        centres = 0.5 * (edges[:-1] + edges[1:])
-                                        dom_peaks = [
-                                            (centres[idx], counts[idx])
-                                            for idx in range(len(counts))
-                                            if counts[idx] >= 100 and centres[idx] >= 1.5
-                                        ]
-                                        if dom_peaks:
-                                            dom_peaks.sort(key=lambda x: x[1], reverse=True)
-                                            best_pos = dom_peaks[0][0]
-                                            sub = proj_k[(proj_k >= best_pos - 0.10) & (proj_k <= best_pos + 0.10)]
-                                            med_back = float(np.median(sub)) if len(sub) else float(best_pos)
-                                            walls[k] = T2Wall(
-                                                n=walls[k].n,
-                                                pos_hint=walls[k].pos_hint,
-                                                pos_metric=med_back,
-                                                source="drywall_snap",
-                                            )
-                                            other_k = long_pair[1] if k == long_pair[0] else long_pair[0]
-                                            target_span = 2.195
-                                            target_pos = target_span - med_back
-                                            walls[other_k] = T2Wall(
-                                                n=walls[other_k].n,
-                                                pos_hint=walls[other_k].pos_hint,
-                                                pos_metric=target_pos,
-                                                source="drywall_snap",
-                                            )
-                                            break
-
-                                # 2. Short axis drywall snapping
-                                for k in short_pair:
-                                    proj_k = wall_band_xy @ dirs[k] if len(wall_band_xy) else np.zeros(0)
-                                    other_k = short_pair[1] if k == short_pair[0] else short_pair[0]
-                                    sub_r = proj_k[(proj_k >= 0.45) & (proj_k <= 0.65)]
-                                    if len(sub_r) >= 30:
-                                        med_r = float(np.median(sub_r))
-                                        walls[k] = T2Wall(
-                                            n=walls[k].n,
-                                            pos_hint=walls[k].pos_hint,
-                                            pos_metric=med_r,
-                                            source="drywall_snap",
-                                        )
-                                        target_other = 1.418 - med_r
-                                        walls[other_k] = T2Wall(
-                                            n=walls[other_k].n,
-                                            pos_hint=walls[other_k].pos_hint,
-                                            pos_metric=target_other,
-                                            source="drywall_snap",
-                                        )
-                                        break
-
-                        mask = np.ones(len(kept), dtype=bool)
-                        for w in walls:
-                            mask &= (kept[:, :2] @ w.n) <= (w.pos_metric + T2_CLIP_MARGIN_M)
+                        mask = _clip_mask_for_t2_walls(kept[:, :2], walls)
                         kept = kept[mask]
                         forced_wall_positions = [(w.n, float(w.pos_metric)) for w in walls]
                         n_w = len(forced_wall_positions)

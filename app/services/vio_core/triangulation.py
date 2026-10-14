@@ -108,6 +108,7 @@ def triangulate_dlt_single(
     t2: np.ndarray,
     K: np.ndarray,
     min_parallax_deg: float = 1.0,
+    max_depth: float | None = None,
 ) -> TriangulationResult:
     """Performs DLT triangulation (SVD on 4x4 matrix) for a single 2D keypoint pair.
 
@@ -173,6 +174,8 @@ def triangulate_dlt_single(
 
     # Validity flag check: positive depths in both cameras, positive inverse depth, and sufficient parallax
     valid = bool((z1 > 0.01) and (z2 > 0.01) and (rho > 0.0) and (parallax_deg >= min_parallax_deg))
+    if max_depth is not None and max_depth > 0:
+        valid = valid and bool((z1 <= max_depth) and (z2 <= max_depth))
 
     return TriangulationResult(
         point_3d=P_w,
@@ -192,6 +195,7 @@ def triangulate_dlt_batch(
     t2: np.ndarray,
     K: np.ndarray,
     min_parallax_deg: float = 1.0,
+    max_depth: float | None = None,
 ) -> BatchTriangulationResult:
     """Vectorised twin of triangulate_dlt_single for N pairs sharing the second camera pose.
 
@@ -276,6 +280,8 @@ def triangulate_dlt_batch(
     parallax_deg[too_close] = 0.0
 
     valid = (z1 > 0.01) & (z2 > 0.01) & (rho > 0.0) & (parallax_deg >= min_parallax_deg) & ~degenerate
+    if max_depth is not None and max_depth > 0:
+        valid = valid & (z1 <= max_depth) & (z2 <= max_depth)
 
     # Degenerate rows mirror the single version's early return (all zeros, invalid)
     P_w[degenerate] = 0.0
@@ -301,6 +307,7 @@ def triangulate_dlt(
     t2: np.ndarray,
     K: np.ndarray,
     min_parallax_deg: float = 1.0,
+    max_depth: float | None = None,
 ) -> Union[TriangulationResult, list[TriangulationResult]]:
     """DLT triangulation for keypoints (supports single point pair or batch of point pairs).
 
@@ -313,6 +320,7 @@ def triangulate_dlt(
         t2: Camera 2 position t_wc2 (3,).
         K: Camera intrinsic matrix (3, 3).
         min_parallax_deg: Minimum parallax angle threshold (default 1.0 deg).
+        max_depth: Optional maximum depth threshold.
 
     Returns:
         TriangulationResult for single point input, or list[TriangulationResult] for batch input.
@@ -324,11 +332,11 @@ def triangulate_dlt(
         results = []
         for p1, p2 in zip(pts1_arr, pts2_arr):
             results.append(
-                triangulate_dlt_single(p1, p2, R1, t1, R2, t2, K, min_parallax_deg)
+                triangulate_dlt_single(p1, p2, R1, t1, R2, t2, K, min_parallax_deg, max_depth=max_depth)
             )
         return results
     else:
-        return triangulate_dlt_single(pts1_arr, pts2_arr, R1, t1, R2, t2, K, min_parallax_deg)
+        return triangulate_dlt_single(pts1_arr, pts2_arr, R1, t1, R2, t2, K, min_parallax_deg, max_depth=max_depth)
 
 
 def triangulate_point(

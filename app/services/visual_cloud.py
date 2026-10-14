@@ -166,6 +166,13 @@ def crop_to_layout_polygon(
     except Exception:
         return work
     pts = np.asarray(work.points, dtype=float)
+    if len(pts) >= 50:
+        p_span_x = float(np.percentile(pts[:, 0], 98) - np.percentile(pts[:, 0], 2))
+        p_span_y = float(np.percentile(pts[:, 1], 98) - np.percentile(pts[:, 1], 2))
+        p_area = max(0.1, p_span_x * p_span_y)
+        if poly.area < 0.60 * p_area:
+            # Layout polygon covers only a partial sub-region of the full room; do not truncate the room!
+            return work
     mask_xy = np.asarray(contains_xy(grown, pts[:, 0], pts[:, 1]), dtype=bool)
     height_m = layout_height_m(layout)
     z_min = -float(SUBSURFACE_MARGIN_M)
@@ -275,7 +282,51 @@ def get_metric_vggt_cloud(
     else:
         cols_arr = np.full((len(pts_vggt), 3), 0.85, dtype=float)
 
-    # 1. Determine Sim(3) registration parameters (s, R, t)
+    # 1. Produce pcd_room: Clean, Manhattan-aligned, and scaled to Ground Truth metric dimensions
+    from app.services.manhattan_alignment import (
+        align_point_cloud_to_manhattan,
+        clean_and_align_point_cloud,
+        scale_point_cloud_to_metric,
+    )
+
+    clean_ply = getattr(vggt_prior, "clean_ply_path", None)
+    if clean_ply and os.path.isfile(clean_ply) and os.path.getsize(clean_ply) > 0:
+        manhattan_pcd = o3d.io.read_point_cloud(clean_ply)
+    else:
+        work_cloud = o3d.geometry.PointCloud()
+        work_cloud.points = o3d.utility.Vector3dVector(pts_vggt)
+        work_cloud.colors = o3d.utility.Vector3dVector(cols_arr)
+
+        if len(work_cloud.points) > 500_000:
+            manhattan_pcd, _ = clean_and_align_point_cloud(
+                work_cloud, voxel=0.003, stat_neighbors=16, stat_std=2.8
+            )
+        elif len(work_cloud.points) > 50:
+            cleaned_sor, _ = work_cloud.remove_statistical_outlier(nb_neighbors=16, std_ratio=2.8)
+            manhattan_pcd, _ = align_point_cloud_to_manhattan(cleaned_sor)
+        else:
+            manhattan_pcd = work_cloud
+
+    target_h = None
+    target_l = None
+    target_w = None
+    if isinstance(layout, dict):
+        room_dict = layout.get("room", {})
+        target_h = room_dict.get("clear_interior_height_m") or room_dict.get("height_meters")
+        target_l = room_dict.get("clear_interior_long_side_m") or room_dict.get("width_m")
+        target_w = room_dict.get("clear_interior_short_side_m") or room_dict.get("depth_m")
+
+    if len(manhattan_pcd.points) >= 50:
+        pcd_room = scale_point_cloud_to_metric(
+            manhattan_pcd,
+            target_height_m=float(target_h) if target_h is not None else None,
+            target_length_m=float(target_l) if target_l is not None else None,
+            target_width_m=float(target_w) if target_w is not None else None,
+        )
+    else:
+        pcd_room = manhattan_pcd
+
+    # 2. Determine Sim(3) registration parameters (s, R, t) for pcd_vio
     s_use, R_use, t_use = None, None, None
     if isinstance(layout, dict):
         diag_vggt = layout.get("diagnostics", {}).get("vggt_prior", {})
@@ -345,17 +396,6 @@ def get_metric_vggt_cloud(
     pcd_vio.points = o3d.utility.Vector3dVector(p_vio)
     pcd_vio.colors = o3d.utility.Vector3dVector(cols_arr)
 
-    # 2. Transform to room canonical coordinates
-    if isinstance(layout, dict):
-        pcd_room = apply_layout_frames(pcd_vio, layout, gravity)
-        pts_r = np.asarray(pcd_room.points).copy()
-        if len(pts_r) > 100:
-            z_floor = float(np.percentile(pts_r[:, 2], 0.5))
-            pts_r[:, 2] -= z_floor
-            pcd_room.points = o3d.utility.Vector3dVector(pts_r)
-    else:
-        pcd_room = o3d.geometry.PointCloud(pcd_vio)
-
     return pcd_room, pcd_vio
 
 
@@ -407,18 +447,17 @@ def build_poisson_mesh_from_cloud(
 
     # Crop to room bounding box with margin
     margin = float(ROOM_CROP_MARGIN_M)
-    if len(xy) >= 4:
-        min_b = np.array([float(xy[:, 0].min()) - margin, float(xy[:, 1].min()) - margin, -0.05])
-        max_b = np.array([float(xy[:, 0].max()) + margin, float(xy[:, 1].max()) + margin, h + 0.05])
-        bbox = o3d.geometry.AxisAlignedBoundingBox(min_bound=min_b, max_bound=max_b)
-        mesh = mesh.crop(bbox)
-    elif isinstance(layout, dict) and "room" in layout:
-        w = float(layout.get("room", {}).get("width_m", 2.0))
-        d = float(layout.get("room", {}).get("depth_m", 1.5))
-        min_b = np.array([-margin, -margin, -0.05])
-        max_b = np.array([w + margin, d + margin, h + 0.05])
-        bbox = o3d.geometry.AxisAlignedBoundingBox(min_bound=min_b, max_bound=max_b)
-        mesh = mesh.crop(bbox)
+    p_pts = np.asarray(pcd_ds.points)
+    p_min = p_pts.min(axis=0) if len(p_pts) else np.zeros(3)
+    p_max = p_pts.max(axis=0) if len(p_pts) else np.ones(3)
+    min_x = min(float(xy[:, 0].min()), p_min[0]) if len(xy) >= 4 else p_min[0]
+    max_x = max(float(xy[:, 0].max()), p_max[0]) if len(xy) >= 4 else p_max[0]
+    min_y = min(float(xy[:, 1].min()), p_min[1]) if len(xy) >= 4 else p_min[1]
+    max_y = max(float(xy[:, 1].max()), p_max[1]) if len(xy) >= 4 else p_max[1]
+    min_b = np.array([min_x - margin, min_y - margin, -0.05])
+    max_b = np.array([max_x + margin, max_y + margin, max(h, p_max[2]) + 0.05])
+    bbox = o3d.geometry.AxisAlignedBoundingBox(min_bound=min_b, max_bound=max_b)
+    mesh = mesh.crop(bbox)
 
     # Clean degenerate artifacts
     mesh.remove_degenerate_triangles()

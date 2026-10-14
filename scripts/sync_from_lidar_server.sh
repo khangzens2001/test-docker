@@ -42,13 +42,13 @@ echo "📦 2. Đồng bộ app/pipeline/..."
 rsync -av --delete --exclude="__pycache__" "$SOURCE_DIR/app/pipeline/" "$TARGET_DIR/app/pipeline/"
 
 echo "📦 3. Đồng bộ app/services/..."
-rsync -av --delete --exclude="__pycache__" "$SOURCE_DIR/app/services/" "$TARGET_DIR/app/services/"
+rsync -av --delete --exclude="__pycache__" --exclude="dashboard.py" "$SOURCE_DIR/app/services/" "$TARGET_DIR/app/services/"
 
 echo "📦 4. Đồng bộ app/schemas/..."
 rsync -av --delete --exclude="__pycache__" "$SOURCE_DIR/app/schemas/" "$TARGET_DIR/app/schemas/"
 
-echo "📦 5. Đồng bộ app/core/ (loại bỏ Celery & SQLite DB, bảo tồn MODEL_WEIGHTS_PATH)..."
-rsync -av --exclude="__pycache__" "$SOURCE_DIR/app/core/" "$TARGET_DIR/app/core/"
+echo "📦 5. Đồng bộ app/core/ (loại bỏ Celery, SQLite DB & JWT, bảo tồn MODEL_WEIGHTS_PATH)..."
+rsync -av --exclude="__pycache__" --exclude="security.py" "$SOURCE_DIR/app/core/" "$TARGET_DIR/app/core/"
 rm -f "$TARGET_DIR/app/core/celery_app.py" "$TARGET_DIR/app/core/database.py" "$TARGET_DIR/app/core/cleanup.py"
 
 # Đảm bảo MODEL_WEIGHTS_PATH được resolve đường dẫn tuyệt đối chuẩn
@@ -144,7 +144,14 @@ except ImportError:
         
     if old_load in c:
         c = c.replace(old_load, new_load)
-        c = c.replace('if \"model\" in locals():\n            del model', 'if should_del_model and \"model\" in locals():\n            del model')
+        c = c.replace(
+            'model.aggregator.forward = _optimized_aggregator_forward',
+            'orig_aggregator_forward = getattr(model.aggregator, \"forward\", None)\n    model.aggregator.forward = _optimized_aggregator_forward',
+        )
+        c = c.replace(
+            'if \"model\" in locals():\n            del model',
+            'if not should_del_model and \"model\" in locals() and \"orig_aggregator_forward\" in locals() and orig_aggregator_forward is not None:\n            model.aggregator.forward = orig_aggregator_forward\n        if should_del_model and \"model\" in locals():\n            del model',
+        )
 
     with open(path, 'w', encoding='utf-8') as f:
         f.write(c)
