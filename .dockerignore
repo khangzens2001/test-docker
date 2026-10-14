@@ -1,0 +1,15 @@
+.git
+.github
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.DS_Store
+*.log
+images_to_test/
+vggt_room3d_jobs/
+data/
+.env
+.env.*
+vggt-space/

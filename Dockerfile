@@ -42,14 +42,13 @@ RUN conda install -y -c conda-forge libstdcxx-ng && \
     pip install --no-cache-dir -r requirements_demo.txt && \
     pip install --no-cache-dir fastapi uvicorn python-multipart aiofiles boto3 open3d gdown runpod huggingface-hub==0.24.0 safetensors opencv-python-headless scipy matplotlib shapely pandas trimesh ezdxf pypdf Pillow onnxruntime pyarrow pydantic-settings cachetools numba requests
 
-# 5. Tải trước trọng số model VGGT-1B từ Hugging Face và lưu vào cache (không load vào RAM để tránh OOM)
+# 5. Tải trước trọng số model VGGT-1B từ Hugging Face và lưu vào cache (chỉ lấy model.safetensors, bỏ qua model.pt trùng lặp 4.7GB)
 ARG HF_TOKEN=""
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/VGGT-1B', token='${HF_TOKEN}' if '${HF_TOKEN}' else None)"
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/VGGT-1B', ignore_patterns=['*.pt'], token='${HF_TOKEN}' if '${HF_TOKEN}' else None)"
 
-# 5b. Đồng bộ phiên bản NumPy, SciPy, Pandas, PyArrow, OpenCV 4.11, ImageHash và ONNX Runtime GPU (CUDAExecutionProvider) khớp chuẩn lidar_room_scan_server
+# 5b. Đồng bộ phiên bản NumPy, SciPy, Pandas, PyArrow, OpenCV 4.11, Pillow 12.3, ImageHash và ONNX Runtime GPU (CUDAExecutionProvider) khớp chuẩn lidar_room_scan_server
 RUN pip uninstall -y onnxruntime opencv-python opencv-python-headless && \
-    pip install --no-cache-dir numpy==1.26.4 scipy==1.15.3 pandas==2.3.3 pyarrow==25.0.1 opencv-python-headless==4.11.0.86 onnxruntime-gpu==1.23.2 ImageHash==4.3.2
-RUN pip install --no-cache-dir pillow==12.3.0
+    pip install --no-cache-dir numpy==1.26.4 scipy==1.15.3 pandas==2.3.3 pyarrow==25.0.1 opencv-python-headless==4.11.0.86 onnxruntime-gpu==1.23.2 ImageHash==4.3.2 pillow==12.3.0
 
 # 6. Copy core modules, app, weights, floorplan generator, icons, scripts, file API Server chính và handler vào thư mục space
 COPY app /app/vggt-space/app
