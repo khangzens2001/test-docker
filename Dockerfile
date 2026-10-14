@@ -49,6 +49,7 @@ RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(
 # 5b. Đồng bộ phiên bản NumPy, SciPy, Pandas, PyArrow, OpenCV 4.11, ImageHash và ONNX Runtime GPU (CUDAExecutionProvider) khớp chuẩn lidar_room_scan_server
 RUN pip uninstall -y onnxruntime opencv-python opencv-python-headless && \
     pip install --no-cache-dir numpy==1.26.4 scipy==1.15.3 pandas==2.3.3 pyarrow==25.0.1 opencv-python-headless==4.11.0.86 onnxruntime-gpu==1.23.2 ImageHash==4.3.2
+RUN pip install --no-cache-dir pillow==12.3.0
 
 # 6. Copy core modules, app, weights, floorplan generator, icons, scripts, file API Server chính và handler vào thư mục space
 COPY app /app/vggt-space/app
