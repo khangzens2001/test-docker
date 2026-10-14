@@ -46,8 +46,13 @@ RUN conda install -y -c conda-forge libstdcxx-ng && \
 ARG HF_TOKEN=""
 RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/VGGT-1B', token='${HF_TOKEN}' if '${HF_TOKEN}' else None)"
 
+# 5b. Đồng bộ phiên bản NumPy, SciPy, Pandas, PyArrow, OpenCV 4.11, ImageHash và ONNX Runtime GPU (CUDAExecutionProvider) khớp chuẩn lidar_room_scan_server
+RUN pip uninstall -y onnxruntime opencv-python opencv-python-headless && \
+    pip install --no-cache-dir numpy==1.26.4 scipy==1.15.3 pandas==2.3.3 pyarrow==25.0.1 opencv-python-headless==4.11.0.86 onnxruntime-gpu==1.23.2 ImageHash==4.3.2
+
 # 6. Copy core modules, app, weights, floorplan generator, icons, scripts, file API Server chính và handler vào thư mục space
 COPY app /app/vggt-space/app
+COPY keyframe_select /app/vggt-space/keyframe_select
 COPY weights /app/vggt-space/weights
 COPY floorplan_generator /app/vggt-space/floorplan_generator
 COPY icon /app/vggt-space/icon

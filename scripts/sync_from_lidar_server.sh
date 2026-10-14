@@ -96,6 +96,13 @@ with open(path, 'w', encoding='utf-8') as f:
     echo "  -> Đã cập nhật export_vggt_keyframes.py không phụ thuộc app.tasks.pipeline."
 fi
 
+KEYFRAME_SELECT_SRC="$(dirname "$SOURCE_DIR")/selected_keyframe/src/keyframe_select"
+if [ -d "$KEYFRAME_SELECT_SRC" ]; then
+    echo "📦 7b. Đồng bộ keyframe_select/..."
+    mkdir -p "$TARGET_DIR/keyframe_select"
+    rsync -av --delete --exclude="__pycache__" "$KEYFRAME_SELECT_SRC/" "$TARGET_DIR/keyframe_select/"
+fi
+
 # Tối ưu vggt_runner.py để tái sử dụng preloaded model từ handler/backend và tương thích docker path
 python3 -c "
 import os
