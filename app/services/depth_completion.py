@@ -65,7 +65,7 @@ def analytical_z_plane(
     return out
 
 
-def fit_vertical_plane_2dof(
+def _ransac_single_gravity_plane(
     points_xyz: np.ndarray, g_cam: np.ndarray, z_max_ghost: float | None = None
 ) -> dict | None:
     pts = np.asarray(points_xyz, dtype=np.float64)
@@ -114,7 +114,6 @@ def fit_vertical_plane_2dof(
     N = nt / nn[:, None]
     D = -np.sum(N * pts_i, axis=1)
 
-    # Vectorize distance computation: R = |pts @ N.T + D| shape (n_pts, P)
     R = np.abs(pts @ N.T + D)
     inlier_mask = R < PLANE_INLIER_M
     inlier_counts = np.sum(inlier_mask, axis=0)
@@ -124,13 +123,10 @@ def fit_vertical_plane_2dof(
         inlier_index = np.flatnonzero(inlier_mask[:, c_idx])
         xyz_i = pts[inlier_index]
         med_z = float(np.median(xyz_i[:, 2]))
-        # Standoff guard (criterion 3)
         if med_z < PLANE_MIN_STANDOFF_M:
             continue
-        # Ghost ceiling guard
         if z_max_ghost is not None and med_z > float(z_max_ghost):
             continue
-        # Fixture span guards (criterion 4)
         dx = float(xyz_i[:, 0].max() - xyz_i[:, 0].min())
         dy = float(xyz_i[:, 1].max() - xyz_i[:, 1].min())
         dz = float(xyz_i[:, 2].max() - xyz_i[:, 2].min())
@@ -142,6 +138,40 @@ def fit_vertical_plane_2dof(
             best_z = med_z
             best = {"n": N[c_idx], "D": float(D[c_idx]), "inlier_index": inlier_index, "median_z": med_z}
     return best
+
+
+def fit_multi_planes_gravity_constrained(
+    points_xyz: np.ndarray,
+    g_cam: np.ndarray,
+    z_max_ghost: float | None = None,
+    max_planes: int = 3,
+) -> list[dict]:
+    """Fit up to max_planes distinct gravity-constrained vertical planes sequentially."""
+    pts = np.asarray(points_xyz, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < PLANE_MIN_INLIERS:
+        return []
+    planes: list[dict] = []
+    rem_mask = np.ones(len(pts), dtype=bool)
+    for _ in range(max_planes):
+        rem_idx = np.flatnonzero(rem_mask)
+        if len(rem_idx) < PLANE_MIN_INLIERS:
+            break
+        cand = _ransac_single_gravity_plane(pts[rem_idx], g_cam, z_max_ghost=z_max_ghost)
+        if cand is None:
+            break
+        n_c = np.asarray(cand["n"], dtype=np.float64)
+        if any(abs(float(np.dot(n_c, np.asarray(p["n"], dtype=np.float64)))) >= 0.85 for p in planes):
+            rem_mask[rem_idx[cand["inlier_index"]]] = False
+            continue
+        global_inliers = rem_idx[cand["inlier_index"]]
+        planes.append({
+            "n": n_c,
+            "D": float(cand["D"]),
+            "inlier_index": global_inliers,
+            "median_z": float(cand["median_z"]),
+        })
+        rem_mask[global_inliers] = False
+    return planes
 
 
 def inlier_support_mask(
@@ -231,6 +261,53 @@ def pregate_sparse_tof(
     return out, int(np.count_nonzero(drop_mask))
 
 
+def flatten_mirror_cavity_depth(
+    dense_metric: np.ndarray,
+    sparse_status: np.ndarray | None,
+    plane: np.ndarray | dict,
+    K: np.ndarray,
+    inlier_hull_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, int]:
+    """Flatten mirror/glass/multipath phantom cavities inside a supported wall plane without touching foreground objects."""
+    out = np.array(dense_metric, dtype=np.float32, copy=True)
+    if isinstance(plane, dict):
+        n = np.asarray(plane["n"], dtype=np.float64).reshape(3)
+        D = float(plane["D"])
+    else:
+        p_arr = np.asarray(plane, dtype=np.float64).reshape(4)
+        n, D = p_arr[:3], float(p_arr[3])
+    h, w = out.shape
+    zmap = analytical_z_plane(n, D, K, h, w)
+    valid = np.isfinite(zmap) & (zmap > INPAINT_Z_MIN_M) & (zmap < INPAINT_Z_MAX_M)
+    if inlier_hull_mask is not None:
+        valid &= np.asarray(inlier_hull_mask) > 0
+    if not np.any(valid):
+        return out, 0
+
+    anom_region = np.zeros((h, w), dtype=bool)
+    if sparse_status is not None and sparse_status.shape == out.shape:
+        st = np.asarray(sparse_status, dtype=np.int32)
+        anom_pts = (st != 0) & (st != 5) & (st != 9)
+        if np.any(anom_pts):
+            if cv2 is not None:
+                rad = max(28, int(round(0.08 * max(h, w))))
+                k_anom = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rad + 1, 2 * rad + 1))
+                anom_region = cv2.dilate(anom_pts.astype(np.uint8), k_anom) > 0
+            else:
+                anom_region = anom_pts
+
+    # Only flatten pixels that bulge BEHIND the wall plane (never flatten foreground obstacles where out < zmap)
+    cavity_mask = valid & (
+        (anom_region & (out > zmap + PLANE_INLIER_M))
+        | (out > zmap + PLANE_BEHIND_M)
+        | (anom_region & (out <= 0.0))
+    )
+    count = int(np.count_nonzero(cavity_mask))
+    if count > 0:
+        out[cavity_mask] = zmap[cavity_mask].astype(np.float32)
+    return out, count
+
+
 def inpaint_planar_depth(
     dense_metric: np.ndarray,
     pre_huber_depth: np.ndarray,
@@ -271,6 +348,7 @@ def inpaint_planar_depth(
         out[cc] = zmap[cc].astype(np.float32)
         painted += int(np.count_nonzero(cc))
     return out, painted
+
 
 
 class DepthorModelManager:
@@ -380,7 +458,11 @@ class DepthCompletionService:
         }
 
     def align_scale_shift(
-        self, rel_depth: np.ndarray, sparse_tof: np.ndarray, mask: np.ndarray
+        self,
+        rel_depth: np.ndarray,
+        sparse_tof: np.ndarray,
+        mask: np.ndarray,
+        sparse_status: np.ndarray | None = None,
     ) -> np.ndarray:
         if not np.any(mask):
             rel_median = np.median(rel_depth)
@@ -393,6 +475,10 @@ class DepthCompletionService:
 
         y = sparse_tof[mask]
         x = rel_depth[mask]
+        w_pts = np.ones_like(y, dtype=np.float64)
+        if sparse_status is not None and sparse_status.shape == sparse_tof.shape:
+            st = sparse_status[mask]
+            w_pts = np.where(st == 5, 1.0, np.where(st == 9, 0.35, 0.15))
 
         if len(y) < 2:
             scale = np.median(y) / np.median(x) if np.median(x) > 0 else 1.0
@@ -406,12 +492,17 @@ class DepthCompletionService:
             indices = np.unique(np.linspace(0, len(x) - 1, 500, dtype=int))
             x = x[indices]
             y = y[indices]
+            w_pts = w_pts[indices]
 
-        s0 = np.median(y) / np.median(x) if np.median(x) > 0 else 1.0
+        high_conf = w_pts >= 0.9
+        if np.count_nonzero(high_conf) >= 4 and np.median(x[high_conf]) > 0:
+            s0 = np.median(y[high_conf]) / np.median(x[high_conf])
+        else:
+            s0 = np.median(y) / np.median(x) if np.median(x) > 0 else 1.0
 
         def res(p):
             s, c = p
-            return (s * x + c) - y
+            return w_pts * ((s * x + c) - y)
 
         try:
             # Explicitly specify Huber loss f_scale=0.1 and scale bound s based on s0
@@ -490,12 +581,32 @@ class DepthCompletionService:
         *,
         g_cam: np.ndarray | None = None,
         z_max_ghost: float | None = None,
+        sparse_status: np.ndarray | None = None,
     ) -> np.ndarray:
         h, w, _ = rgb.shape
         work = np.array(sparse_tof, dtype=np.float32, copy=True)
+        status_dropped = 0
+        if sparse_status is not None and sparse_status.shape == work.shape:
+            st = np.asarray(sparse_status, dtype=np.int32)
+            valid_tof = (work > 0.05) & (work < 8.0)
+            bad_st = valid_tof & (st != 0) & (st != 5) & (st != 9)
+            if np.any(bad_st):
+                status_dropped += int(np.count_nonzero(bad_st))
+                work[bad_st] = 0.0
+            s5_mask = (work > 0.05) & (work < 8.0) & (st == 5)
+            s9_mask = (work > 0.05) & (work < 8.0) & (st == 9)
+            if np.count_nonzero(s5_mask) >= 8 and np.any(s9_mask):
+                p90_s5 = float(np.percentile(work[s5_mask], 90))
+                s9_outlier = s9_mask & (work > max(1.6 * p90_s5, p90_s5 + 0.80))
+                if np.any(s9_outlier):
+                    status_dropped += int(np.count_nonzero(s9_outlier))
+                    work[s9_outlier] = 0.0
+
         fusion_off = g_cam is None and z_max_ghost is None
-        dropped = 0
+        dropped = status_dropped
         trusted = None
+        secondary = None
+        secondary_uv = None
         inpainted = 0
         reason = "fusion_off"
         input_empty = not np.any((work > 0.05) & (work < 8.0))
@@ -510,7 +621,56 @@ class DepthCompletionService:
                     x = (cols - cx) / fx * z
                     y = (rows - cy) / fy * z
                     pts = np.column_stack([x, y, z])
-                    trusted = fit_vertical_plane_2dof(pts, g_cam, z_max_ghost=z_max_ghost)
+                    # Prefer status==5 points for primary plane fitting when abundant
+                    if sparse_status is not None and sparse_status.shape == work.shape:
+                        st_rc = sparse_status[rows, cols]
+                        s5_idx = np.flatnonzero(st_rc == 5)
+                        if len(s5_idx) >= PLANE_MIN_INLIERS:
+                            s5_planes = fit_multi_planes_gravity_constrained(
+                                pts[s5_idx], g_cam, z_max_ghost=z_max_ghost, max_planes=1
+                            )
+                            if s5_planes:
+                                fit_s5 = s5_planes[0]
+                                n_fit = np.asarray(fit_s5["n"], dtype=np.float64)
+                                d_fit = float(fit_s5["D"])
+                                inl_all = np.flatnonzero(np.abs(pts @ n_fit + d_fit) < PLANE_INLIER_M)
+                                trusted = {
+                                    "n": n_fit,
+                                    "D": d_fit,
+                                    "inlier_index": inl_all,
+                                    "median_z": float(np.median(pts[inl_all, 2])) if len(inl_all) > 0 else fit_s5["median_z"],
+                                }
+                    if trusted is None:
+                        multi_planes = fit_multi_planes_gravity_constrained(
+                            pts, g_cam, z_max_ghost=z_max_ghost, max_planes=2
+                        )
+                        if multi_planes:
+                            trusted = multi_planes[0]
+                            if len(multi_planes) > 1:
+                                secondary = multi_planes[1]
+                                sec_global_idx = secondary["inlier_index"]
+                                secondary_uv = np.column_stack([cols[sec_global_idx], rows[sec_global_idx]])
+                    # Check for a secondary vertical wall plane (e.g. orthogonal wall in a corner)
+                    if trusted is not None and secondary is None:
+                        rem_mask = np.ones(len(pts), dtype=bool)
+                        rem_mask[trusted["inlier_index"]] = False
+                        rem_idx = np.flatnonzero(rem_mask)
+                        if len(rem_idx) >= PLANE_MIN_INLIERS:
+                            sec_planes = fit_multi_planes_gravity_constrained(
+                                pts[rem_idx], g_cam, z_max_ghost=z_max_ghost, max_planes=1
+                            )
+                            if sec_planes:
+                                sec_fit = sec_planes[0]
+                                cos_ang = abs(float(np.dot(trusted["n"], sec_fit["n"])))
+                                if cos_ang < 0.85:  # distinct wall orientation (> ~31 deg)
+                                    sec_global_idx = rem_idx[sec_fit["inlier_index"]]
+                                    secondary = {
+                                        "n": sec_fit["n"],
+                                        "D": sec_fit["D"],
+                                        "inlier_index": sec_global_idx,
+                                        "median_z": sec_fit["median_z"],
+                                    }
+                                    secondary_uv = np.column_stack([cols[sec_global_idx], rows[sec_global_idx]])
                 uv = None
                 if trusted is not None:
                     uv = np.column_stack(
@@ -521,12 +681,14 @@ class DepthCompletionService:
                     reason = "no_gravity"
                 else:
                     reason = "no_plane_ghost_cap"
-                work, dropped = pregate_sparse_tof(work, intrinsics, trusted, uv, z_max_ghost)
+                work, pg_dropped = pregate_sparse_tof(work, intrinsics, trusted, uv, z_max_ghost)
+                dropped += int(pg_dropped)
             except Exception:
                 logger.warning("planar pre-gate failed; using original sparse ToF", exc_info=True)
                 work = np.array(sparse_tof, dtype=np.float32, copy=True)
                 dropped = 0
                 trusted = None
+                secondary = None
                 reason = "pregate_failed"
             remain = np.any((work > 0.05) & (work < 8.0))
             if (not remain) and (dropped > 0 or not input_empty):
@@ -568,13 +730,44 @@ class DepthCompletionService:
             rel_depth = np.random.uniform(0.5, 2.0, (h, w))
 
         clean_mask = self.remove_tof_anomalies(rel_depth, work, mask)
-        dense_metric = self.align_scale_shift(rel_depth, work, clean_mask)
+        dense_metric = self.align_scale_shift(rel_depth, work, clean_mask, sparse_status=sparse_status)
         if trusted is not None and session is not None:
             try:
                 plane = np.array([*trusted["n"], trusted["D"]], dtype=np.float64)
+                hull_mask = None
+                if secondary is not None and secondary_uv is not None and uv is not None:
+                    dil_px = max(INLIER_HULL_DILATE_PX, int(round(0.18 * max(h, w))))
+                    prim_hull = inlier_support_mask(h, w, uv, dilate_px=dil_px)
+                    sec_hull = inlier_support_mask(h, w, secondary_uv, dilate_px=INLIER_HULL_DILATE_PX)
+                    hull_mask = (prim_hull > 0) & (sec_hull == 0)
                 dense_metric, inpainted = inpaint_planar_depth(
-                    dense_metric, rel_depth, plane, intrinsics, inlier_hull_mask=None
+                    dense_metric, rel_depth, plane, intrinsics, inlier_hull_mask=hull_mask
                 )
+                if sparse_status is not None and uv is not None:
+                    prim_support = hull_mask if hull_mask is not None else inlier_support_mask(
+                        h, w, uv, dilate_px=INLIER_HULL_DILATE_PX
+                    )
+                    dense_metric, mirror_flat = flatten_mirror_cavity_depth(
+                        dense_metric, sparse_status, plane, intrinsics, inlier_hull_mask=prim_support
+                    )
+                    inpainted += int(mirror_flat)
+                if secondary is not None and secondary_uv is not None:
+                    sec_plane = np.array([*secondary["n"], secondary["D"]], dtype=np.float64)
+                    sec_hull_full = inlier_support_mask(
+                        h, w, secondary_uv, dilate_px=max(INLIER_HULL_DILATE_PX, int(round(0.15 * max(h, w))))
+                    )
+                    if uv is not None:
+                        prim_core = inlier_support_mask(h, w, uv, dilate_px=INLIER_HULL_DILATE_PX)
+                        sec_hull_full = (sec_hull_full > 0) & (prim_core == 0)
+                    dense_metric, inpainted_sec = inpaint_planar_depth(
+                        dense_metric, rel_depth, sec_plane, intrinsics, inlier_hull_mask=sec_hull_full
+                    )
+                    inpainted += int(inpainted_sec)
+                    if sparse_status is not None:
+                        dense_metric, mirror_sec = flatten_mirror_cavity_depth(
+                            dense_metric, sparse_status, sec_plane, intrinsics, inlier_hull_mask=sec_hull_full
+                        )
+                        inpainted += int(mirror_sec)
             except Exception:
                 logger.warning("planar inpaint failed; keeping aligned depth", exc_info=True)
                 inpainted = 0
@@ -590,4 +783,6 @@ class DepthCompletionService:
             "z_max_ghost": z_max_ghost,
         }
         return dense_metric
+
+
 

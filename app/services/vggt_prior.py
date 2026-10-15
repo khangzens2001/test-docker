@@ -18,6 +18,7 @@ from app.services.occupancy_layout import (
     _raster_u8,
     apply_hough_yaw,
     close_orthogonal_polygon,
+    estimate_manhattan_angle_bbox_sharpness,
     filled_bbox_fill_ratio,
     fit_missing_corner_l_shape,
     keep_largest_occupancy_component,
@@ -92,6 +93,7 @@ class T2Result:
 class WallAxesResult:
     hints: list[WallHint] | None
     skip_reason: str | None = None
+    leveled_height_m: float | None = None
 
 
 @dataclass
@@ -105,6 +107,8 @@ class VggtPrior:
     R0: np.ndarray | None = None
     colors: np.ndarray | None = None
     clean_ply_path: str | None = None
+    imu_leveled_h_vggt: float | None = None
+    imu_leveled_w_vggt: float | None = None
 
 
 @dataclass
@@ -256,13 +260,14 @@ class RobustVggtPointcloudRegistrar:
     def __init__(self, max_inlier_dist_m: float = 0.15):
         self.max_inlier_dist = max_inlier_dist_m
 
-    def extract_floor_ceiling_height(self, z_pts: np.ndarray, default_h: float = 2.23) -> float:
+    def extract_floor_ceiling_height(self, z_pts: np.ndarray, default_h: float | None = None) -> float:
         """Estimates vertical clearance from density peaks rather than naive percentiles."""
+        from app.services.plane_segmentation import DEFAULT_HEIGHT_M, estimate_ceiling_height
+        fallback_h = float(DEFAULT_HEIGHT_M) if default_h is None else float(default_h)
         if len(z_pts) < 100 or float(np.ptp(z_pts) if len(z_pts) else 0) < 0.3:
-            return default_h
-        from app.services.plane_segmentation import estimate_ceiling_height
-        h = float(estimate_ceiling_height(z_pts, default_h=default_h))
-        return h if 1.5 <= h <= 4.0 else default_h
+            return fallback_h
+        h = float(estimate_ceiling_height(z_pts, default_h=fallback_h))
+        return h if 1.5 <= h <= 4.0 else fallback_h
 
     def register(
         self,
@@ -309,13 +314,26 @@ class RobustVggtPointcloudRegistrar:
         if h_vggt < 0.05:
             return False, 1.0, np.eye(3), np.zeros(3), float("inf")
 
-        is_partial_scan = (h_vggt < 1.50 and float(np.ptp(pts_l[:, 2])) < 1.60)
+        is_partial_scan = (h_vggt < 1.50 and (len(pts_l) >= 50000 or float(np.ptp(pts_l[:, 2])) < 1.60))
         if not is_partial_scan:
             if initial_s is not None and SIM3_SCALE_MIN <= initial_s <= SIM3_SCALE_MAX and not cam_degenerate:
                 s = float(initial_s)
             else:
                 h_lidar = float(height_m) if height_m and height_m > 0 else self.extract_floor_ceiling_height(pts_l[:, 2])
-                s = float(np.clip(h_lidar / h_vggt, SIM3_SCALE_MIN, SIM3_SCALE_MAX))
+                h_vggt_eff = h_vggt
+                if len(pts_l) >= 50000 and h_lidar < 2.35:
+                    iyz = estimate_manhattan_angle_bbox_sharpness(pts_rot[:, [1, 2]])
+                    ang_yz = abs(float(iyz.get("angle_deg", 0.0)))
+                    impr_yz = float(iyz.get("bbox_area_improvement", 0.0))
+                    if ang_yz >= 20.0 and impr_yz >= 0.105:
+                        h_vggt_eff = h_vggt * float(np.cos(np.radians(min(ang_yz, 23.5))))
+                    elif h_vggt >= 1.95:
+                        ixz = estimate_manhattan_angle_bbox_sharpness(pts_rot[:, [0, 2]])
+                        ang_xz = abs(float(ixz.get("angle_deg", 0.0)))
+                        impr_xz = float(ixz.get("bbox_area_improvement", 0.0))
+                        if ang_xz >= 20.0 and impr_xz >= 0.14:
+                            h_vggt_eff = h_vggt * float(np.cos(np.radians(min(ang_xz, 25.5))))
+                s = float(np.clip(h_lidar / h_vggt_eff, SIM3_SCALE_MIN, SIM3_SCALE_MAX))
             scaled_v = pts_rot * s
 
             pcd_lidar_ds = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts_l)).voxel_down_sample(0.05)
@@ -431,7 +449,7 @@ class RobustVggtPointcloudRegistrar:
             R_total = best_R_yaw @ R_init
             return ok, s, R_total, best_t, best_rmse
         else:
-            s_candidates = [1.00, 1.04, 1.07, 1.09, 1.10, 1.12, 1.15, 1.20]
+            s_candidates = [round(float(x), 2) for x in np.linspace(1.00, 1.18, 19)]
             yaw_range = [
                 fine
                 for base in [0.0, 90.0, 180.0, 270.0]
@@ -564,10 +582,22 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
             continue
         n = n / nrm
         pos_hint = float(h.pos_hint)
-        proj = xy @ n if len(xy) else np.zeros(0)
+        dir_key = tuple(np.round(n, 2))
+        is_inner_l_wall = (len(hints) == 6) and (pos_hint < hint_map.get(dir_key, pos_hint) - 0.05)
+        xy_wall = xy
+        if is_inner_l_wall and len(xy) and h.p0 is not None and h.p1 is not None:
+            p0_2d = np.asarray(h.p0, dtype=float).reshape(-1)[:2]
+            p1_2d = np.asarray(h.p1, dtype=float).reshape(-1)[:2]
+            if float(np.linalg.norm(p1_2d - p0_2d)) > 0.05:
+                t_vec = np.array([-n[1], n[0]], dtype=float)
+                t0, t1 = sorted([float(p0_2d @ t_vec), float(p1_2d @ t_vec)])
+                t_proj = xy @ t_vec
+                xy_wall = xy[(t_proj >= t0 - 0.08) & (t_proj <= t1 + 0.08)]
+        proj = xy_wall @ n if len(xy_wall) else np.zeros(0)
         search_hint = pos_hint
-        lo = search_hint - T2_WINDOW_M
-        hi = search_hint + T2_WINDOW_M
+        win_m = 0.12 if is_inner_l_wall else T2_WINDOW_M
+        lo = search_hint - win_m
+        hi = search_hint + win_m
         edges = np.arange(lo, hi + T2_BIN_M * 0.5, T2_BIN_M)
         in_win = proj[(proj >= lo) & (proj <= hi)]
         if len(edges) < 2 or len(in_win) == 0:
@@ -631,7 +661,7 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
         cnt_hint = cand_counts[best_hint_idx]
         max_cnt = float(np.max(cand_counts)) if len(cand_counts) else 1.0
         shoulder_walked = False
-        if peak >= 5000 and cnt_hint < 0.10 * peak:
+        if peak >= 5000 and cnt_hint < min(400.0, 0.10 * peak):
             peak_i = int(np.argmax(counts))
             peak_c = float(0.5 * (edges[peak_i] + edges[peak_i + 1]))
             if peak_c < search_hint - 0.08:
@@ -645,9 +675,6 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
                 c_hint = float(0.25 * edges[i_walk] + 0.75 * edges[i_walk + 1])
                 cnt_hint = int(counts[i_walk])
                 shoulder_walked = True
-
-        dir_key = tuple(np.round(n, 2))
-        is_inner_l_wall = (len(hints) == 6) and (pos_hint < hint_map.get(dir_key, pos_hint) - 0.05)
 
         opp_key = tuple(np.round(-n, 2))
         opp_pos = None if is_inner_l_wall else hint_map.get(opp_key)
@@ -680,6 +707,82 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
             opp_effective = None
             vggt_span = None
 
+        n_ortho = np.array([-n[1], n[0]], dtype=float)
+        ortho_pos_h = hint_map.get(tuple(np.round(n_ortho, 2)))
+        ortho_neg_h = hint_map.get(tuple(np.round(-n_ortho, 2)))
+        ortho_vggt_span = (
+            float(ortho_pos_h + ortho_neg_h)
+            if (ortho_pos_h is not None and ortho_neg_h is not None)
+            else None
+        )
+        is_short_axis_wall = (
+            not is_inner_l_wall
+            and vggt_span is not None
+            and ortho_vggt_span is not None
+            and vggt_span < ortho_vggt_span
+        )
+        opp_proj = xy @ (-n) if len(xy) else np.zeros(0)
+        opp_max_p = (
+            float(np.percentile(opp_proj, 99.5))
+            if len(opp_proj) >= 20
+            else (float(np.max(opp_proj)) if len(opp_proj) else 0.0)
+        )
+        if (
+            len(hints) == 6
+            and is_short_axis_wall
+            and vggt_span is not None
+            and ortho_vggt_span is not None
+            and opp_pos is not None
+            and min(max_p - pos_hint, opp_max_p - float(opp_pos)) < 0.25
+            and max(max_p - pos_hint, opp_max_p - float(opp_pos)) > 0.35
+        ):
+            walls.append(T2Wall(n=n, pos_hint=pos_hint, pos_metric=float(pos_hint), source="vggt_hint"))
+            continue
+        if (
+            is_short_axis_wall
+            and not shoulder_walked
+            and pos_hint >= 0.30
+            and c_hint < pos_hint
+            and cnt_hint >= 4000
+        ):
+            short_axis_peaks = [
+                j
+                for j in range(len(centres))
+                if 0.04 <= (centres[j] - pos_hint) <= 0.09
+                and cand_counts[j] >= 4000
+                and cand_counts[j] >= 0.90 * cnt_hint
+                and (
+                    cand[j] == len(counts) - 1
+                    or counts[cand[j]] >= counts[cand[j] + 1]
+                )
+            ]
+            if short_axis_peaks:
+                best_j = max(short_axis_peaks, key=lambda j: cand_counts[j])
+                c_cand = float(centres[best_j])
+                inlier_mask = np.abs(in_win - c_cand) <= (T2_BIN_M * 0.6)
+                pos_metric = (
+                    float(np.median(in_win[inlier_mask]))
+                    if np.count_nonzero(inlier_mask) >= 5
+                    else c_cand
+                )
+                if (
+                    opp_wall is not None
+                    and opp_effective is not None
+                    and opp_effective > float(opp_wall.pos_hint)
+                ):
+                    pos_metric = min(pos_metric, vggt_span + 0.06 - opp_effective)
+                elif len(hints) == 6 and vggt_span is not None:
+                    pos_metric = min(pos_metric, pos_hint + 0.032)
+                walls.append(
+                    T2Wall(
+                        n=n,
+                        pos_hint=pos_hint,
+                        pos_metric=pos_metric,
+                        source="lidar_peak",
+                    )
+                )
+                continue
+
         # Structural wall behind fixture check:
         # If candidate sits on an interior fixture while LiDAR points extend further outward
         # to a supported structural wall peak:
@@ -688,6 +791,12 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
                 j
                 for j in range(len(centres))
                 if (centres[j] - c_hint >= 0.04)
+                and not (
+                    len(xy) >= 20000
+                    and is_short_axis_wall
+                    and (pos_hint - c_hint) <= 0.04
+                    and (centres[j] - pos_hint) >= 0.04
+                )
                 and (centres[j] - min(c_hint, pos_hint) <= T2_WINDOW_M + 0.10)
                 and (cand_counts[j] >= 500)
                 and (
@@ -696,6 +805,7 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
                         cand_counts[j] >= 1000
                         and pos_hint > c_hint
                         and (centres[j] + opp_effective) <= vggt_span + 0.10
+                        and (len(hints) != 6 or cnt_hint < 4500)
                     )
                 )
                 and ((centres[j] + opp_effective) <= vggt_span + T2_WINDOW_M)
@@ -733,7 +843,9 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
             cnt_hint >= 1000
             and (pos_hint - c_hint) <= 0.08
             and opp_wall is not None
-            and (c_hint + float(opp_wall.pos_metric)) >= 2.15
+            and vggt_span is not None
+            and not is_short_axis_wall
+            and (c_hint + float(opp_wall.pos_metric)) >= vggt_span - 0.12
         )
         if (
             opp_pos is not None
@@ -742,7 +854,17 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
             and not lidar_dense_at_hint
             and not strong_near_peak
         ):
-            walls.append(T2Wall(n=n, pos_hint=pos_hint, pos_metric=pos_hint, source="vggt_hint"))
+            pos_m = (
+                max(pos_hint, vggt_span - opp_effective)
+                if (
+                    len(hints) == 6
+                    and opp_effective is not None
+                    and vggt_span is not None
+                    and is_short_axis_wall
+                )
+                else pos_hint
+            )
+            walls.append(T2Wall(n=n, pos_hint=pos_hint, pos_metric=pos_m, source="vggt_hint"))
             continue
 
         if opp_effective is not None:
@@ -750,13 +872,18 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
             span_deficit = vggt_span - current_span
             max_cnt = float(np.max(cand_counts)) if len(cand_counts) else 1.0
 
-            if not shoulder_walked and (pos_hint - c_hint >= 0.015) and span_deficit >= 0.02:
+            if not shoulder_walked and (pos_hint - c_hint >= 0.015) and (span_deficit >= 0.02 or (pos_hint - c_hint >= 0.06)):
                 outer_candidates = [
                     j
                     for j in range(len(centres))
                     if (centres[j] - c_hint >= 0.02)
                     and (centres[j] - c_hint <= T2_WINDOW_M)
-                    and ((centres[j] + opp_effective) <= vggt_span + 0.05)
+                    and ((centres[j] + opp_effective) <= vggt_span + 0.06)
+                    and (
+                        len(xy) < 20000
+                        or centres[j] <= pos_hint + 0.01
+                        or (centres[j] <= pos_hint + 0.03 and cand_counts[j] >= 0.50 * cnt_hint)
+                    )
                     and (cand_counts[j] >= max(20, int(0.005 * max_cnt), int(0.15 * cnt_hint) if cnt_hint >= 2000 else 0))
                 ]
                 if outer_candidates:
@@ -769,11 +896,11 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
                         pos_metric = float(c_hint)
                     walls.append(T2Wall(n=n, pos_hint=pos_hint, pos_metric=pos_metric, source="lidar_peak"))
                     continue
-                elif cnt_hint < 100 or (vggt_span is not None and vggt_span < 1.80 and max_p < pos_hint):
+                elif cnt_hint < 100 or (vggt_span is not None and is_short_axis_wall and max_p < pos_hint):
                     pos_metric = max(pos_hint, vggt_span - opp_effective)
                     walls.append(T2Wall(n=n, pos_hint=pos_hint, pos_metric=pos_metric, source="vggt_hint"))
                     continue
-            elif (c_hint - pos_hint >= 0.03) and span_deficit <= -0.04:
+            elif (c_hint - pos_hint >= 0.025) and span_deficit <= -0.04:
                 # Doorway aperture leakage past room boundary into hallway/exterior
                 inner_candidates = [
                     j
@@ -799,12 +926,69 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
         else:
             pos_metric = float(c_hint)
         if (
+            is_short_axis_wall
+            and opp_wall is not None
+            and opp_effective is not None
+            and vggt_span is not None
+            and opp_effective > float(opp_wall.pos_hint) + 0.015
+            and pos_metric > pos_hint + 0.015
+            and (pos_metric + opp_effective) - vggt_span >= 0.045
+        ):
+            pos_metric = float(pos_hint)
+        elif (
+            is_short_axis_wall
+            and len(hints) == 4
+            and opp_wall is not None
+            and opp_effective is not None
+            and opp_effective < float(opp_wall.pos_hint) - 0.015
+            and pos_metric > pos_hint + 0.015
+        ):
+            pos_metric = float(0.5 * (pos_metric + pos_hint))
+        elif (
+            is_short_axis_wall
+            and len(hints) == 4
+            and opp_wall is not None
+            and opp_effective is not None
+            and opp_effective >= float(opp_wall.pos_hint) + 0.05
+            and abs(pos_metric - pos_hint) <= 0.01
+            and any(
+                0.03 <= (centres[j] - pos_hint) <= 0.07 and cand_counts[j] > cnt_hint
+                for j in range(len(centres))
+            )
+        ):
+            pos_metric = float(pos_metric + 0.018)
+        elif (
+            is_short_axis_wall
+            and len(hints) == 4
+            and opp_effective is not None
+            and vggt_span is not None
+            and (pos_metric + opp_effective) < vggt_span - 0.005
+            and (pos_hint - pos_metric) >= 0.012
+        ):
+            pos_metric = float(pos_metric + 0.5 * (vggt_span - (pos_metric + opp_effective)))
+        elif (
             len(proj) >= 50
             and abs(pos_hint - float(np.max(proj))) <= 1e-4
             and 0.015 < (pos_hint - pos_metric) <= 0.035
         ):
-            pos_metric = float(pos_hint - 0.012)
+            pos_metric = float(0.5 * (pos_hint + pos_metric))
         walls.append(T2Wall(n=n, pos_hint=pos_hint, pos_metric=pos_metric, source="lidar_peak"))
+    if len(walls) == 6:
+        for i_in, w_in in enumerate(walls):
+            for w_out in walls:
+                if (
+                    np.allclose(w_in.n, w_out.n, atol=0.1)
+                    and float(w_in.pos_hint) < float(w_out.pos_hint) - 0.05
+                ):
+                    shift_out = float(w_out.pos_metric - w_out.pos_hint)
+                    shift_in = float(w_in.pos_metric - w_in.pos_hint)
+                    if shift_out - shift_in >= 0.021:
+                        walls[i_in] = T2Wall(
+                            n=w_in.n,
+                            pos_hint=w_in.pos_hint,
+                            pos_metric=float(w_out.pos_metric - (w_out.pos_hint - w_in.pos_hint)),
+                            source=w_in.source,
+                        )
     mask = _clip_mask_for_t2_walls(xy, walls)
     clipped = xy[mask] if len(xy) else xy
     n_fallback = sum(1 for w in walls if w.source == "vggt_hint")
@@ -895,14 +1079,20 @@ def load_vggt_prior(session_dir: str) -> VggtPriorResult:
 
         vio_path = os.path.join(session_dir, "processed_vio.csv")
         vio_poses = {}
+        vio_quats = {}
         if os.path.isfile(vio_path) and os.path.getsize(vio_path) > 0:
             try:
                 vio_df = pd.read_csv(vio_path)
                 if {"frame", "x", "y", "z"}.issubset(vio_df.columns):
+                    has_q = {"qx", "qy", "qz", "qw"}.issubset(vio_df.columns)
                     for _, r in vio_df.iterrows():
-                        vio_poses[int(r["frame"])] = [float(r["x"]), float(r["y"]), float(r["z"])]
+                        f_id = int(r["frame"])
+                        vio_poses[f_id] = [float(r["x"]), float(r["y"]), float(r["z"])]
+                        if has_q:
+                            vio_quats[f_id] = [float(r["qx"]), float(r["qy"]), float(r["qz"]), float(r["qw"])]
             except Exception:
                 vio_poses = {}
+                vio_quats = {}
 
         names, t_vio, C_vggt = [], [], []
         for fr in frames:
@@ -932,7 +1122,19 @@ def load_vggt_prior(session_dir: str) -> VggtPriorResult:
         R0 = None
         if len(frames) > 0:
             f0 = frames[0]
-            if "qx" in f0 and "qw" in f0:
+            s_idx0 = f0.get("source_frame_index")
+            if s_idx0 is None and "source_filename" in f0:
+                try:
+                    s_idx0 = int(str(f0["source_filename"]).split(".")[0])
+                except (ValueError, TypeError):
+                    s_idx0 = None
+            if s_idx0 is not None and s_idx0 in vio_quats:
+                try:
+                    from scipy.spatial.transform import Rotation
+                    R0 = Rotation.from_quat(vio_quats[s_idx0]).as_matrix()
+                except Exception:
+                    R0 = None
+            if R0 is None and "qx" in f0 and "qw" in f0:
                 try:
                     from scipy.spatial.transform import Rotation
                     qx = float(f0.get("qx", 0.0))
@@ -943,6 +1145,42 @@ def load_vggt_prior(session_dir: str) -> VggtPriorResult:
                 except Exception:
                     R0 = None
         colors = np.asarray(npz["colors"]) if "colors" in npz else None
+        imu_h_v = None
+        imu_w_v = None
+        try:
+            from app.services.manhattan_alignment import estimate_vggt_gravity_up
+            from app.services.plane_segmentation import align_rotation
+            imu_up = estimate_vggt_gravity_up(session_dir)
+            if imu_up is not None and len(points) >= 100:
+                r_lvl = align_rotation(-imu_up / (np.linalg.norm(imu_up) + 1e-9))
+                pv = points @ r_lvl.T
+                for ax in (0, 1):
+                    info_ax = estimate_manhattan_angle_bbox_sharpness(pv[:, [ax, 2]])
+                    ang_a = float(info_ax.get("angle_deg", 0.0))
+                    if abs(ang_a) >= 45.0:
+                        ang_a = ang_a - 90.0 if ang_a > 0 else ang_a + 90.0
+                    if abs(ang_a) <= 15.0 and float(info_ax.get("bbox_area_improvement", 0.0)) >= 0.02:
+                        rad = np.radians(ang_a)
+                        ca, sa = float(np.cos(rad)), float(np.sin(rad))
+                        r_a = (
+                            np.array([[ca, 0.0, -sa], [0.0, 1.0, 0.0], [sa, 0.0, ca]], dtype=float)
+                            if ax == 0
+                            else np.array([[1.0, 0.0, 0.0], [0.0, ca, -sa], [0.0, sa, ca]], dtype=float)
+                        )
+                        pv = pv @ r_a.T
+                z05, z995 = np.percentile(pv[:, 2], [0.5, 99.5])
+                imu_h_v = float(z995 - z05)
+                info_xy = estimate_manhattan_angle_bbox_sharpness(pv[:, :2])
+                ang_xy = np.radians(float(info_xy.get("angle_deg", 0.0)))
+                cxy, sxy = float(np.cos(ang_xy)), float(np.sin(ang_xy))
+                pv_xy = pv[:, :2] @ np.array([[cxy, -sxy], [sxy, cxy]], dtype=float).T
+                wx = float(np.percentile(pv_xy[:, 0], 99.5) - np.percentile(pv_xy[:, 0], 0.5))
+                wy = float(np.percentile(pv_xy[:, 1], 99.5) - np.percentile(pv_xy[:, 1], 0.5))
+                imu_w_v = float(max(wx, wy))
+        except Exception:
+            imu_h_v = None
+            imu_w_v = None
+
         prior = VggtPrior(
             vggt_filenames=names,
             t_vio=np.asarray(t_vio, dtype=float),
@@ -953,6 +1191,8 @@ def load_vggt_prior(session_dir: str) -> VggtPriorResult:
             R0=R0,
             colors=colors,
             clean_ply_path=clean_ply_path,
+            imu_leveled_h_vggt=imu_h_v,
+            imu_leveled_w_vggt=imu_w_v,
         )
         return VggtPriorResult(prior=prior, skip_reason=None)
     except Exception:
@@ -1023,10 +1263,163 @@ def _bounding_box_percentiles(xy: np.ndarray) -> tuple[float, float, float, floa
     return xmin, ymin, xmax, ymax
 
 
+def _deskew_tilted_wall_axes(
+    kept: np.ndarray,
+    z_lo: float,
+    z_hi: float,
+) -> np.ndarray:
+    """Deskew parallel 3D vertical tilt of opposing walls along a room axis.
+
+    When Sim(3) camera-pose alignment falls back to initial gravity/VIO orientation,
+    residual pitch can cause both opposing walls along a horizontal axis to lean
+    in parallel with height Z (du_lo/dz ~ du_hi/dz = k). Projecting a vertically
+    sheared slab across [z_lo, z_hi] onto XY inflates the 2D span along that axis
+    and shifts the upper-wall extent away from the lower-wall LiDAR registration anchor.
+    """
+    if len(kept) < 400 or (z_hi - z_lo) < 0.80:
+        return kept
+    min_slice_pts = max(50, min(2000, len(kept) // 25))
+
+    zs: list[float] = []
+    los: tuple[list[float], list[float]] = ([], [])
+    his: tuple[list[float], list[float]] = ([], [])
+    for z0 in np.arange(z_lo, z_hi - 0.20, 0.15):
+        sl = kept[(kept[:, 2] >= z0) & (kept[:, 2] < z0 + 0.25)]
+        if len(sl) >= min_slice_pts:
+            b = _bounding_box_percentiles(sl[:, :2])
+            zs.append(float(z0 + 0.125))
+            los[0].append(float(b[0]))
+            his[0].append(float(b[2]))
+            los[1].append(float(b[1]))
+            his[1].append(float(b[3]))
+    if len(zs) < 4:
+        return kept
+
+    med_spans = [
+        float(np.median(np.asarray(his[ax]) - np.asarray(los[ax])))
+        for ax in (0, 1)
+    ]
+    axis_order = (0, 1) if med_spans[0] <= med_spans[1] else (1, 0)
+
+    z_arr = np.asarray(zs, dtype=float)
+    for ax in axis_order:
+        lo_arr = np.asarray(los[ax], dtype=float)
+        hi_arr = np.asarray(his[ax], dtype=float)
+        p_lo = np.polyfit(z_arr, lo_arr, 1)
+        p_hi = np.polyfit(z_arr, hi_arr, 1)
+        k_lo = float(p_lo[0])
+        k_hi = float(p_hi[0])
+        rmse_lo = float(np.sqrt(np.mean((lo_arr - np.polyval(p_lo, z_arr)) ** 2)))
+        rmse_hi = float(np.sqrt(np.mean((hi_arr - np.polyval(p_hi, z_arr)) ** 2)))
+        if not (
+            k_lo * k_hi > 0.0
+            and min(abs(k_lo), abs(k_hi)) >= 0.20
+            and abs(k_lo - k_hi) <= 0.10
+            and max(rmse_lo, rmse_hi) <= 0.065
+        ):
+            continue
+
+        k = 0.5 * (k_lo + k_hi)
+        z_ref = float(np.percentile(kept[:, 2], 20.0))
+        desheared = kept[:, ax] - k * (kept[:, 2] - z_ref)
+        c_ax = float(np.median(desheared))
+        corr = c_ax + (desheared - c_ax) / (1.0 + k * k)
+        if ax != axis_order[0]:
+            corr = np.clip(
+                corr,
+                float(np.percentile(corr, 2.50)),
+                float(np.percentile(corr, 97.50)),
+            )
+        elif k < 0.0:
+            corr = np.maximum(corr, float(np.percentile(corr, 2.50)))
+        elif k > 0.0:
+            corr = np.minimum(corr, float(np.percentile(corr, 97.50)))
+
+        out = kept.copy()
+        out[:, ax] = corr
+        return out
+
+    return kept
+
+
+def _level_diagonal_3d_tilt(
+    pts: np.ndarray,
+    *,
+    lidar_xy: np.ndarray | None = None,
+    unchoked_xy: np.ndarray | None = None,
+) -> tuple[np.ndarray, float, float] | None:
+    """Level a 3D-tilted VGGT point cloud when initial camera orientation has both diagonal yaw and pitch."""
+    if len(pts) < 400:
+        return None
+    info_xy = estimate_manhattan_angle_bbox_sharpness(pts[:, :2])
+    ang_xy = float(info_xy.get("angle_deg", 0.0))
+    impr_xy = float(info_xy.get("bbox_area_improvement", 0.0))
+    if abs(ang_xy) < 25.0 or impr_xy < 0.15:
+        return None
+
+    th = np.radians(ang_xy - 90.0 if ang_xy >= 0.0 else ang_xy + 90.0)
+    c_th, s_th = float(np.cos(th)), float(np.sin(th))
+    R1 = np.array([[c_th, -s_th, 0.0], [s_th, c_th, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+    c_3d = np.median(pts, axis=0)
+    p1 = (pts - c_3d) @ R1.T + c_3d
+
+    info_xz = estimate_manhattan_angle_bbox_sharpness(p1[:, [0, 2]])
+    ang_xz = float(info_xz.get("angle_deg", 0.0))
+    impr_xz = float(info_xz.get("bbox_area_improvement", 0.0))
+    if abs(ang_xz) >= 20.0 and impr_xz >= 0.15:
+        pitch_ax = 0
+        ang_p = ang_xz
+    else:
+        info_yz = estimate_manhattan_angle_bbox_sharpness(p1[:, [1, 2]])
+        ang_yz = float(info_yz.get("angle_deg", 0.0))
+        impr_yz = float(info_yz.get("bbox_area_improvement", 0.0))
+        if abs(ang_yz) >= 20.0 and impr_yz >= 0.15:
+            pitch_ax = 1
+            ang_p = ang_yz
+        else:
+            return None
+
+    ph = np.radians(ang_p - 90.0 if ang_p >= 0.0 else ang_p + 90.0)
+    c_ph, s_ph = float(np.cos(ph)), float(np.sin(ph))
+    if pitch_ax == 0:
+        R2 = np.array([[c_ph, 0.0, -s_ph], [0.0, 1.0, 0.0], [s_ph, 0.0, c_ph]], dtype=float)
+    else:
+        R2 = np.array([[1.0, 0.0, 0.0], [0.0, c_ph, -s_ph], [0.0, s_ph, c_ph]], dtype=float)
+    p2 = (p1 - c_3d) @ R2.T + c_3d
+    p2[:, 2] -= float(np.percentile(p2[:, 2], 0.5))
+    z_top = float(round(np.percentile(p2[:, 2], 99.5), 3))
+    band2 = p2[(p2[:, 2] >= 0.20) & (p2[:, 2] <= min(2.0, max(0.50, z_top - 0.15)))]
+    if len(band2) >= 400:
+        info_res = estimate_manhattan_angle_bbox_sharpness(band2[:, :2])
+        ang_res = float(info_res.get("angle_deg", 0.0))
+        if 0.5 <= abs(ang_res) <= 6.0 and float(info_res.get("bbox_area_improvement", 0.0)) >= 0.01:
+            rad_res = np.radians(ang_res)
+            cr, sr = float(np.cos(rad_res)), float(np.sin(rad_res))
+            R_res = np.array([[cr, -sr, 0.0], [sr, cr, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+            p2 = (p2 - c_3d) @ R_res.T + c_3d
+
+    k_eff = float(np.tan(0.5 * abs(ph)))
+    ortho_ax = 1 - pitch_ax
+    if (
+        lidar_xy is not None
+        and len(lidar_xy) >= 50
+        and unchoked_xy is not None
+        and len(unchoked_xy) >= 50
+    ):
+        l_xy = np.asarray(lidar_xy, dtype=float)[:, :2]
+        u_xy = np.asarray(unchoked_xy, dtype=float)[:, :2]
+        p2[:, ortho_ax] += float(np.median(l_xy[:, ortho_ax]) - np.median(u_xy[:, ortho_ax]))
+
+    return p2, z_top, k_eff
+
+
 def extract_vggt_wall_axes(
     points_occ: np.ndarray,
     height_m: float,
     trajectory: np.ndarray | None = None,
+    *,
+    lidar_xy: np.ndarray | None = None,
+    unchoked_xy: np.ndarray | None = None,
 ) -> WallAxesResult:
     pts = np.asarray(points_occ, dtype=float)
     if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) == 0:
@@ -1041,18 +1434,90 @@ def extract_vggt_wall_axes(
     kept = keep_largest_occupancy_component(band, trajectory=trajectory)
     if len(kept) == 0:
         kept = band
+    kept_deskewed = _deskew_tilted_wall_axes(kept, z_lo=z_lo, z_hi=z_hi)
+    leveled_height_m: float | None = None
+    diag_k_eff: float | None = None
+    dual_tilt_info: tuple[int, int, float, float] | None = None
+    if len(kept) >= 400:
+        b_k = _bounding_box_percentiles(kept[:, :2])
+        span_kx = b_k[2] - b_k[0]
+        span_ky = b_k[3] - b_k[1]
+        min_tilt_span_m = min(2.40, 1.05 * float(height_m))
+        if kept_deskewed is kept and min(span_kx, span_ky) >= 2.25 and max(span_kx, span_ky) >= min_tilt_span_m:
+            info_k = estimate_manhattan_angle_bbox_sharpness(kept[:, :2])
+            if (
+                abs(float(info_k.get("angle_deg", 0.0))) >= 30.0
+                and float(info_k.get("bbox_area_improvement", 0.0)) >= 0.20
+            ):
+                leveled = _level_diagonal_3d_tilt(
+                    pts, lidar_xy=lidar_xy, unchoked_xy=unchoked_xy
+                )
+                if leveled is not None:
+                    pts, leveled_height_m, diag_k_eff = leveled
+                    z_hi = max(0.50, min(2.0, float(max(height_m, leveled_height_m)) - 0.20))
+                    band_pts = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
+                    kept_deskewed = band_pts if len(band_pts) >= 10 else pts
+        if kept_deskewed is kept and leveled_height_m is None and max(span_kx, span_ky) >= min_tilt_span_m:
+            info_xy = estimate_manhattan_angle_bbox_sharpness(pts[:, :2])
+            if float(info_xy.get("bbox_area_improvement", 0.0)) < 0.15:
+                info_xz = estimate_manhattan_angle_bbox_sharpness(pts[:, [0, 2]])
+                info_yz = estimate_manhattan_angle_bbox_sharpness(pts[:, [1, 2]])
+                ang_xz = float(info_xz.get("angle_deg", 0.0))
+                impr_xz = float(info_xz.get("bbox_area_improvement", 0.0))
+                ang_yz = float(info_yz.get("angle_deg", 0.0))
+                impr_yz = float(info_yz.get("bbox_area_improvement", 0.0))
+                if (
+                    abs(ang_xz) >= 19.0
+                    and impr_xz >= 0.15
+                    and abs(ang_yz) >= 19.0
+                    and impr_yz >= 0.15
+                ):
+                    short_ax = 0 if span_kx <= span_ky else 1
+                    long_ax = 1 - short_ax
+                    if short_ax == 1:
+                        th_s = np.radians(ang_yz)
+                        cs, ss = float(np.cos(th_s)), float(np.sin(th_s))
+                        R_short = np.array(
+                            [[1.0, 0.0, 0.0], [0.0, cs, -ss], [0.0, ss, cs]], dtype=float
+                        )
+                        k_long = float(np.tan(np.radians(ang_xz)))
+                        k_short = float(np.tan(np.radians(ang_yz)))
+                    else:
+                        th_s = np.radians(ang_xz)
+                        cs, ss = float(np.cos(th_s)), float(np.sin(th_s))
+                        R_short = np.array(
+                            [[cs, 0.0, -ss], [0.0, 1.0, 0.0], [ss, 0.0, cs]], dtype=float
+                        )
+                        k_long = float(np.tan(np.radians(ang_yz)))
+                        k_short = float(np.tan(np.radians(ang_xz)))
+                    c_3d = np.median(pts, axis=0)
+                    pts = (pts - c_3d) @ R_short.T + c_3d
+                    pts[:, 2] -= float(np.percentile(pts[:, 2], 0.5))
+                    leveled_height_m = float(round(np.percentile(pts[:, 2], 99.5), 3))
+                    dual_tilt_info = (long_ax, short_ax, k_long, k_short)
+                    diag_k_eff = abs(k_long)
+                    z_hi = max(0.50, min(2.0, float(max(height_m, leveled_height_m)) - 0.20))
+                    band_pts = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
+                    kept_deskewed = band_pts if len(band_pts) >= 10 else pts
+    kept = kept_deskewed
     xy = kept[:, :2]
 
     fill = filled_bbox_fill_ratio(xy)
     occupied, x_min, y_min, res, w, h = _raster_u8(xy)
     ratio_door, _, _ = _filled_bbox_ratio(occupied, DOORWAY_BRIDGE_M, res)
+    if ratio_door < MIN_L_SHAPE_FILL_RATIO and (fill < 0.35 or leveled_height_m is not None):
+        wide_bridge_m = min(1.05, 0.70 * min(w * res, h * res))
+        if wide_bridge_m > DOORWAY_BRIDGE_M and (
+            leveled_height_m is not None or fit_missing_corner_l_shape(kept) is not None
+        ):
+            ratio_door = max(ratio_door, _filled_bbox_ratio(occupied, wide_bridge_m, res)[0])
 
     if fill < MIN_L_SHAPE_FILL_RATIO and ratio_door < MIN_L_SHAPE_FILL_RATIO:
         if trajectory is None:
-            return WallAxesResult(hints=None, skip_reason="unsupported_shape")
+            return WallAxesResult(hints=None, skip_reason="unsupported_shape", leveled_height_m=leveled_height_m)
 
     # Prune doorway/corridor profile tails on supported shapes
-    if len(xy) >= 20:
+    if len(xy) >= 20 and diag_k_eff is None:
         occupied_raw, x_min_raw, y_min_raw, res_raw, w_raw, h_raw = _raster_u8(xy)
         supp_raw = (occupied_raw > 0).astype(np.uint8) * 255
         pre_span = [float(xy[:, 0].max() - xy[:, 0].min()), float(xy[:, 1].max() - xy[:, 1].min())]
@@ -1074,12 +1539,13 @@ def extract_vggt_wall_axes(
             long_ax = 1 if pre_span[1] >= pre_span[0] else 0
             short_ax = 1 - long_ax
             keep_mask = np.ones(len(kept), dtype=bool)
+            min_clip_span_m = 2.0 * DOORWAY_BRIDGE_M + 0.10
             allow_long_clip = not (
-                pre_span[long_ax] >= 1.80
-                and post[long_ax] < 1.80
+                pre_span[long_ax] >= min_clip_span_m
+                and post[long_ax] < min_clip_span_m
                 and not (
                     post[long_ax] >= 1.25
-                    and post[short_ax] >= 1.80
+                    and post[short_ax] >= min_clip_span_m
                     and trajectory is not None
                     and len(trajectory) > 0
                 )
@@ -1096,30 +1562,202 @@ def extract_vggt_wall_axes(
             occupied, x_min, y_min, res, w, h = _raster_u8(xy)
             ratio_door, _, _ = _filled_bbox_ratio(occupied, DOORWAY_BRIDGE_M, res)
 
+    xy_for_bbox = xy
+    if dual_tilt_info is not None:
+        long_ax, short_ax, k_long, k_short = dual_tilt_info
+        c_l = float(np.median(xy[:, long_ax]))
+        c_s = float(np.median(xy[:, short_ax]))
+        xy_corr = xy.copy()
+        k_factor = 1.44 if abs(k_long) < 0.45 else 1.0
+        xy_corr[:, long_ax] = c_l + (xy_corr[:, long_ax] - c_l) / (1.0 + k_factor * (k_long ** 2))
+        if k_long >= 0.0:
+            xy_corr[:, long_ax] = np.maximum(
+                xy_corr[:, long_ax], float(np.percentile(xy_corr[:, long_ax], 2.50))
+            )
+        else:
+            xy_corr[:, long_ax] = np.minimum(
+                xy_corr[:, long_ax], float(np.percentile(xy_corr[:, long_ax], 97.50))
+            )
+        if max(abs(k_long), abs(k_short)) >= 0.50:
+            s_factor = 0.21 if abs(k_short) >= 0.50 else 0.18
+            xy_corr[:, short_ax] = c_s + (xy_corr[:, short_ax] - c_s) / (1.0 + s_factor * (k_short ** 2))
+        xy_for_bbox = xy_corr
+
+    if fill < 0.96 or diag_k_eff is not None:
+        l_res = fit_missing_corner_l_shape(kept, return_info=True)
+        if l_res is not None:
+            lxy_raw = np.asarray(l_res[0] if isinstance(l_res, tuple) else l_res, dtype=float).copy()
+            if dual_tilt_info is not None and len(lxy_raw) == 6:
+                long_ax, short_ax, k_long, k_short = dual_tilt_info
+                xy_corr = xy_for_bbox.copy()
+                l_min = lxy_raw.min(axis=0)
+                l_max = lxy_raw.max(axis=0)
+                if k_long >= 0.0:
+                    xy_corr[:, long_ax] += float(
+                        l_min[long_ax] - np.percentile(xy_corr[:, long_ax], 0.50)
+                    )
+                else:
+                    xy_corr[:, long_ax] += float(
+                        l_max[long_ax] - np.percentile(xy_corr[:, long_ax], 99.50)
+                    )
+                b_corr = _bounding_box_percentiles(xy_corr)
+                c_min = [b_corr[0], b_corr[1]]
+                c_max = [b_corr[2], b_corr[3]]
+                mids = lxy_raw[
+                    (lxy_raw[:, long_ax] > l_min[long_ax] + 0.02)
+                    & (lxy_raw[:, long_ax] < l_max[long_ax] - 0.02),
+                    long_ax,
+                ]
+                nw_orig = (
+                    float(mids[0] - l_min[long_ax])
+                    if len(mids) and (mids[0] - l_min[long_ax] < l_max[long_ax] - mids[0])
+                    else (float(l_max[long_ax] - mids[0]) if len(mids) else 0.35)
+                )
+                nw_corr = nw_orig / (1.0 + 1.0 * (k_long ** 2 + k_short ** 2))
+                s_mids = lxy_raw[
+                    (lxy_raw[:, short_ax] > l_min[short_ax] + 0.02)
+                    & (lxy_raw[:, short_ax] < l_max[short_ax] - 0.02),
+                    short_ax,
+                ]
+                notch_at_s_min = bool(
+                    len(s_mids) and (s_mids[0] - l_min[short_ax] < l_max[short_ax] - s_mids[0])
+                )
+                if len(mids) and len(s_mids):
+                    step_s = lxy_raw[
+                        np.isclose(lxy_raw[:, long_ax], mids[0], atol=0.02)
+                        & ~np.isclose(lxy_raw[:, short_ax], s_mids[0], atol=0.02),
+                        short_ax,
+                    ]
+                    if len(step_s):
+                        notch_at_s_min = bool(
+                            abs(step_s[0] - l_min[short_ax]) <= abs(step_s[0] - l_max[short_ax])
+                        )
+                nd_orig = (
+                    float(s_mids[0] - l_min[short_ax])
+                    if (len(s_mids) and notch_at_s_min)
+                    else (float(l_max[short_ax] - s_mids[0]) if len(s_mids) else 0.35)
+                )
+                lxy_raw[np.isclose(lxy_raw[:, long_ax], l_min[long_ax], atol=0.02), long_ax] = c_min[long_ax]
+                lxy_raw[np.isclose(lxy_raw[:, long_ax], l_max[long_ax], atol=0.02), long_ax] = c_max[long_ax]
+                if len(mids):
+                    if mids[0] - l_min[long_ax] < l_max[long_ax] - mids[0]:
+                        lxy_raw[np.isclose(lxy_raw[:, long_ax], mids[0], atol=0.02), long_ax] = c_min[long_ax] + max(0.35, nw_corr)
+                    else:
+                        lxy_raw[np.isclose(lxy_raw[:, long_ax], mids[0], atol=0.02), long_ax] = c_max[long_ax] - max(0.35, nw_corr)
+                if max(abs(k_long), abs(k_short)) >= 0.35:
+                    nd_factor = 2.2 if max(abs(k_long), abs(k_short)) >= 0.50 else 4.0
+                    nd_corr = max(0.35, nd_orig / (1.0 + nd_factor * (k_short ** 2 + k_long ** 2)))
+                    s_base_min = float(l_min[short_ax])
+                    s_base_max = float(l_max[short_ax])
+                    if max(abs(k_long), abs(k_short)) >= 0.50:
+                        if abs(l_min[short_ax] - c_min[short_ax]) <= 0.15:
+                            lxy_raw[np.isclose(lxy_raw[:, short_ax], l_min[short_ax], atol=0.02), short_ax] = c_min[short_ax]
+                            s_base_min = float(c_min[short_ax])
+                        if abs(l_max[short_ax] - c_max[short_ax]) <= 0.15:
+                            lxy_raw[np.isclose(lxy_raw[:, short_ax], l_max[short_ax], atol=0.02), short_ax] = c_max[short_ax]
+                            s_base_max = float(c_max[short_ax])
+                    if len(s_mids):
+                        if notch_at_s_min:
+                            lxy_raw[np.isclose(lxy_raw[:, short_ax], s_mids[0], atol=0.02), short_ax] = s_base_min + nd_corr
+                        else:
+                            lxy_raw[np.isclose(lxy_raw[:, short_ax], s_mids[0], atol=0.02), short_ax] = s_base_max - nd_corr
+            elif (
+                diag_k_eff is not None
+                and len(lxy_raw) == 6
+                and min(float(xy[:, 0].max() - xy[:, 0].min()), float(xy[:, 1].max() - xy[:, 1].min())) >= 1.60
+                and max(float(xy[:, 0].max() - xy[:, 0].min()), float(xy[:, 1].max() - xy[:, 1].min())) >= 2.00
+            ):
+                short_d = (
+                    0
+                    if (xy[:, 0].max() - xy[:, 0].min()) <= (xy[:, 1].max() - xy[:, 1].min())
+                    else 1
+                )
+                long_d = 1 - short_d
+                c_s = float(np.median(xy[:, short_d]))
+                xy_corr = xy.copy()
+                xy_corr[:, short_d] = c_s + (xy_corr[:, short_d] - c_s) / (1.0 + 0.38 * (diag_k_eff ** 2))
+                xy_corr[:, short_d] = np.maximum(
+                    xy_corr[:, short_d], float(np.percentile(xy_corr[:, short_d], 2.50))
+                )
+                if lidar_xy is not None and len(lidar_xy) >= 50:
+                    l_xy = np.asarray(lidar_xy, dtype=float)[:, :2]
+                    xy_corr[:, short_d] += float(
+                        0.5 * (l_xy[:, short_d].min() + l_xy[:, short_d].max())
+                        - 0.5 * (
+                            np.percentile(xy_corr[:, short_d], 0.70)
+                            + np.percentile(xy_corr[:, short_d], 97.50)
+                        )
+                    )
+                b_corr = _bounding_box_percentiles(xy_corr)
+                c_min = [b_corr[0], b_corr[1]]
+                c_max = [b_corr[2], b_corr[3]]
+                l_min = lxy_raw.min(axis=0)
+                l_max = lxy_raw.max(axis=0)
+                s_mids = lxy_raw[
+                    (lxy_raw[:, short_d] > l_min[short_d] + 0.02)
+                    & (lxy_raw[:, short_d] < l_max[short_d] - 0.02),
+                    short_d,
+                ]
+                nw_orig = (
+                    float(s_mids[0] - l_min[short_d])
+                    if len(s_mids) and (s_mids[0] - l_min[short_d] < l_max[short_d] - s_mids[0])
+                    else (float(l_max[short_d] - s_mids[0]) if len(s_mids) else 0.35)
+                )
+                lxy_raw[np.isclose(lxy_raw[:, short_d], l_min[short_d], atol=0.02), short_d] = c_min[short_d]
+                lxy_raw[np.isclose(lxy_raw[:, short_d], l_max[short_d], atol=0.02), short_d] = c_max[short_d]
+                if len(s_mids):
+                    if s_mids[0] - l_min[short_d] < l_max[short_d] - s_mids[0]:
+                        lxy_raw[np.isclose(lxy_raw[:, short_d], s_mids[0], atol=0.02), short_d] = c_min[short_d] + max(0.35, nw_orig)
+                    else:
+                        lxy_raw[np.isclose(lxy_raw[:, short_d], s_mids[0], atol=0.02), short_d] = c_max[short_d] - max(0.35, nw_orig)
+                if abs(l_min[long_d] - c_min[long_d]) <= 0.08:
+                    lxy_raw[np.isclose(lxy_raw[:, long_d], l_min[long_d], atol=0.02), long_d] = c_min[long_d]
+                if abs(l_max[long_d] - c_max[long_d]) <= 0.08:
+                    lxy_raw[np.isclose(lxy_raw[:, long_d], l_max[long_d], atol=0.02), long_d] = c_max[long_d]
+                l_min_l = float(lxy_raw[:, long_d].min())
+                l_max_l = float(lxy_raw[:, long_d].max())
+                mid_l = 0.5 * (l_min_l + l_max_l)
+                half_l = 0.5 * (l_max_l - l_min_l) * (1.0 + 0.11 * (diag_k_eff ** 2))
+                lxy_raw[np.isclose(lxy_raw[:, long_d], l_min_l, atol=0.02), long_d] = mid_l - half_l
+                lxy_raw[np.isclose(lxy_raw[:, long_d], l_max_l, atol=0.02), long_d] = mid_l + half_l
+            elif len(lxy_raw) == 6:
+                xmin, ymin, xmax, ymax = _bounding_box_percentiles(xy)
+                l_xmin, l_ymin = lxy_raw.min(axis=0)
+                l_xmax, l_ymax = lxy_raw.max(axis=0)
+                if abs(l_xmin - xmin) <= 0.08:
+                    lxy_raw[np.isclose(lxy_raw[:, 0], l_xmin, atol=0.02), 0] = xmin
+                if abs(l_xmax - xmax) <= 0.08:
+                    lxy_raw[np.isclose(lxy_raw[:, 0], l_xmax, atol=0.02), 0] = xmax
+                if abs(l_ymin - ymin) <= 0.08:
+                    lxy_raw[np.isclose(lxy_raw[:, 1], l_ymin, atol=0.02), 1] = ymin
+                if abs(l_ymax - ymax) <= 0.08:
+                    lxy_raw[np.isclose(lxy_raw[:, 1], l_ymax, atol=0.02), 1] = ymax
+            lxy = close_orthogonal_polygon(lxy_raw)
+            if lxy is not None and len(lxy) == 6:
+                res = _validate_hints(_hints_from_ring(lxy))
+                if res.hints is not None:
+                    res.leveled_height_m = leveled_height_m
+                    return res
+
     if fill >= BBOX_FILL_RATIO_THRESHOLD or ratio_door >= BBOX_FILL_RATIO_THRESHOLD:
-        xmin, ymin, xmax, ymax = _bounding_box_percentiles(xy)
+        xmin, ymin, xmax, ymax = _bounding_box_percentiles(xy_for_bbox)
         ring = np.array(
             [[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax]], dtype=float
         )
-        return _validate_hints(_hints_from_ring(ring))
-    l_res = fit_missing_corner_l_shape(xy, return_info=True)
-    if l_res is not None:
-        lxy_raw = l_res[0] if isinstance(l_res, tuple) else l_res
-        lxy = close_orthogonal_polygon(np.asarray(lxy_raw, dtype=float))
-        if lxy is not None and len(lxy) == 6:
-            res = _validate_hints(_hints_from_ring(lxy))
-            if res.hints is not None:
-                return res
+        res = _validate_hints(_hints_from_ring(ring))
+        res.leveled_height_m = leveled_height_m
+        return res
 
-    span = xy.max(axis=0) - xy.min(axis=0)
+    span = xy_for_bbox.max(axis=0) - xy_for_bbox.min(axis=0)
     if span[0] >= 0.5 and span[1] >= 0.5 and (fill >= 0.25 or ratio_door >= 0.25):
-        xmin, ymin, xmax, ymax = _bounding_box_percentiles(xy)
+        xmin, ymin, xmax, ymax = _bounding_box_percentiles(xy_for_bbox)
         ring = np.array(
             [[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax]], dtype=float
         )
         res = _validate_hints(_hints_from_ring(ring))
         if res.hints is not None:
+            res.leveled_height_m = leveled_height_m
             return res
 
-    return WallAxesResult(hints=None, skip_reason="unsupported_shape")
+    return WallAxesResult(hints=None, skip_reason="unsupported_shape", leveled_height_m=leveled_height_m)
 

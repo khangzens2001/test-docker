@@ -28,7 +28,6 @@ AXIS_CLOSURE_M = 0.001
 DOORWAY_BRIDGE_M = 0.85
 DOORWAY_CHOKE_M = 0.78
 DOORWAY_CHOKE_KEEP_RATIO = 0.20
-SMALL_ROOM_AREA_M2 = 5.0
 CHOKE_MAX_DISCARD_RATIO = 0.25
 WALL_KEEP_DILATE_M = 0.15
 MIN_CHOKE_BBOX_REDUCTION_M = 0.20
@@ -44,8 +43,6 @@ BUILTIN_FRONT_TOL_M = 0.14
 BUILTIN_OUTER_MARGIN_M = 0.20
 BUILTIN_HIGH_Z_M = 1.55
 BUILTIN_HIGH_Z_MIN_POINTS = 40
-SMALL_ROOM_KEEPOUT_MAX_AREA_M2 = 4.5
-SMALL_ROOM_KEEPOUT_MIN_SHORT_SIDE_M = 1.6
 VERTEX_DECIMALS = 3
 MAX_NGON_VERTICES = 16
 MIN_NGON_VERTICES = 8
@@ -55,12 +52,9 @@ NGON_CAVITY_CLOSE_M = 0.05
 HEADING_CLASS_DEG = (0.0, 45.0, 90.0, 135.0)
 HEADING_SNAP_DEG = 7.5
 MIN_CHAMFER_M = 0.25
-MAX_CHAMFER_M = 1.80
 MIN_FREE_OBLIQUE_M = 0.50
 OPEN_CORRIDOR_MIN_WIDTH_M = 0.90
 OPEN_CORRIDOR_MIN_LENGTH_M = 1.50
-SECOND_ROOM_MIN_AREA_M2 = 6.0
-
 
 
 def slice_wall_band(points: np.ndarray, height_m: float) -> np.ndarray:
@@ -1102,17 +1096,18 @@ def choke_doorway_tails(
 
         w_neck_val = float(neck.get("neck_width_m", 0.0)) if neck else 0.0
         area_a_neck = float(neck.get("area_a_m2", 0.0)) if neck else 0.0
-        is_small_room = (
-            cavity_area_m2 < 6.0
-            or (neck is not None and 0.0 < area_a_neck < 6.0)
+        mean_cavity_thickness_m = cavity_area_m2 / max(max(pre), 1e-3)
+        is_compact_cavity = (
+            mean_cavity_thickness_m < 2.0 * DOORWAY_CHOKE_M
+            or (neck is not None and 0.0 < area_a_neck < 2.0 * max(pre) * DOORWAY_CHOKE_M)
         )
-        is_narrow_aperture = (w_neck_val > 0.0 and w_neck_val <= 1.60) or is_narrow_tail
+        is_narrow_aperture = (w_neck_val > 0.0 and w_neck_val <= 2.0 * BUILTIN_MIN_LENGTH_M) or is_narrow_tail
 
         max_discard = (
-            0.35 if (is_small_room and trajectory is not None)
+            0.35 if (is_compact_cavity and trajectory is not None)
             else (0.40 if (is_narrow_tail and trajectory is not None) else CHOKE_MAX_DISCARD_RATIO)
         )
-        if cavity_area_m2 < SMALL_ROOM_AREA_M2 and discarded_cavity_ratio > max_discard:
+        if mean_cavity_thickness_m < 2.0 * DOORWAY_CHOKE_M and discarded_cavity_ratio > max_discard:
             info["doorway_choke_applied"] = False
             info["choke_guard_reason"] = "small_room_discard_cap"
             pts_clip, info_clip = _clip_doorway_profile_tails(
@@ -1135,7 +1130,7 @@ def choke_doorway_tails(
                 float(out[:, 0].max() - out[:, 0].min()),
                 float(out[:, 1].max() - out[:, 1].min()),
             ]
-            if is_small_room and (min(post) < 0.80 or (min(pre) > 1.10 and post[0] * post[1] < 1.60)):
+            if is_compact_cavity and (min(post) < BUILTIN_MIN_LENGTH_M or (min(pre) > 1.10 and post[0] * post[1] < 2.0 * BUILTIN_MIN_LENGTH_M)):
                 info["doorway_choke_applied"] = False
                 info["choke_guard_reason"] = "small_room_post_bbox_too_small"
                 pts_clip, info_clip = _clip_doorway_profile_tails(
@@ -1154,18 +1149,10 @@ def choke_doorway_tails(
                         t_y0, t_y1 = float(np.min(traj_arr[:, 1])), float(np.max(traj_arr[:, 1]))
                         o_x0, o_x1 = float(np.min(out[:, 0])), float(np.max(out[:, 0]))
                         o_y0, o_y1 = float(np.min(out[:, 1])), float(np.max(out[:, 1]))
-                        encroach_x = max(0.0, float(o_x0 - t_x0), float(t_x1 - o_x1))
-                        encroach_y = max(0.0, float(o_y0 - t_y0), float(t_y1 - o_y1))
-                        max_encroach = max(encroach_x, encroach_y)
-                        is_small_room_5m2 = (
-                            cavity_area_m2 < 5.0
-                            or (pre[0] * pre[1] < 5.0)
-                            or (neck is not None and 0.0 < area_a_neck < 5.0)
-                        )
 
                         if o_x0 > t_x0 + 0.05 or o_x1 < t_x1 - 0.05 or o_y0 > t_y0 + 0.05 or o_y1 < t_y1 - 0.05:
                             bypass_guard = False
-                            if (is_narrow_tail or is_narrow_aperture or is_small_room) and len(traj_arr) > 0:
+                            if (is_narrow_tail or is_narrow_aperture or is_compact_cavity) and len(traj_arr) > 0:
                                 t_ix = np.clip(np.round((traj_arr[:, 0] - x_min) / resolution).astype(int), 0, width - 1)
                                 t_iy = np.clip(np.round((traj_arr[:, 1] - y_min) / resolution).astype(int), 0, height - 1)
                                 if tail_cells.shape == (height, width):
@@ -1183,25 +1170,27 @@ def choke_doorway_tails(
                                     step_in = in_tail_mask[:-1] & in_tail_mask[1:] & (diffs < 2.0)
                                     L_in_tail = float(np.sum(diffs[step_in]))
                                 t_span_tail = max(float(np.ptp(traj_arr[in_tail_mask, 0])), float(np.ptp(traj_arr[in_tail_mask, 1]))) if n_in_tail > 1 else 0.0
-                                is_small_enclosed_neck = (
+                                min_neck_side_area = (
+                                    min(float(neck.get("area_a_m2", 999.0)), float(neck.get("area_b_m2", 999.0)))
+                                    if neck is not None
+                                    else 999.0
+                                )
+                                is_enclosed_neck = (
                                     neck is not None
                                     and neck.get("neck_kind") in ("door", "open_corridor")
-                                    and (
-                                        min(float(neck.get("area_a_m2", 999.0)), float(neck.get("area_b_m2", 999.0))) < 6.0
-                                        or cavity_area_m2 < 10.0
-                                    )
-                                    and 0.0 < float(neck.get("neck_width_m", 0.0)) <= 1.60
+                                    and (is_compact_cavity or min_neck_side_area < 2.0 * max(pre) * DOORWAY_CHOKE_M)
+                                    and 0.0 < float(neck.get("neck_width_m", 0.0)) <= 2.0 * BUILTIN_MIN_LENGTH_M
                                 )
                                 dwell_in_tail = float(n_in_tail / max(len(traj_arr) - n_in_tail, 1))
                                 is_true_tail = (frac_in_tail < 0.30 and dwell_in_tail < 0.25)
-                                if (is_small_room and is_narrow_aperture) or is_small_enclosed_neck:
+                                if (is_compact_cavity and is_narrow_aperture) or is_enclosed_neck:
                                     bypass_guard = True
-                                elif is_small_room and frac_in_tail < 0.40:
+                                elif is_compact_cavity and frac_in_tail < 0.40:
                                     bypass_guard = True
                                 elif is_true_tail:
-                                    if is_small_room and frac_in_tail < 0.30:
+                                    if is_compact_cavity and frac_in_tail < 0.30:
                                         bypass_guard = True
-                                    elif is_narrow_tail and frac_in_tail < 0.20 and (L_in_tail < 1.50 or t_span_tail < 0.80):
+                                    elif is_narrow_tail and frac_in_tail < 0.20 and (L_in_tail < BODY_SPAN_M or t_span_tail < BUILTIN_MIN_LENGTH_M):
                                         bypass_guard = True
 
                             if not bypass_guard:
@@ -1320,8 +1309,9 @@ def _clip_doorway_profile_tails(
         return pts, info
     info = dict(info)
 
-    is_small_room = (info.get("cavity_area_m2", 0.0) < 6.0)
-    if is_small_room and (min(post) < 0.80 or (min(pre) > 1.10 and post[0] * post[1] < 1.60)):
+    mean_cavity_thickness_m = float(info.get("cavity_area_m2", 0.0)) / max(max(pre), 1e-3)
+    is_compact_cavity = (mean_cavity_thickness_m < 2.0 * DOORWAY_CHOKE_M)
+    if is_compact_cavity and (min(post) < BUILTIN_MIN_LENGTH_M or (min(pre) > 1.10 and post[0] * post[1] < 2.0 * BUILTIN_MIN_LENGTH_M)):
         info["doorway_choke_applied"] = False
         info["choke_guard_reason"] = "small_room_post_bbox_too_small"
         return pts, info
@@ -1341,10 +1331,10 @@ def _clip_doorway_profile_tails(
             is_narrow_tail = True
 
     max_discard = (
-        0.35 if is_small_room and trajectory is not None
+        0.35 if is_compact_cavity and trajectory is not None
         else (0.40 if is_narrow_tail and trajectory is not None else CHOKE_MAX_DISCARD_RATIO)
     )
-    if info.get("cavity_area_m2", 0.0) < SMALL_ROOM_AREA_M2 and discarded_ratio > max_discard:
+    if is_compact_cavity and discarded_ratio > max_discard:
         info["doorway_choke_applied"] = False
         info["choke_guard_reason"] = "small_room_discard_cap"
         return pts, info
@@ -1355,17 +1345,10 @@ def _clip_doorway_profile_tails(
             t_y0, t_y1 = float(np.min(traj_arr[:, 1])), float(np.max(traj_arr[:, 1]))
             o_x0, o_x1 = float(np.min(out[:, 0])), float(np.max(out[:, 0]))
             o_y0, o_y1 = float(np.min(out[:, 1])), float(np.max(out[:, 1]))
-            encroach_x = max(0.0, float(o_x0 - t_x0), float(t_x1 - o_x1))
-            encroach_y = max(0.0, float(o_y0 - t_y0), float(t_y1 - o_y1))
-            max_encroach = max(encroach_x, encroach_y)
-            is_small_room_5m2 = (
-                float(info.get("cavity_area_m2", 0.0)) < 5.0
-                or (pre[0] * pre[1] < 5.0)
-            )
 
             if o_x0 > t_x0 + 0.05 or o_x1 < t_x1 - 0.05 or o_y0 > t_y0 + 0.05 or o_y1 < t_y1 - 0.05:
                 bypass_guard = False
-                if (is_narrow_tail or is_small_room) and len(traj_arr) > 0:
+                if (is_narrow_tail or is_compact_cavity) and len(traj_arr) > 0:
                     in_tail_mask = (
                         (traj_arr[:, 0] < o_x0) | (traj_arr[:, 0] > o_x1) |
                         (traj_arr[:, 1] < o_y0) | (traj_arr[:, 1] > o_y1)
@@ -1380,10 +1363,10 @@ def _clip_doorway_profile_tails(
                     t_span_tail = max(float(np.ptp(traj_arr[in_tail_mask, 0])), float(np.ptp(traj_arr[in_tail_mask, 1]))) if n_in_tail > 1 else 0.0
                     dwell_ratio_b = float(frac_in_tail / max(1.0 - frac_in_tail, 0.01))
                     is_true_tail = (frac_in_tail < 0.30 and dwell_ratio_b < 0.25)
-                    if is_small_room and frac_in_tail < 0.40:
+                    if is_compact_cavity and frac_in_tail < 0.40:
                         bypass_guard = True
                     elif is_true_tail:
-                        if is_small_room and frac_in_tail < 0.30:
+                        if is_compact_cavity and frac_in_tail < 0.30:
                             bypass_guard = True
                         elif frac_in_tail < 0.20 and (L_in_tail < 1.50 or t_span_tail < 0.80):
                             bypass_guard = True
@@ -1710,12 +1693,12 @@ def fit_orthogonal_ngon(points_xy: np.ndarray) -> np.ndarray | None:
 def fit_missing_corner_l_shape(
     points_xy: np.ndarray, *, return_info: bool = False
 ) -> np.ndarray | tuple[np.ndarray, float] | None:
-    p2d = np.asarray(points_xy, dtype=float)[:, :2]
-    if len(p2d) < 6:
+    pts_arr = np.asarray(points_xy, dtype=float)
+    if pts_arr.ndim != 2 or pts_arr.shape[1] < 2 or len(pts_arr) < 6:
         return None
+    p2d = pts_arr[:, :2]
+    has_3d = pts_arr.shape[1] >= 3
     fill = filled_bbox_fill_ratio(p2d)
-    if fill < MIN_L_SHAPE_FILL_RATIO:
-        return None
     occupied, x_min, y_min, resolution, width, height = _raster_u8(p2d)
     support = (occupied > 0).astype(np.uint8) * 255
     ys, xs = np.nonzero(support)
@@ -1737,6 +1720,37 @@ def fit_missing_corner_l_shape(
     cavity = np.zeros_like(occupied)
     if contours:
         cv2.drawContours(cavity, [max(contours, key=cv2.contourArea)], -1, 255, thickness=cv2.FILLED)
+    raw_bbox_px = max(1, int((xs.max() - xs.min()) * (ys.max() - ys.min())))
+    if int(cv2.countNonZero(cavity)) < int(0.45 * raw_bbox_px):
+        for bridge_m in (DOORWAY_BRIDGE_M, min(1.05, 0.70 * min(span_x, span_y))):
+            if int(cv2.countNonZero(cavity)) >= int(0.45 * raw_bbox_px):
+                break
+            if bridge_m <= 0.05:
+                continue
+            door_px = _odd_px(bridge_m, resolution, 5)
+            pad = door_px + 2
+            closed_pad = np.pad(closed, pad, mode="constant", constant_values=0)
+            closed_h = cv2.morphologyEx(
+                closed_pad,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (door_px, 3)),
+            )[pad:-pad, pad:-pad]
+            closed_v = cv2.morphologyEx(
+                closed_pad,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (3, door_px)),
+            )[pad:-pad, pad:-pad]
+            closed_hv = np.maximum(closed_h, closed_v)
+            contours_hv, _ = cv2.findContours(closed_hv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours_hv:
+                cavity_hv = np.zeros_like(occupied)
+                cv2.drawContours(
+                    cavity_hv, [max(contours_hv, key=cv2.contourArea)], -1, 255, thickness=cv2.FILLED
+                )
+                if int(cv2.countNonZero(cavity_hv)) > int(cv2.countNonZero(cavity)):
+                    cavity = cavity_hv
+    if fill < MIN_L_SHAPE_FILL_RATIO and int(cv2.countNonZero(cavity)) < int(MIN_L_SHAPE_FILL_RATIO * raw_bbox_px):
+        return None
     target_mask = np.maximum(cavity, occupied)
     target_count = int(cv2.countNonZero(target_mask))
     _line_cache = {}
@@ -1816,6 +1830,12 @@ def fit_missing_corner_l_shape(
             hits.append(line_sup(p[0], p[1], q[0], q[1]))
         return float(np.mean(hits)) if hits else 0.0, hits
 
+    min_std_px = int(math.ceil(MIN_L_SHAPE_NOTCH_SIDE_M / resolution - 1e-9))
+    min_cmp_px = int(math.ceil(0.30 / resolution - 1e-9))
+    max_cmp_px = int(math.ceil(0.35 / resolution - 1e-9))
+    min_rem_std_px = int(math.ceil(0.25 / resolution - 1e-9))
+    min_rem_cmp_px = int(math.ceil(0.50 / resolution - 1e-9))
+
     best = None
     for p in (0.0, 1.5, 2.5):
         x0 = int(np.percentile(xs, p))
@@ -1830,12 +1850,18 @@ def fit_missing_corner_l_shape(
             - integral_support[y1, x0]
             + integral_support[y0, x0]
         )
+        max_open_std = MAX_OCC_OUTSIDE_RATIO * max(total_occ, 1)
+        max_open_cmp = 0.05 * max(total_occ, 1)
+        min_area_px = MIN_CONCAVE_AREA_RATIO * bbox_area
+        min_bbox_dim = bbox_w if bbox_w <= bbox_h else bbox_h
+        allow_compact = (min_bbox_dim * resolution) <= 2.0
+        min_ratio_px = MIN_NOTCH_RATIO * max(1, min_bbox_dim)
 
         rect = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
         iou_rect = poly_iou(target_mask, rect)
         rect_sup, _ = calc_support(rect)
 
-        min_notch_side = max(10, int(round(min(bbox_w, bbox_h) * 0.08)))
+        min_notch_side = max(10, int(round(min_bbox_dim * 0.08)))
         x_cands = np.unique(np.concatenate([
             np.linspace(x0 + min_notch_side, x1 - min_notch_side, 28).astype(int),
             np.percentile(xs, np.linspace(15, 85, 15)).astype(int),
@@ -1849,23 +1875,28 @@ def fit_missing_corner_l_shape(
 
         for xs_mid in x_cands.tolist():
             for ys_mid in y_cands.tolist():
-                missing = {
-                    "top_left": (x0, ys_mid, xs_mid, y1),
-                    "top_right": (xs_mid, ys_mid, x1, y1),
-                    "bottom_right": (xs_mid, y0, x1, ys_mid),
-                    "bottom_left": (x0, y0, xs_mid, ys_mid),
-                }
-                for corner, (mx0, my0, mx1, my1) in missing.items():
+                for corner_id, mx0, my0, mx1, my1 in (
+                    (0, x0, ys_mid, xs_mid, y1),
+                    (1, xs_mid, ys_mid, x1, y1),
+                    (2, xs_mid, y0, x1, ys_mid),
+                    (3, x0, y0, xs_mid, ys_mid),
+                ):
                     notch_w = mx1 - mx0
                     notch_h = my1 - my0
-                    notch_w_m = notch_w * resolution
-                    notch_h_m = notch_h * resolution
-                    if min(notch_w_m, notch_h_m) < MIN_L_SHAPE_NOTCH_SIDE_M:
-                        continue
-                    notch_area = notch_w * notch_h
-                    if notch_area / bbox_area < MIN_CONCAVE_AREA_RATIO:
-                        continue
-                    if (bbox_w - notch_w) * resolution < 0.25 or (bbox_h - notch_h) * resolution < 0.25:
+                    min_nh = notch_w if notch_w <= notch_h else notch_h
+                    is_compact_notch = min_nh < min_std_px
+                    if is_compact_notch:
+                        if not allow_compact or min_nh < min_cmp_px:
+                            continue
+                        max_nh = notch_h if notch_w <= notch_h else notch_w
+                        if max_nh < max_cmp_px or min_nh < min_ratio_px:
+                            continue
+                        if (bbox_w - notch_w) < min_rem_cmp_px or (bbox_h - notch_h) < min_rem_cmp_px:
+                            continue
+                    else:
+                        if (bbox_w - notch_w) < min_rem_std_px or (bbox_h - notch_h) < min_rem_std_px:
+                            continue
+                    if (notch_w * notch_h) < min_area_px:
                         continue
 
                     open_count = int(
@@ -1874,20 +1905,20 @@ def fit_missing_corner_l_shape(
                         - integral_open[my1, mx0]
                         + integral_open[my0, mx0]
                     )
-                    occ_out = float(open_count) / max(total_occ, 1)
-                    if occ_out > MAX_OCC_OUTSIDE_RATIO:
+                    if open_count > (max_open_cmp if is_compact_notch else max_open_std):
                         continue
 
                     # Inward notch edges
+                    min_inward_sup = 0.75 if is_compact_notch else MIN_NOTCH_EDGE_SUPPORT
                     sup_h = line_sup(mx0, ys_mid, mx1, ys_mid)
-                    if sup_h < MIN_NOTCH_EDGE_SUPPORT:
+                    if sup_h < min_inward_sup:
                         continue
                     sup_v = line_sup(xs_mid, my0, xs_mid, my1)
-                    if sup_v < MIN_NOTCH_EDGE_SUPPORT:
+                    if sup_v < min_inward_sup:
                         continue
 
                     # Construct polygon only when candidate passes all gates so far
-                    if corner == "bottom_right":
+                    if corner_id == 2:
                         poly = [
                             (x0, y0),
                             (xs_mid, y0),
@@ -1896,7 +1927,7 @@ def fit_missing_corner_l_shape(
                             (x1, y1),
                             (x0, y1),
                         ]
-                    elif corner == "bottom_left":
+                    elif corner_id == 3:
                         poly = [
                             (x0, ys_mid),
                             (xs_mid, ys_mid),
@@ -1905,7 +1936,7 @@ def fit_missing_corner_l_shape(
                             (x1, y1),
                             (x0, y1),
                         ]
-                    elif corner == "top_right":
+                    elif corner_id == 1:
                         poly = [
                             (x0, y0),
                             (x1, y0),
@@ -1926,17 +1957,83 @@ def fit_missing_corner_l_shape(
 
                     edge_support, edge_hits = calc_support(poly)
                     min_edge_sup = min(edge_hits) if edge_hits else 0.0
-                    if edge_support < MIN_EDGE_SUPPORT or min_edge_sup < MIN_SINGLE_EDGE_SUPPORT:
+                    req_min_edge = 0.45 if is_compact_notch else MIN_SINGLE_EDGE_SUPPORT
+                    if edge_support < MIN_EDGE_SUPPORT or min_edge_sup < req_min_edge:
+                        continue
+                    if is_compact_notch and edge_support < rect_sup + 0.02:
                         continue
 
                     iou_l = poly_iou(target_mask, poly)
                     score = (iou_l - iou_rect) + 0.10 * (edge_support - rect_sup)
 
-                    if score < MIN_L_SHAPE_SCORE or iou_l < MIN_L_SHAPE_IOU:
+                    if is_compact_notch:
+                        min_cmp_iou = (
+                            0.78
+                            if ((iou_l - iou_rect) >= 0.045 and edge_support >= 0.80)
+                            else 0.80
+                        )
+                        if iou_l <= iou_rect or iou_l < min_cmp_iou or score < 0.012:
+                            continue
+                    elif score < MIN_L_SHAPE_SCORE or iou_l < MIN_L_SHAPE_IOU:
                         continue
 
-                    if best is None or score > best[0]:
-                        best = (score, poly, edge_support)
+                    if best is not None and score <= best[0]:
+                        continue
+
+                    if is_compact_notch and has_3d:
+                        x_mid_m = xs_mid * resolution + x_min
+                        y_mid_m = ys_mid * resolution + y_min
+                        mx0_m = mx0 * resolution + x_min
+                        mx1_m = mx1 * resolution + x_min
+                        my0_m = my0 * resolution + y_min
+                        my1_m = my1 * resolution + y_min
+                        sub_h = pts_arr[
+                            (np.abs(p2d[:, 1] - y_mid_m) <= 0.08)
+                            & (p2d[:, 0] >= mx0_m - 0.05)
+                            & (p2d[:, 0] <= mx1_m + 0.05)
+                        ]
+                        sub_v = pts_arr[
+                            (np.abs(p2d[:, 0] - x_mid_m) <= 0.08)
+                            & (p2d[:, 1] >= my0_m - 0.05)
+                            & (p2d[:, 1] <= my1_m + 0.05)
+                        ]
+                        if len(sub_h) < 30 or len(sub_v) < 30:
+                            continue
+                        z_h = sub_h[:, 2]
+                        z_v = sub_v[:, 2]
+                        if (
+                            float(np.percentile(z_h, 90)) < 1.35
+                            or float(np.percentile(z_v, 90)) < 1.35
+                            or float(np.percentile(z_h, 90) - np.percentile(z_h, 10)) < 0.50
+                            or float(np.percentile(z_v, 90) - np.percentile(z_v, 10)) < 0.50
+                        ):
+                            continue
+                        xh_raw = sub_h[:, 0]
+                        yv_raw = sub_v[:, 1]
+                        nw_m = mx1_m - mx0_m
+                        nh_m = my1_m - my0_m
+                        if (
+                            float(np.percentile(xh_raw, 90) - np.percentile(xh_raw, 10)) < 0.38 * nw_m
+                            or float(np.percentile(yv_raw, 90) - np.percentile(yv_raw, 10)) < 0.38 * nh_m
+                        ):
+                            continue
+                        xh = (
+                            xh_raw - np.polyval(np.polyfit(z_h, xh_raw, 1), z_h)
+                            if float(np.std(z_h)) >= 0.05
+                            else xh_raw
+                        )
+                        yv = (
+                            yv_raw - np.polyval(np.polyfit(z_v, yv_raw, 1), z_v)
+                            if float(np.std(z_v)) >= 0.05
+                            else yv_raw
+                        )
+                        r_h = float(np.percentile(xh, 90) - np.percentile(xh, 10)) / max(nw_m, 1e-6)
+                        r_v = float(np.percentile(yv, 90) - np.percentile(yv, 10)) / max(nh_m, 1e-6)
+                        r_short = r_h if nw_m <= nh_m else r_v
+                        if r_short < 0.35 or max(r_h, r_v) < 0.50:
+                            continue
+
+                    best = (score, poly, edge_support)
 
     if best is None:
         return None
@@ -2061,28 +2158,22 @@ def detect_builtin_keepouts(
         return empty
 
     p2d = pts[:, :2]
-    dx = float(p2d[:, 0].max() - p2d[:, 0].min())
-    dy = float(p2d[:, 1].max() - p2d[:, 1].min())
     p_dx = float(np.percentile(p2d[:, 0], 98) - np.percentile(p2d[:, 0], 2))
     p_dy = float(np.percentile(p2d[:, 1], 98) - np.percentile(p2d[:, 1], 2))
-    initial_area = min(dx * dy, p_dx * p_dy)
     short_side = min(p_dx, p_dy)
 
-    is_small_room = (
-        initial_area < SMALL_ROOM_KEEPOUT_MAX_AREA_M2
-        or short_side < SMALL_ROOM_KEEPOUT_MIN_SHORT_SIDE_M
-    )
+    min_keepout_room_width_m = 2.0 * OPEN_CORRIDOR_MIN_WIDTH_M - 0.20
+    is_compact_cavity = short_side < min_keepout_room_width_m
     if trajectory is not None and len(trajectory):
         traj_arr = np.asarray(trajectory, dtype=float)
         if traj_arr.ndim == 2 and traj_arr.shape[0] and traj_arr.shape[1] >= 2:
             t_dx = float(traj_arr[:, 0].max() - traj_arr[:, 0].min())
             t_dy = float(traj_arr[:, 1].max() - traj_arr[:, 1].min())
-            traj_room_area = (t_dx + 0.50) * (t_dy + 0.50)
             traj_short_side = min(t_dx, t_dy) + 0.35
-            if traj_room_area < SMALL_ROOM_KEEPOUT_MAX_AREA_M2 or traj_short_side < SMALL_ROOM_KEEPOUT_MIN_SHORT_SIDE_M:
-                is_small_room = True
+            if traj_short_side < min_keepout_room_width_m:
+                is_compact_cavity = True
 
-    if is_small_room:
+    if is_compact_cavity:
         return empty
 
     occupied, x_min, y_min, resolution, width, height = _raster_u8(pts[:, :2])
@@ -2525,10 +2616,14 @@ def classify_occupancy_necks(
             and span_b >= 0.80
             and dwell_b >= 0.15
         )
+        w_n = max(float(c.get("neck_width_m", 0.0)), OPEN_CORRIDOR_MIN_WIDTH_M)
+        l_t = max(float(c.get("tail_length_m", 0.0)), OPEN_CORRIDOR_MIN_LENGTH_M)
+        min_ab = min(float(c["area_a_m2"]), float(c["area_b_m2"]))
+        max_ab = max(float(c["area_a_m2"]), float(c["area_b_m2"]), 1e-3)
         if (
             has_kinetic_movement
-            and c["area_a_m2"] >= SECOND_ROOM_MIN_AREA_M2
-            and c["area_b_m2"] >= SECOND_ROOM_MIN_AREA_M2
+            and min_ab >= 1.5 * w_n * l_t
+            and min_ab >= 0.35 * max_ab
         ):
             c["neck_kind"] = "room_connector"
             return c
@@ -2544,13 +2639,15 @@ def classify_occupancy_necks(
             and span_b >= 0.80
             and dwell_b >= 0.15
         )
-        is_small_room = float(c.get("area_a_m2", 0.0)) < 6.0
-        is_narrow_neck = float(c.get("neck_width_m", 0.0)) <= 1.60
+        w_n = max(float(c.get("neck_width_m", 0.0)), OPEN_CORRIDOR_MIN_WIDTH_M)
+        l_t = max(float(c.get("tail_length_m", 0.0)), OPEN_CORRIDOR_MIN_LENGTH_M)
+        is_compact_cavity = float(c.get("area_a_m2", 0.0)) < 2.5 * w_n * l_t
+        is_narrow_neck = float(c.get("neck_width_m", 0.0)) < 2.0 * OPEN_CORRIDOR_MIN_WIDTH_M
         if (
             has_kinetic_movement
             and c["tail_length_m"] >= OPEN_CORRIDOR_MIN_LENGTH_M
             and c["neck_width_m"] >= OPEN_CORRIDOR_MIN_WIDTH_M
-            and not (is_small_room and is_narrow_neck)
+            and not (is_compact_cavity and is_narrow_neck)
         ):
             c["neck_kind"] = "open_corridor"
             return c

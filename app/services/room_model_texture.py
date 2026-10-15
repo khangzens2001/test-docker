@@ -92,7 +92,13 @@ def export_room_model_texture_glb(
         if K.shape != (3, 3):
             return None
 
-        from app.pipeline.runner import load_pose_table_for_tsdf
+        from app.pipeline.runner import (
+            _display_to_camera_sensor_rotation,
+            extract_lidar_display_metadata,
+            load_pose_table_for_tsdf,
+            resolve_gravity_vector,
+            resolve_keyframe_rgb_path,
+        )
 
         pose_df = load_pose_table_for_tsdf(session_dir)
         if pose_df.empty:
@@ -111,7 +117,14 @@ def export_room_model_texture_glb(
             R_ff = np.eye(2)
             t_ff = np.zeros(2)
 
-        g = np.asarray(G_ARCORE_WORLD, dtype=float).reshape(3)
+        g_raw = layout.get("gravity_vector") if isinstance(layout, dict) else None
+        if g_raw is None:
+            g_raw = resolve_gravity_vector(
+                pose_df, source=pose_df.attrs.get("pose_source", "unknown")
+            )
+        if g_raw is None:
+            g_raw = G_ARCORE_WORLD
+        g = np.asarray(g_raw, dtype=float).reshape(3)
         g_norm = float(np.linalg.norm(g))
         R_grav = align_rotation(g / g_norm) if g_norm > 0 else np.eye(3)
 
@@ -123,13 +136,31 @@ def export_room_model_texture_glb(
             p_w = (R_grav.T @ p_g.T).T
             return p_w
 
+        manifest_data = None
+        manifest_path = os.path.join(session_dir, "manifest.json")
+        if os.path.isfile(manifest_path):
+            try:
+                import json as _json
+                with open(manifest_path, "r", encoding="utf-8") as mf:
+                    manifest_data = _json.load(mf)
+            except Exception:
+                manifest_data = None
+        _, _, rot_deg = extract_lidar_display_metadata(manifest_data)
+        R_dc = (
+            _display_to_camera_sensor_rotation(rot_deg)
+            if pose_df.attrs.get("pose_source") == "server_vio"
+            else np.eye(3)
+        )
+
         # Gather all valid camera poses
         all_keyframes = []
         for idx, row in pose_df.iterrows():
             fn = int(row["frame"])
             rgb_file = os.path.join(session_dir, "rgb", f"{fn:06d}.jpg")
-            if os.path.isfile(rgb_file):
-                R = Rotation.from_quat([row["qx"], row["qy"], row["qz"], row["qw"]]).as_matrix()
+            if not os.path.isfile(rgb_file):
+                rgb_file = resolve_keyframe_rgb_path(session_dir, {"frame": fn}) or ""
+            if rgb_file and os.path.isfile(rgb_file):
+                R = Rotation.from_quat([row["qx"], row["qy"], row["qz"], row["qw"]]).as_matrix() @ R_dc
                 t = np.array([row["x"], row["y"], row["z"]], dtype=float)
                 all_keyframes.append({"frame": fn, "path": rgb_file, "R": R, "t": t, "idx": idx})
 
@@ -409,6 +440,67 @@ def export_room_model_texture_glb(
             faces.append(
                 [base_floor + int(tri[0]), base_floor + int(tri[1]), base_floor + int(tri[2])]
             )
+
+        obstacles = layout.get("obstacles") if isinstance(layout, dict) else None
+        if isinstance(obstacles, list) and obstacles:
+            sw_r0 = max(wall_h_px, floor_row_start - 12)
+            sw_r1 = min(tex_h, floor_row_start - 2)
+            if sw_r1 > sw_r0:
+                atlas[sw_r0:sw_r1, 10:50] = np.array([195, 208, 222], dtype=np.uint8)
+                u_fix = 30.0 / tex_w
+                v_fix = 1.0 - (0.5 * (sw_r0 + sw_r1) / tex_h)
+            else:
+                u_fix, v_fix = 0.5, 0.39
+            for obs in obstacles:
+                if not isinstance(obs, dict):
+                    continue
+                bmin = obs.get("bbox_min")
+                bmax = obs.get("bbox_max")
+                if (
+                    not isinstance(bmin, (list, tuple))
+                    or not isinstance(bmax, (list, tuple))
+                    or len(bmin) < 3
+                    or len(bmax) < 3
+                ):
+                    continue
+                try:
+                    ox0, oy0, oz0 = float(bmin[0]), float(bmin[1]), max(0.0, float(bmin[2]))
+                    ox1, oy1, oz1 = float(bmax[0]), float(bmax[1]), min(height_m - 0.10, float(bmax[2]))
+                except (TypeError, ValueError):
+                    continue
+                if ox1 - ox0 < 0.05 or oy1 - oy0 < 0.05 or oz1 - oz0 < 0.05:
+                    continue
+                ob = len(verts_3d)
+                verts_3d.extend(
+                    [
+                        [ox0, oy0, oz0],
+                        [ox1, oy0, oz0],
+                        [ox1, oy1, oz0],
+                        [ox0, oy1, oz0],
+                        [ox0, oy0, oz1],
+                        [ox1, oy0, oz1],
+                        [ox1, oy1, oz1],
+                        [ox0, oy1, oz1],
+                    ]
+                )
+                for _ in range(8):
+                    uvs.append([u_fix, v_fix])
+                faces.extend(
+                    [
+                        [ob + 0, ob + 1, ob + 5],
+                        [ob + 0, ob + 5, ob + 4],
+                        [ob + 1, ob + 2, ob + 6],
+                        [ob + 1, ob + 6, ob + 5],
+                        [ob + 2, ob + 3, ob + 7],
+                        [ob + 2, ob + 7, ob + 6],
+                        [ob + 3, ob + 0, ob + 4],
+                        [ob + 3, ob + 4, ob + 7],
+                        [ob + 4, ob + 5, ob + 6],
+                        [ob + 4, ob + 6, ob + 7],
+                        [ob + 0, ob + 2, ob + 1],
+                        [ob + 0, ob + 3, ob + 2],
+                    ]
+                )
 
         # Save atlas image as PNG for 2D inspection
         atlas_path = os.path.join(session_dir, "room_model_texture_atlas.png")

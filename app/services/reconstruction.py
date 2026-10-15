@@ -73,15 +73,16 @@ class ReconstructionService:
         )
         def _make_uniform_volume(poses_list):
             all_t = np.array([p[0:3, 3] for p in poses_list], dtype=float)
-            all_fwd = np.array([p[0:3, 3] + p[0:3, :3] @ np.array([0.0, 0.0, 2.0]) for p in poses_list], dtype=float)
-            all_back = np.array([p[0:3, 3] + p[0:3, :3] @ np.array([0.0, 0.0, -2.0]) for p in poses_list], dtype=float)
+            all_fwd = np.array([p[0:3, 3] + p[0:3, :3] @ np.array([0.0, 0.0, 2.5]) for p in poses_list], dtype=float)
+            all_back = np.array([p[0:3, 3] + p[0:3, :3] @ np.array([0.0, 0.0, -2.5]) for p in poses_list], dtype=float)
             pts_box = np.vstack([all_t, all_fwd, all_back])
             p_min = pts_box.min(axis=0) - 1.5
             p_max = pts_box.max(axis=0) + 1.5
             span = float(np.max(p_max - p_min))
-            length = max(span, 6.0)
-            origin = p_min - 0.5
-            res = int(np.clip(length / 0.08, 64, 256))
+            length = max(span, 6.4)
+            center = 0.5 * (p_min + p_max)
+            origin = center - 0.5 * length
+            res = int(np.clip(round(length / VOXEL_LENGTH), 64, 256))
             return o3d.pipelines.integration.UniformTSDFVolume(
                 length,
                 res,
@@ -121,20 +122,8 @@ class ReconstructionService:
             vol.reset()
             return m
 
-        if len(depths) <= 2:
-            volume = _make_uniform_volume(poses)
-            mesh = _run_integrate(volume)
-        else:
-            volume = o3d.pipelines.integration.ScalableTSDFVolume(
-                voxel_length=VOXEL_LENGTH,
-                sdf_trunc=SDF_TRUNC,
-                color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
-            )
-            mesh = _run_integrate(volume)
-            if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
-                logger.warning("ScalableTSDFVolume returned empty mesh; falling back to UniformTSDFVolume.")
-                vol_u = _make_uniform_volume(poses)
-                mesh = _run_integrate(vol_u)
+        volume = _make_uniform_volume(poses)
+        mesh = _run_integrate(volume)
 
         for i in range(len(depths)):
             depths[i] = None

@@ -44,6 +44,8 @@ from app.services.alignment import (
 )
 from app.services.bundle import export_session_bundle
 from app.services.calibration import (
+    _display_to_camera_sensor_rotation,
+    chain_wahba_to_lidar_camera_extrinsics,
     extract_lidar_display_metadata,
     load_camera_intrinsics,
     load_processed_lidar_for_tof,
@@ -51,6 +53,8 @@ from app.services.calibration import (
     lookup_lidar_row,
     normalize_quaternions_vectorized,
     project_lidar_frame_to_sparse_tof,
+    project_lidar_frame_to_sparse_tof_with_status,
+    refine_extrinsics_from_session,
     refine_lidar_camera_extrinsics_em,
     should_skip_tof_keyframe,
 )
@@ -60,6 +64,7 @@ from app.services.floorplan import export_artifacts
 from app.services.ingestion import (
     assign_primary_imu,
     assign_seq_num,
+    build_cross_stream_index_map,
     detect_time_unit,
     hub_gap_stats,
     map_hub_android_from_lidar,
@@ -950,14 +955,24 @@ def run_sensor_ingestion(session_dir: str) -> dict[str, Any]:
             hub_R_diag["hub_R_sv_ratio"] = (
                 None if wahba["sv_ratio"] is None else float(wahba["sv_ratio"])
             )
+            if "lag_ms" in wahba:
+                hub_R_diag["hub_gyro_lag_ms"] = float(wahba["lag_ms"])
             if wahba["accepted"] and wahba["R"] is not None:
                 hub_R_accepted_matrix = np.asarray(wahba["R"], dtype=np.float64)
+                lag_ns = int(wahba.get("lag_ns", 0))
+                if lag_ns != 0 and "device_timestamp_ns" in processed_imu.columns:
+                    processed_imu["device_timestamp_ns"] = (
+                        processed_imu["device_timestamp_ns"].to_numpy(dtype=np.int64) - lag_ns
+                    )
+                    processed_imu.to_csv(os.path.join(session_dir, "processed_imu.csv"), index=False)
         except Exception as exc:
             logger.warning("Hub IMU Wahba estimation failed with %s: %s", type(exc).__name__, exc)
 
     if len(odo_data) > 0:
         odo_stitched = select_best_tracking_island(odo_data, imu_df=processed_phone)
         odo_stitched.to_csv(os.path.join(session_dir, "processed_odometry.csv"), index=False)
+    else:
+        odo_stitched = None
 
     lidar_cols = ["device_timestamp_ns", "mcu_timestamp_ns"]
     lidar_cols += [f"distance_{i}" for i in range(64)]
@@ -968,9 +983,28 @@ def run_sensor_ingestion(session_dir: str) -> dict[str, Any]:
     lidar_cols = [c for c in lidar_cols if c in lidar_data.columns]
     lidar_data[lidar_cols].to_csv(os.path.join(session_dir, "processed_lidar.csv"), index=False)
 
+    try:
+        cross_map = build_cross_stream_index_map(
+            lidar_data[lidar_cols],
+            phone_imu_df=processed_phone,
+            hub_imu_df=processed_imu,
+            odo_df=odo_stitched if odo_stitched is not None else odo_data,
+        )
+        if not cross_map.empty:
+            cross_map.to_csv(os.path.join(session_dir, "cross_stream_mapping.csv"), index=False)
+    except Exception as exc:
+        logger.debug("Cross-stream index mapping skipped: %s", exc)
+
+    T_lidar_chained = chain_wahba_to_lidar_camera_extrinsics(
+        T_lidar,
+        hub_R_accepted_matrix,
+        rot_deg=rot_deg,
+        extrinsics_calibrated=extra_meta.get("extrinsics_calibrated"),
+    )
+
     processed_extrinsics = {
         "T_imu_camera": T_imu.tolist(),
-        "T_lidar_camera": T_lidar.tolist(),
+        "T_lidar_camera": T_lidar_chained.tolist(),
         "T_imu_camera_meaning": extra_meta.get("T_imu_camera_meaning"),
         "ray_frame": extra_meta.get("ray_frame"),
         "source": extra_meta.get("source"),
@@ -1054,10 +1088,25 @@ def run_3d_reconstruction(
 
     k = load_camera_intrinsics(os.path.join(session_dir, "camera_matrix.csv"))
 
-    if enable_server_vio:
+    recon_timings: dict[str, float] = {}
+
+    t_pre_cal = time.time()
+    try:
+        refine_extrinsics_from_session(session_dir, prefer_server_vio=False)
+    except Exception:
+        logger.debug("Pre-VIO extrinsic refinement skipped", exc_info=True)
+    recon_timings["pre_vio_cal_sec"] = round(time.time() - t_pre_cal, 3)
+
+    t_vio = time.time()
+    if enable_server_vio and not (
+        os.getenv("SKIP_EXISTING_VIO", "0") == "1"
+        and os.path.isfile(os.path.join(session_dir, "processed_vio.csv"))
+    ):
         publish_session_vio(session_dir)
         gc.collect()
+    recon_timings["vio_sec"] = round(time.time() - t_vio, 3)
 
+    t_kf = time.time()
     estimator = VioEstimator()
     pose_df = load_pose_table_for_tsdf(session_dir, prefer_server_vio=enable_server_vio)
     raw_keyframes = estimator.select_keyframes(pose_df)
@@ -1098,6 +1147,7 @@ def run_3d_reconstruction(
             resolved.append(item)
 
     keyframes = _decimate_keyframes(resolved, max_limit=150)
+    recon_timings["keyframe_selection_sec"] = round(time.time() - t_kf, 3)
 
     manifest_data = None
     if os.path.isfile(manifest_path):
@@ -1131,7 +1181,7 @@ def run_3d_reconstruction(
     z_max_ghost = max(GHOST_RANGE_FLOOR_M, diag + GHOST_TRAJ_MARGIN_M)
 
     enable_vggt = is_vggt_enabled()
-    force_vggt = (pose_df.attrs.get("pose_source") == "server_vio") or (os.getenv("FORCE_VGGT", "0") == "1")
+    force_vggt = os.getenv("FORCE_VGGT", "0") == "1"
 
     can_parallel = False
     parallel_reason = ""
@@ -1166,6 +1216,7 @@ def run_3d_reconstruction(
     try:
         depth_service = DepthCompletionService()
 
+        t_em = time.time()
         try:
             em = refine_lidar_camera_extrinsics_em(
                 T0=lidar_pack.get("T_lidar_camera"),
@@ -1185,14 +1236,32 @@ def run_3d_reconstruction(
                 lidar_pack["T_lidar_camera"] = em["T_lidar_camera"]
         except Exception:
             logger.exception("EM extrinsic refinement failed for session; keeping T0")
+        recon_timings["em_refinement_sec"] = round(time.time() - t_em, 3)
 
         from concurrent.futures import ThreadPoolExecutor
+
+        session_R_dc = None
+        if pose_df is not None and pose_df.attrs.get("pose_source") == "server_vio" and rot_deg and keyframes:
+            r_dc_cand = _display_to_camera_sensor_rotation(rot_deg)
+            if not np.allclose(r_dc_cand, np.eye(3)):
+                z0_list = []
+                z1_list = []
+                for kf_c in keyframes[:20]:
+                    try:
+                        r_m = Rotation.from_quat([kf_c["qx"], kf_c["qy"], kf_c["qz"], kf_c["qw"]]).as_matrix()
+                        z0_list.append(abs(float(r_m[2, 0])))
+                        z1_list.append(abs(float(r_m[2, 1])))
+                    except Exception:
+                        pass
+                if z0_list and float(np.median(z0_list)) < 0.5 and float(np.median(z1_list)) >= 0.4:
+                    session_R_dc = r_dc_cand
 
         def _prep_keyframe(kf):
             rgb = cv2.imread(kf["_rgb_path"]) if cv2 is not None else None
             if rgb is None:
                 return None
             sparse_tof = np.zeros(rgb.shape[:2], dtype=np.float32)
+            sparse_status = None
             row = lookup_lidar_row(
                 lidar_pack.get("df"),
                 kf.get("frame"),
@@ -1214,21 +1283,51 @@ def run_3d_reconstruction(
                     flip_v=flip_v,
                     rot_deg=rot_deg,
                 )
+                stat_cols = [f"status_{i}" for i in range(64)]
+                if all(c in row.index for c in stat_cols):
+                    stats = row[stat_cols].to_numpy(dtype=np.float64)
+                    _, sparse_status = project_lidar_frame_to_sparse_tof_with_status(
+                        dists,
+                        stats,
+                        lidar_pack["rays"],
+                        lidar_pack["T_lidar_camera"],
+                        k,
+                        h,
+                        w,
+                        flip_h=flip_h,
+                        flip_v=flip_v,
+                        rot_deg=rot_deg,
+                    )
             if should_skip_tof_keyframe(has_lidar, sparse_tof):
                 return None
 
             R_wc = Rotation.from_quat([kf["qx"], kf["qy"], kf["qz"], kf["qw"]]).as_matrix()
+            if session_R_dc is not None:
+                R_wc = R_wc @ session_R_dc
             g_cam = None if g_world is None else (R_wc.T @ np.asarray(g_world, dtype=float))
-            return (kf, rgb, sparse_tof, R_wc, g_cam)
+            return (kf, rgb, sparse_tof, sparse_status, R_wc, g_cam)
 
+        t_depth = time.time()
         with ThreadPoolExecutor(max_workers=2) as executor:
             for idx, item in enumerate(executor.map(_prep_keyframe, keyframes)):
                 if progress_callback:
                     progress_callback(idx, len(keyframes))
                 if item is None:
                     continue
-                kf, rgb, sparse_tof, R_wc, g_cam = item
-                dense_depth = depth_service.run_depthor_plus(rgb, sparse_tof, k, g_cam=g_cam, z_max_ghost=z_max_ghost)
+                kf, rgb, sparse_tof, sparse_status, R_wc, g_cam = item
+                try:
+                    dense_depth = depth_service.run_depthor_plus(
+                        rgb,
+                        sparse_tof,
+                        k,
+                        g_cam=g_cam,
+                        z_max_ghost=z_max_ghost,
+                        sparse_status=sparse_status,
+                    )
+                except TypeError:
+                    dense_depth = depth_service.run_depthor_plus(
+                        rgb, sparse_tof, k, g_cam=g_cam, z_max_ghost=z_max_ghost
+                    )
                 if np.count_nonzero(dense_depth > 0) == 0:
                     continue
                 depths.append(dense_depth)
@@ -1238,6 +1337,7 @@ def run_3d_reconstruction(
                 pose[0:3, 3] = [kf["x"], kf["y"], kf["z"]]
                 pose[0:3, 0:3] = R_wc
                 poses.append(pose)
+        recon_timings["depth_completion_sec"] = round(time.time() - t_depth, 3)
 
         trajectory = (
             pose_df[["x", "y", "z"]].to_numpy(dtype=float)
@@ -1253,6 +1353,7 @@ def run_3d_reconstruction(
             )
         )
 
+        t_tsdf = time.time()
         reconstruction_service = ReconstructionService()
         mesh = reconstruction_service.integrate_tsdf(depths, poses, k, colors)
         del depths, poses, colors
@@ -1272,11 +1373,13 @@ def run_3d_reconstruction(
             raise ValueError("TSDF produced empty mesh.")
 
         reconstruction_service.export_mesh_artifacts(mesh, session_dir)
+        recon_timings["tsdf_integration_sec"] = round(time.time() - t_tsdf, 3)
 
         vggt_prior = None
         if vggt_worker is not None:
             logger.info("Depthor+ and TSDF integration completed. Waiting for parallel VGGT barrier...")
             vggt_res = vggt_worker.join()
+            recon_timings["vggt_sec"] = round(float(vggt_res.get("duration_s", 0.0)), 3)
             if vggt_res.get("success", False):
                 vggt_result = load_vggt_prior(session_dir)
                 vggt_prior = vggt_result.prior
@@ -1295,12 +1398,14 @@ def run_3d_reconstruction(
                 vggt_result = VggtPriorResult(prior=None, skip_reason=f"parallel_vggt_failed: {err_msg}")
                 vggt_prior = None
         elif enable_vggt:
+            t_vseq = time.time()
             try:
                 from app.services.vggt_runner import run_vggt_inference
 
                 run_vggt_inference(session_dir, force_recompute=force_vggt)
             except Exception:
                 logger.exception("VGGT inference attempt failed; falling back to standard reconstruction")
+            recon_timings["vggt_sec"] = round(time.time() - t_vseq, 3)
 
             vggt_result = load_vggt_prior(session_dir)
             vggt_prior = vggt_result.prior
@@ -1309,11 +1414,13 @@ def run_3d_reconstruction(
 
             vggt_result = VggtPriorResult(prior=None, skip_reason="disabled_by_config")
             vggt_prior = None
+            recon_timings["vggt_sec"] = 0.0
     finally:
         if vggt_worker is not None and not vggt_worker._joined:
             logger.warning("Terminating background VGGT worker due to unhandled pipeline interruption")
             vggt_worker.terminate()
 
+    t_seg = time.time()
     try:
         layout, whiteflat_pcd = reconstruction_service.segment_planes(
             mesh,
@@ -1327,7 +1434,9 @@ def run_3d_reconstruction(
             layout, whiteflat_pcd = reconstruction_service.segment_planes(mesh, gravity_vector)
         else:
             raise
+    recon_timings["plane_segmentation_sec"] = round(time.time() - t_seg, 3)
 
+    t_exp = time.time()
     attach_vggt_diagnostics(layout, vggt_result)
     export_artifacts(layout, session_dir)
     reconstruction_service.export_whiteflat_ply(whiteflat_pcd, session_dir)
@@ -1340,6 +1449,7 @@ def run_3d_reconstruction(
         export_room_model_texture_glb(session_dir, layout=layout)
     except Exception:
         logger.exception("Failed to export room_model_texture.glb")
+    recon_timings["export_artifacts_sec"] = round(time.time() - t_exp, 3)
 
     return {
         "status": "reconstructed",
@@ -1347,6 +1457,7 @@ def run_3d_reconstruction(
         "mesh": mesh,
         "pose_df": pose_df,
         "keyframes_count": len(keyframes),
+        "timings": recon_timings,
     }
 
 
@@ -1593,6 +1704,8 @@ class PipelineRunner:
                 stage_callback=self.stage_callback,
             )
             timings["reconstruction_sec"] = round(time.time() - t1, 3)
+            if isinstance(recon_res, dict) and "timings" in recon_res:
+                timings.update(recon_res["timings"])
 
             # 3. Material Estimation & Bundle Export
             t2 = time.time()

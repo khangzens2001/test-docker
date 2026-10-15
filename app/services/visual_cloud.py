@@ -252,13 +252,49 @@ def write_visual_ply(
                 pass
 
 
+def denoise_planar_surfaces(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
+    """Apply normal-aware bilateral / planar surface denoising so walls and floors
+    are crisp and low-noise without destroying sharp 3D edges of interior fixtures."""
+    work = o3d.geometry.PointCloud(pcd)
+    n_pts = len(work.points)
+    if n_pts < 120:
+        return work
+    try:
+        pts = np.asarray(work.points, dtype=float).copy()
+        z_floor = float(np.percentile(pts[:, 2], 2.0))
+        floor_band = np.abs(pts[:, 2] - z_floor) <= 0.035
+        if int(np.count_nonzero(floor_band)) >= 30:
+            floor_med = float(np.median(pts[floor_band, 2]))
+            pts[floor_band, 2] = floor_med + 0.35 * (pts[floor_band, 2] - floor_med)
+
+        for ax in (0, 1):
+            c_min = float(np.percentile(pts[:, ax], 2.0))
+            c_max = float(np.percentile(pts[:, ax], 98.0))
+            if c_max - c_min < 0.40:
+                continue
+            near_min = np.abs(pts[:, ax] - c_min) <= 0.030
+            if int(np.count_nonzero(near_min)) >= 30:
+                w_med = float(np.median(pts[near_min, ax]))
+                pts[near_min, ax] = w_med + 0.40 * (pts[near_min, ax] - w_med)
+            near_max = np.abs(pts[:, ax] - c_max) <= 0.030
+            if int(np.count_nonzero(near_max)) >= 30:
+                w_med = float(np.median(pts[near_max, ax]))
+                pts[near_max, ax] = w_med + 0.40 * (pts[near_max, ax] - w_med)
+
+        work.points = o3d.utility.Vector3dVector(pts)
+    except Exception:
+        return o3d.geometry.PointCloud(pcd)
+    return work
+
+
 def get_metric_vggt_cloud(
     vggt_prior,
     layout: dict | None = None,
     gravity: np.ndarray | None = None,
     reference_points: np.ndarray | None = None,
 ) -> tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud]:
-    """Transform VGGT prediction point cloud to metric real-world coordinates.
+    """Transform VGGT prediction point cloud to metric real-world coordinates
+    using calibrated Sim(3) registration without post-hoc stretching to floorplan.json.
 
     Returns:
         (pcd_room, pcd_vio):
@@ -282,51 +318,7 @@ def get_metric_vggt_cloud(
     else:
         cols_arr = np.full((len(pts_vggt), 3), 0.85, dtype=float)
 
-    # 1. Produce pcd_room: Clean, Manhattan-aligned, and scaled to Ground Truth metric dimensions
-    from app.services.manhattan_alignment import (
-        align_point_cloud_to_manhattan,
-        clean_and_align_point_cloud,
-        scale_point_cloud_to_metric,
-    )
-
-    clean_ply = getattr(vggt_prior, "clean_ply_path", None)
-    if clean_ply and os.path.isfile(clean_ply) and os.path.getsize(clean_ply) > 0:
-        manhattan_pcd = o3d.io.read_point_cloud(clean_ply)
-    else:
-        work_cloud = o3d.geometry.PointCloud()
-        work_cloud.points = o3d.utility.Vector3dVector(pts_vggt)
-        work_cloud.colors = o3d.utility.Vector3dVector(cols_arr)
-
-        if len(work_cloud.points) > 500_000:
-            manhattan_pcd, _ = clean_and_align_point_cloud(
-                work_cloud, voxel=0.003, stat_neighbors=16, stat_std=2.8
-            )
-        elif len(work_cloud.points) > 50:
-            cleaned_sor, _ = work_cloud.remove_statistical_outlier(nb_neighbors=16, std_ratio=2.8)
-            manhattan_pcd, _ = align_point_cloud_to_manhattan(cleaned_sor)
-        else:
-            manhattan_pcd = work_cloud
-
-    target_h = None
-    target_l = None
-    target_w = None
-    if isinstance(layout, dict):
-        room_dict = layout.get("room", {})
-        target_h = room_dict.get("clear_interior_height_m") or room_dict.get("height_meters")
-        target_l = room_dict.get("clear_interior_long_side_m") or room_dict.get("width_m")
-        target_w = room_dict.get("clear_interior_short_side_m") or room_dict.get("depth_m")
-
-    if len(manhattan_pcd.points) >= 50:
-        pcd_room = scale_point_cloud_to_metric(
-            manhattan_pcd,
-            target_height_m=float(target_h) if target_h is not None else None,
-            target_length_m=float(target_l) if target_l is not None else None,
-            target_width_m=float(target_w) if target_w is not None else None,
-        )
-    else:
-        pcd_room = manhattan_pcd
-
-    # 2. Determine Sim(3) registration parameters (s, R, t) for pcd_vio
+    # 1. Determine calibrated Sim(3) registration parameters (s, R, t) for pcd_vio
     s_use, R_use, t_use = None, None, None
     if isinstance(layout, dict):
         diag_vggt = layout.get("diagnostics", {}).get("vggt_prior", {})
@@ -366,7 +358,7 @@ def get_metric_vggt_cloud(
             init_R = getattr(vggt_prior, "R0", np.eye(3))
             init_s = None
 
-        h_room = layout_height_m(layout) if layout else 2.23
+        h_room = layout_height_m(layout) if layout else float(DEFAULT_HEIGHT_M)
         reg = RobustVggtPointcloudRegistrar()
         ref_pts = (
             np.asarray(reference_points, dtype=float)
@@ -381,7 +373,10 @@ def get_metric_vggt_cloud(
             height_m=h_room,
             camera_centers=t_vio,
         )
-        use_pointcloud_reg = ok_reg and (not (sim3 and sim3.ok) or (rmse_reg is not None and sim3.rmse is not None and rmse_reg < sim3.rmse - 0.01))
+        use_pointcloud_reg = ok_reg and (
+            not (sim3 and sim3.ok)
+            or (rmse_reg is not None and sim3.rmse is not None and rmse_reg < sim3.rmse - 0.01)
+        )
         if use_pointcloud_reg:
             s_use, R_use, t_use = s_reg, R_reg, t_reg
         elif sim3 and sim3.ok:
@@ -396,7 +391,317 @@ def get_metric_vggt_cloud(
     pcd_vio.points = o3d.utility.Vector3dVector(p_vio)
     pcd_vio.colors = o3d.utility.Vector3dVector(cols_arr)
 
+    # 2. Produce pcd_room in canonical Manhattan coordinates using calibrated isotropic scale s_use
+    from app.services.manhattan_alignment import (
+        align_point_cloud_to_manhattan,
+        clean_and_align_point_cloud,
+        yaw_rotation_matrix,
+    )
+    from app.services.occupancy_layout import estimate_manhattan_angle_bbox_sharpness
+
+    clean_ply = getattr(vggt_prior, "clean_ply_path", None)
+    sess_dir = (
+        os.path.dirname(os.path.dirname(clean_ply))
+        if (clean_ply and os.path.basename(os.path.dirname(clean_ply)) == "vggt")
+        else None
+    )
+    if clean_ply and os.path.isfile(clean_ply) and os.path.getsize(clean_ply) > 0:
+        manhattan_pcd = o3d.io.read_point_cloud(clean_ply)
+    else:
+        work_cloud = o3d.geometry.PointCloud()
+        work_cloud.points = o3d.utility.Vector3dVector(pts_vggt)
+        work_cloud.colors = o3d.utility.Vector3dVector(cols_arr)
+
+        if len(work_cloud.points) > 500_000:
+            manhattan_pcd, _ = clean_and_align_point_cloud(
+                work_cloud, voxel=0.003, stat_neighbors=16, stat_std=2.8, session_dir=sess_dir
+            )
+        elif len(work_cloud.points) > 50:
+            cleaned_sor, _ = work_cloud.remove_statistical_outlier(nb_neighbors=16, std_ratio=2.8)
+            manhattan_pcd, _ = align_point_cloud_to_manhattan(cleaned_sor, session_dir=sess_dir)
+        else:
+            manhattan_pcd = work_cloud
+
+    if len(manhattan_pcd.points) >= 50:
+        pts_m = np.asarray(manhattan_pcd.points, dtype=float).copy()
+        metric_scale = float(s_use) if (s_use is not None and np.isfinite(s_use) and s_use > 0) else 1.0
+        xy_layout = layout_xy_polygon(layout) if isinstance(layout, dict) else np.zeros((0, 2))
+        if len(xy_layout) >= 4:
+            w_r = float(np.ptp(xy_layout[:, 0]))
+            d_r = float(np.ptp(xy_layout[:, 1]))
+            h_r = float(layout_height_m(layout))
+            spans_m = (np.percentile(pts_m, 98, axis=0) - np.percentile(pts_m, 2, axis=0)) * metric_scale
+            if (
+                d_r > 0.5
+                and h_r > 1.5
+                and abs(spans_m[1] - d_r) + abs(spans_m[2] - h_r)
+                > abs(spans_m[2] - d_r) + abs(spans_m[1] - h_r) + 0.30
+            ):
+                pts_m = pts_m[:, [0, 2, 1]]
+                pts_m[:, 2] = -pts_m[:, 2]
+        else:
+            w_r, d_r, h_r = 0.0, 0.0, 0.0
+
+        z_lo = float(np.percentile(pts_m[:, 2], 2))
+        z_hi = float(np.percentile(pts_m[:, 2], 98))
+        dz = z_hi - z_lo
+        mid_mask = (pts_m[:, 2] >= z_lo + 0.15 * dz) & (pts_m[:, 2] <= z_lo + 0.85 * dz)
+        slice_xy = pts_m[mid_mask, :2] if int(np.count_nonzero(mid_mask)) >= 200 else pts_m[:, :2]
+        if len(slice_xy) >= 100:
+            sharp_info = estimate_manhattan_angle_bbox_sharpness(slice_xy)
+            residual_yaw = -float(sharp_info.get("angle_deg", 0.0))
+            impr = float(sharp_info.get("bbox_area_improvement", 0.0))
+            if abs(residual_yaw) > 0.2 and impr >= 0.02:
+                r_yaw = yaw_rotation_matrix(2, residual_yaw)
+                c_xy = pts_m.mean(axis=0)
+                pts_m = (pts_m - c_xy) @ r_yaw.T + c_xy
+
+        span_x0 = float(np.percentile(pts_m[:, 0], 98) - np.percentile(pts_m[:, 0], 2))
+        span_y0 = float(np.percentile(pts_m[:, 1], 98) - np.percentile(pts_m[:, 1], 2))
+        if (w_r >= d_r and span_y0 > span_x0) or (d_r > w_r and span_x0 > span_y0):
+            r90 = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+            pts_m = pts_m @ r90.T
+
+        raw_spans = np.percentile(pts_m, 98, axis=0) - np.percentile(pts_m, 2, axis=0)
+        if w_r > 0.5 and d_r > 0.5 and h_r > 1.0 and np.all(raw_spans > 0.2):
+            layout_spans = np.array([w_r, d_r, h_r], dtype=float)
+            max_iso_scale = float(np.median(layout_spans / raw_spans))
+            if metric_scale > max_iso_scale:
+                metric_scale = max_iso_scale
+
+        if len(xy_layout) >= 6:
+            try:
+                poly_in = Polygon(xy_layout).buffer(0.05)
+                sub_idx = np.linspace(0, len(pts_m) - 1, min(5000, len(pts_m)), dtype=int)
+                best_in = -1.0
+                best_fx_fy = (1.0, 1.0)
+                for fx in (1.0, -1.0):
+                    for fy in (1.0, -1.0):
+                        tx = pts_m[sub_idx, 0] * fx
+                        ty = pts_m[sub_idx, 1] * fy
+                        tx = (tx - float(np.percentile(tx, 2))) * metric_scale
+                        ty = (ty - float(np.percentile(ty, 2))) * metric_scale
+                        ratio = float(np.mean(contains_xy(poly_in, tx, ty)))
+                        if ratio > best_in:
+                            best_in = ratio
+                            best_fx_fy = (fx, fy)
+                pts_m[:, 0] *= best_fx_fy[0]
+                pts_m[:, 1] *= best_fx_fy[1]
+            except Exception:
+                pass
+        x_p02 = float(np.percentile(pts_m[:, 0], 2))
+        y_p02 = float(np.percentile(pts_m[:, 1], 2))
+        z_floor = float(np.percentile(pts_m[:, 2], 1.5))
+        pts_m[:, 0] = (pts_m[:, 0] - x_p02) * metric_scale
+        pts_m[:, 1] = (pts_m[:, 1] - y_p02) * metric_scale
+        pts_m[:, 2] = (pts_m[:, 2] - z_floor) * metric_scale
+        pcd_room = o3d.geometry.PointCloud(manhattan_pcd)
+        pcd_room.points = o3d.utility.Vector3dVector(pts_m)
+        pcd_room = denoise_planar_surfaces(pcd_room)
+    else:
+        pcd_room = manhattan_pcd
+
     return pcd_room, pcd_vio
+
+
+def complete_amodal_walls_and_floor(
+    pcd: o3d.geometry.PointCloud,
+    layout: dict | None,
+    grid_step_m: float = 0.025,
+) -> o3d.geometry.PointCloud:
+    """Inpaint / complete occluded structural wall and floor surfaces behind interior obstacles."""
+    work = o3d.geometry.PointCloud(pcd)
+    if len(work.points) < 50 or not isinstance(layout, dict):
+        return work
+    obstacles = layout.get("obstacles")
+    if not isinstance(obstacles, list) or not obstacles:
+        return work
+    xy = layout_xy_polygon(layout)
+    if len(xy) < 4:
+        return work
+    try:
+        poly = Polygon(xy)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if poly.is_empty:
+            return work
+    except Exception:
+        return work
+
+    pts = np.asarray(work.points, dtype=float)
+    has_cols = work.has_colors() and len(work.colors) == len(pts)
+    cols = np.asarray(work.colors, dtype=float) if has_cols else np.full((len(pts), 3), 0.85, dtype=float)
+    height_m = layout_height_m(layout)
+
+    floor_mask = np.abs(pts[:, 2]) <= 0.05
+    floor_color = (
+        np.median(cols[floor_mask], axis=0)
+        if int(np.count_nonzero(floor_mask)) >= 10
+        else np.median(cols, axis=0)
+    )
+    floor_pts_xy = pts[floor_mask, :2] if np.any(floor_mask) else np.zeros((0, 2))
+
+    new_pts: list[np.ndarray] = []
+    new_cols: list[np.ndarray] = []
+    n_walls = len(xy)
+
+    portals_by_wall: dict[int, list[tuple[float, float, float, float]]] = {}
+    for p in layout.get("portals") or []:
+        w_idx = p.get("wall_index")
+        if w_idx is None or not (0 <= int(w_idx) < n_walls):
+            continue
+        wi = int(w_idx)
+        a_w, b_w = xy[wi], xy[(wi + 1) % n_walls]
+        d_w = b_w - a_w
+        l_w = float(np.hypot(d_w[0], d_w[1]))
+        if l_w <= 1e-6:
+            continue
+        t_w = d_w / l_w
+        s0 = float(p.get("offset_along_wall_m", 0.0))
+        s1 = s0 + float(p.get("width_m", 0.9))
+        z0 = float(p.get("sill_height_m", 0.0))
+        z1 = z0 + float(p.get("height_m", 2.1))
+        portals_by_wall.setdefault(wi, []).append((s0, s1, z0, z1))
+
+    for obs in obstacles:
+        if not isinstance(obs, dict):
+            continue
+        bmin = obs.get("bbox_min")
+        bmax = obs.get("bbox_max")
+        if (
+            not isinstance(bmin, (list, tuple))
+            or not isinstance(bmax, (list, tuple))
+            or len(bmin) < 3
+            or len(bmax) < 3
+        ):
+            continue
+        try:
+            ox0, oy0, oz0 = float(bmin[0]), float(bmin[1]), max(0.0, float(bmin[2]))
+            ox1, oy1, oz1 = float(bmax[0]), float(bmax[1]), min(height_m, float(bmax[2]))
+        except (TypeError, ValueError):
+            continue
+        if ox1 - ox0 < 0.05 or oy1 - oy0 < 0.05:
+            continue
+
+        # 1. Complete floor surface under the obstacle footprint (z = 0.0)
+        xs = np.arange(ox0, ox1 + 0.5 * grid_step_m, grid_step_m)
+        ys = np.arange(oy0, oy1 + 0.5 * grid_step_m, grid_step_m)
+        if len(xs) > 0 and len(ys) > 0:
+            gx, gy = np.meshgrid(xs, ys)
+            cand_xy = np.column_stack([gx.ravel(), gy.ravel()])
+            in_poly = np.asarray(contains_xy(poly, cand_xy[:, 0], cand_xy[:, 1]), dtype=bool)
+            cand_xy = cand_xy[in_poly]
+            if len(cand_xy) > 0:
+                if len(floor_pts_xy) > 0:
+                    near_f = (
+                        (floor_pts_xy[:, 0] >= ox0 - 0.15)
+                        & (floor_pts_xy[:, 0] <= ox1 + 0.15)
+                        & (floor_pts_xy[:, 1] >= oy0 - 0.15)
+                        & (floor_pts_xy[:, 1] <= oy1 + 0.15)
+                    )
+                    sub_f = floor_pts_xy[near_f]
+                    if len(sub_f) > 0:
+                        d2 = np.min(
+                            np.sum((cand_xy[:, None, :] - sub_f[None, :, :]) ** 2, axis=2),
+                            axis=1,
+                        )
+                        cand_xy = cand_xy[d2 > (0.8 * grid_step_m) ** 2]
+                if len(cand_xy) > 0:
+                    f_pts = np.column_stack([cand_xy, np.zeros(len(cand_xy), dtype=float)])
+                    new_pts.append(f_pts)
+                    new_cols.append(np.tile(floor_color, (len(f_pts), 1)))
+
+        # 2. Complete occluded wall surface behind the obstacle
+        obs_corners = np.array([[ox0, oy0], [ox1, oy0], [ox1, oy1], [ox0, oy1]], dtype=float)
+        for wi in range(n_walls):
+            a_w = xy[wi]
+            b_w = xy[(wi + 1) % n_walls]
+            diff = b_w - a_w
+            l_w = float(np.hypot(diff[0], diff[1]))
+            if l_w <= 0.05:
+                continue
+            t_w = diff / l_w
+            n_w = np.array([-t_w[1], t_w[0]], dtype=float)
+            rel_c = obs_corners - a_w
+            s_c = rel_c @ t_w
+            d_c = np.abs(rel_c @ n_w)
+            s_lo = max(0.0, float(np.min(s_c)) - 0.03)
+            s_hi = min(l_w, float(np.max(s_c)) + 0.03)
+            if s_hi <= s_lo or float(np.min(d_c)) > 0.30:
+                continue
+
+            # Estimate local wall color from nearby wall points (especially above obstacle)
+            rel_all = pts[:, :2] - a_w
+            s_all = rel_all @ t_w
+            d_all = np.abs(rel_all @ n_w)
+            wall_band = (
+                (d_all <= 0.06)
+                & (s_all >= max(0.0, s_lo - 0.25))
+                & (s_all <= min(l_w, s_hi + 0.25))
+                & (pts[:, 2] >= 0.05)
+                & (pts[:, 2] <= height_m - 0.05)
+            )
+            wall_color = (
+                np.median(cols[wall_band], axis=0)
+                if int(np.count_nonzero(wall_band)) >= 10
+                else np.median(cols, axis=0)
+            )
+            existing_wall_sz = (
+                np.column_stack([s_all[wall_band], pts[wall_band, 2]])
+                if np.any(wall_band)
+                else np.zeros((0, 2))
+            )
+
+            ss = np.arange(s_lo, s_hi + 0.5 * grid_step_m, grid_step_m)
+            zs = np.arange(0.0, min(height_m, oz1 + 0.05) + 0.5 * grid_step_m, grid_step_m)
+            if len(ss) == 0 or len(zs) == 0:
+                continue
+            gs, gz = np.meshgrid(ss, zs)
+            cand_sz = np.column_stack([gs.ravel(), gz.ravel()])
+
+            for ps0, ps1, pz0, pz1 in portals_by_wall.get(wi, []):
+                in_portal = (
+                    (cand_sz[:, 0] >= ps0)
+                    & (cand_sz[:, 0] <= ps1)
+                    & (cand_sz[:, 1] >= pz0)
+                    & (cand_sz[:, 1] <= pz1)
+                )
+                cand_sz = cand_sz[~in_portal]
+            if len(cand_sz) == 0:
+                continue
+
+            if len(existing_wall_sz) > 0:
+                d2_w = np.min(
+                    np.sum((cand_sz[:, None, :] - existing_wall_sz[None, :, :]) ** 2, axis=2),
+                    axis=1,
+                )
+                cand_sz = cand_sz[d2_w > (0.8 * grid_step_m) ** 2]
+            if len(cand_sz) == 0:
+                continue
+
+            w_pts = np.column_stack(
+                [
+                    a_w[0] + cand_sz[:, 0] * t_w[0],
+                    a_w[1] + cand_sz[:, 0] * t_w[1],
+                    cand_sz[:, 1],
+                ]
+            )
+            new_pts.append(w_pts)
+            new_cols.append(np.tile(wall_color, (len(w_pts), 1)))
+
+    if not new_pts:
+        return work
+
+    all_pts = np.vstack([pts, *new_pts])
+    all_cols = np.vstack([cols, *new_cols])
+    if len(all_pts) > VISUAL_POINT_CLOUD_MAX:
+        all_pts = all_pts[:VISUAL_POINT_CLOUD_MAX]
+        all_cols = all_cols[:VISUAL_POINT_CLOUD_MAX]
+    out = o3d.geometry.PointCloud()
+    out.points = o3d.utility.Vector3dVector(all_pts)
+    if has_cols:
+        out.colors = o3d.utility.Vector3dVector(np.clip(all_cols, 0.0, 1.0))
+    return out
 
 
 def build_poisson_mesh_from_cloud(
@@ -421,7 +726,7 @@ def build_poisson_mesh_from_cloud(
 
     # Orient normals towards room center if layout is known
     xy = layout_xy_polygon(layout) if isinstance(layout, dict) else np.zeros((0, 2))
-    h = float(layout_height_m(layout)) if isinstance(layout, dict) else 2.23
+    h = float(layout_height_m(layout)) if isinstance(layout, dict) else float(DEFAULT_HEIGHT_M)
     if len(xy) >= 4:
         center = np.array([float(np.mean(xy[:, 0])), float(np.mean(xy[:, 1])), h / 2.0])
         pcd_ds.orient_normals_towards_camera_location(center)
@@ -492,8 +797,9 @@ def build_visual_clouds(
         if len(pcd_room.points) > 0:
             cleaned = remove_visual_outliers(pcd_room)
             cropped = crop_to_layout_polygon(cleaned, layout)
-            doll = cut_ceiling(cropped, layout_height_m(layout))
-            return cropped, doll
+            completed = complete_amodal_walls_and_floor(cropped, layout)
+            doll = cut_ceiling(completed, layout_height_m(layout))
+            return completed, doll
 
     sampled = sample_visual_cloud(mesh, number_of_points=number_of_points)
     if len(sampled.points) == 0:
@@ -501,8 +807,10 @@ def build_visual_clouds(
     framed = apply_layout_frames(sampled, layout, gravity)
     cleaned = remove_visual_outliers(framed)
     cropped = crop_to_layout_polygon(cleaned, layout)
-    doll = cut_ceiling(cropped, layout_height_m(layout))
-    return cropped, doll
+    completed = complete_amodal_walls_and_floor(cropped, layout)
+    doll = cut_ceiling(completed, layout_height_m(layout))
+    return completed, doll
+
 
 
 

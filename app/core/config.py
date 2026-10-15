@@ -85,7 +85,7 @@ class Settings(BaseSettings):
             self.DATABASE_URL = (
                 f"sqlite+aiosqlite:///{os.path.join(self.DATA_DIR, 'server.db')}"
             )
-        if not os.path.isabs(self.MODEL_WEIGHTS_PATH):
+        if not os.path.isabs(self.MODEL_WEIGHTS_PATH) and not os.path.exists(self.MODEL_WEIGHTS_PATH):
             project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             abs_weights = os.path.join(project_root, self.MODEL_WEIGHTS_PATH)
             if os.path.exists(abs_weights):

@@ -531,3 +531,73 @@ def reorder_bounded_dejitter_buffer(
 
     return out
 
+
+def build_cross_stream_index_map(
+    lidar_df: pd.DataFrame,
+    phone_imu_df: pd.DataFrame | None = None,
+    hub_imu_df: pd.DataFrame | None = None,
+    odo_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Build an explicit cross-stream synchronization index map anchored on LiDAR frames."""
+    if lidar_df is None or len(lidar_df) == 0:
+        return pd.DataFrame()
+
+    ts_col = "device_timestamp_ns" if "device_timestamp_ns" in lidar_df.columns else "mcu_timestamp_ns"
+    l_ts = lidar_df[ts_col].to_numpy(dtype=np.int64)
+    n = len(l_ts)
+
+    out: dict[str, np.ndarray] = {
+        "lidar_idx": np.arange(n, dtype=np.int64),
+        "device_timestamp_ns": l_ts,
+    }
+    if "mcu_timestamp_ns" in lidar_df.columns:
+        out["mcu_timestamp_ns"] = lidar_df["mcu_timestamp_ns"].to_numpy(dtype=np.int64)
+    if "matched_frame" in lidar_df.columns:
+        mf_arr = lidar_df["matched_frame"].fillna(-1).to_numpy(dtype=np.int64)
+        out["matched_frame"] = mf_arr
+        out["rgb_frame_idx"] = mf_arr
+    else:
+        out["rgb_frame_idx"] = np.full(n, -1, dtype=np.int64)
+    if "match_delta_nanos" in lidar_df.columns:
+        dt_rgb = np.round(lidar_df["match_delta_nanos"].fillna(0).to_numpy(dtype=np.float64) / 1e6, 3)
+        out["rgb_dt_ms"] = dt_rgb
+        out["delta_t_ms"] = dt_rgb
+    else:
+        out["delta_t_ms"] = np.zeros(n, dtype=np.float64)
+
+    def _nearest_index_and_dt(target_ts: np.ndarray, ref_ts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if ref_ts.size == 0:
+            return np.full(target_ts.size, -1, dtype=np.int64), np.full(target_ts.size, np.nan, dtype=np.float64)
+        idx_r = np.searchsorted(ref_ts, target_ts, side="left")
+        idx_r = np.clip(idx_r, 0, ref_ts.size - 1)
+        idx_l = np.maximum(0, idx_r - 1)
+        dt_r = np.abs(ref_ts[idx_r] - target_ts)
+        dt_l = np.abs(ref_ts[idx_l] - target_ts)
+        choose_l = dt_l <= dt_r
+        best_idx = np.where(choose_l, idx_l, idx_r).astype(np.int64)
+        best_dt_ms = (target_ts - ref_ts[best_idx]).astype(np.float64) / 1e6
+        return best_idx, best_dt_ms
+
+    if phone_imu_df is not None and len(phone_imu_df) > 0 and "device_timestamp_ns" in phone_imu_df.columns:
+        p_ts = phone_imu_df["device_timestamp_ns"].to_numpy(dtype=np.int64)
+        p_idx, p_dt = _nearest_index_and_dt(l_ts, p_ts)
+        out["phone_imu_idx"] = p_idx
+        out["phone_imu_dt_ms"] = np.round(p_dt, 3)
+
+    if hub_imu_df is not None and len(hub_imu_df) > 0 and "device_timestamp_ns" in hub_imu_df.columns:
+        h_ts = hub_imu_df["device_timestamp_ns"].to_numpy(dtype=np.int64)
+        h_idx, h_dt = _nearest_index_and_dt(l_ts, h_ts)
+        out["hub_imu_idx"] = h_idx
+        out["iot_imu_idx"] = h_idx
+        out["hub_imu_dt_ms"] = np.round(h_dt, 3)
+
+    if odo_df is not None and len(odo_df) > 0 and "device_timestamp_ns" in odo_df.columns:
+        o_ts = odo_df["device_timestamp_ns"].to_numpy(dtype=np.int64)
+        o_idx, o_dt = _nearest_index_and_dt(l_ts, o_ts)
+        out["odo_idx"] = o_idx
+        out["odo_dt_ms"] = np.round(o_dt, 3)
+
+    return pd.DataFrame(out)
+
+
+

@@ -24,3 +24,14 @@ def write_triangle_mesh_glb(mesh: o3d.geometry.TriangleMesh, path: str) -> bool:
     except Exception:
         return False
     return os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+def write_scene_glb(scene: trimesh.Scene, path: str) -> bool:
+    if scene is None or len(scene.geometry) == 0:
+        return False
+    try:
+        scene.export(path, file_type="glb")
+    except Exception:
+        return False
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+

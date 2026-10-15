@@ -5,7 +5,10 @@ minimum-bounding-box-area yaw rotation search, and metric ground truth scaling.
 """
 from __future__ import annotations
 
+import csv
+import json
 import logging
+import os
 from typing import Tuple
 
 import numpy as np
@@ -13,6 +16,121 @@ import open3d as o3d
 from scipy.ndimage import gaussian_filter1d
 
 logger = logging.getLogger(__name__)
+
+
+def estimate_vggt_gravity_up(session_dir: str | None) -> np.ndarray | None:
+    """Estimate the room upward gravity vector in the VGGT world frame by fusing
+    multi-frame low-acceleration IMU gravity vectors across all selected keyframes."""
+    if not session_dir or not os.path.isdir(session_dir):
+        return None
+    cam_path = os.path.join(session_dir, "vggt", "cameras.json")
+    manifest_path = os.path.join(session_dir, "vggt", "keyframe_manifest.json")
+    if not os.path.isfile(manifest_path):
+        manifest_path = os.path.join(session_dir, "keyframes_selected", "keyframes_manifest.json")
+    vio_path = os.path.join(session_dir, "processed_vio.csv")
+    if not os.path.isfile(vio_path):
+        for alt_vio in ("processed_vio_raw.csv", "processed_odometry.csv", "odometry.csv"):
+            cand_vio = os.path.join(session_dir, alt_vio)
+            if os.path.isfile(cand_vio):
+                vio_path = cand_vio
+                break
+    imu_path = os.path.join(session_dir, "processed_phone_imu.csv")
+    if not os.path.isfile(imu_path):
+        imu_path = os.path.join(session_dir, "phone_imu.csv")
+    if not (
+        os.path.isfile(cam_path)
+        and os.path.isfile(manifest_path)
+        and os.path.isfile(vio_path)
+        and os.path.isfile(imu_path)
+    ):
+        return None
+    try:
+        with open(cam_path, "r", encoding="utf-8") as f:
+            cams = json.load(f).get("cameras", [])
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            frames = json.load(f).get("frames", [])
+        if not cams or not frames:
+            return None
+
+        fn_to_src: dict[str, int] = {}
+        for fr in frames:
+            fn = fr.get("vggt_filename")
+            sidx = fr.get("source_frame_index")
+            if sidx is None and "source_filename" in fr:
+                try:
+                    sidx = int(str(fr["source_filename"]).split(".")[0])
+                except (ValueError, TypeError):
+                    sidx = None
+            if fn is not None and sidx is not None:
+                fn_to_src[str(fn)] = int(sidx)
+
+        src_to_ts: dict[int, int] = {}
+        with open(vio_path, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                k_fr = "frame_index" if "frame_index" in row else "frame"
+                if k_fr not in row:
+                    continue
+                if "device_timestamp_ns" in row:
+                    src_to_ts[int(float(row[k_fr]))] = int(float(row["device_timestamp_ns"]))
+                elif "timestamp_nanos" in row:
+                    src_to_ts[int(float(row[k_fr]))] = int(float(row["timestamp_nanos"]))
+                elif "timestamp" in row:
+                    src_to_ts[int(float(row[k_fr]))] = int(round(float(row["timestamp"]) * 1e9))
+
+        imu_ts_list: list[int] = []
+        imu_acc_list: list[list[float]] = []
+        with open(imu_path, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                ts_k = (
+                    "timestamp_ns"
+                    if "timestamp_ns" in row
+                    else ("timestamp_nanos" if "timestamp_nanos" in row else "device_timestamp_ns")
+                )
+                ax_k = "ax_m_s2" if "ax_m_s2" in row else "ax"
+                ay_k = "ay_m_s2" if "ay_m_s2" in row else "ay"
+                az_k = "az_m_s2" if "az_m_s2" in row else "az"
+                imu_ts_list.append(int(float(row[ts_k])))
+                imu_acc_list.append(
+                    [float(row[ax_k]), float(row[ay_k]), float(row[az_k])]
+                )
+        if not imu_ts_list:
+            return None
+
+        imu_ts = np.asarray(imu_ts_list, dtype=np.int64)
+        imu_acc = np.asarray(imu_acc_list, dtype=float)
+        r_cam_imu = np.diag([1.0, -1.0, -1.0])
+
+        up_world_samples: list[np.ndarray] = []
+        for cam in cams:
+            fn = str(cam.get("vggt_filename", ""))
+            sidx = fn_to_src.get(fn)
+            if sidx is None or sidx not in src_to_ts:
+                continue
+            ts = src_to_ts[sidx]
+            idx = int(np.argmin(np.abs(imu_ts - ts)))
+            g_imu = imu_acc[idx]
+            g_norm = float(np.linalg.norm(g_imu))
+            if not (8.0 <= g_norm <= 11.5):
+                continue
+            g_unit = g_imu / g_norm
+            ext = np.asarray(cam["extrinsic_3x4"], dtype=float).reshape(3, 4)
+            r_cw = ext[:, :3]
+            up_world = r_cw.T @ (r_cam_imu @ g_unit)
+            u_norm = float(np.linalg.norm(up_world))
+            if u_norm > 1e-6:
+                up_world_samples.append(up_world / u_norm)
+
+        if len(up_world_samples) < 3:
+            return None
+        up_arr = np.asarray(up_world_samples, dtype=float)
+        med_up = np.median(up_arr, axis=0)
+        med_norm = float(np.linalg.norm(med_up))
+        if med_norm < 1e-6:
+            return None
+        return med_up / med_norm
+    except Exception:
+        logger.debug("estimate_vggt_gravity_up failed for %s", session_dir, exc_info=True)
+        return None
 
 
 def rotation_from_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
@@ -66,9 +184,9 @@ def detect_floor_normal(
 ) -> tuple:
     """Detect dominant floor plane normal using Open3D RANSAC plane segmentation.
 
-    If reference_up is specified, only planes whose normal is within max_tilt_deg
-    of reference_up will be accepted as the floor. This strictly prevents vertical walls
-    or oblique planes from being mistakenly chosen as the floor.
+    If reference_up is specified, planes near reference_up (floor/ceiling) and planes
+    orthogonal to reference_up (vertical walls) are jointly used to determine the exact
+    vertical normal while rejecting oblique surfaces.
     """
     points = np.asarray(points, dtype=float)
     if len(points) == 0:
@@ -100,19 +218,22 @@ def detect_floor_normal(
         p_down = pcd
 
     threshold = max(diagonal * 0.01, 0.03)
+    o3d.utility.random.seed(42)
 
     if reference_up is not None:
         ref_vec = np.asarray(reference_up, dtype=float)
         ref_vec /= np.linalg.norm(ref_vec) + 1e-9
 
-        # Iteratively segment up to 6 candidate planes to find the one matching reference_up
         rem = p_down
         best_candidate = None
         best_inliers = -1
         best_fallback_cand = None
         best_fallback_inliers = -1
+        wall_normals: list[np.ndarray] = []
+        wall_weights: list[float] = []
+        extracted_planes: list[tuple[np.ndarray, int]] = []
 
-        for _ in range(6):
+        for _ in range(12):
             if len(rem.points) < 50:
                 break
             plane_model, inlier_indices = rem.segment_plane(
@@ -132,20 +253,64 @@ def detect_floor_normal(
             cand_tilt = float(np.degrees(np.arccos(dot_val)))
 
             n_inl = len(inlier_indices)
-            if cand_tilt <= max_tilt_deg and n_inl > best_inliers:
+            if n_inl >= 50:
+                extracted_planes.append((cand_normal, n_inl))
+            if cand_tilt <= max(max_tilt_deg, 18.0) and n_inl > best_inliers:
                 best_inliers = n_inl
                 best_candidate = (cand_normal, cand_tilt, n_inl)
             elif cand_tilt <= 45.0 and n_inl > best_fallback_inliers:
                 best_fallback_inliers = n_inl
                 best_fallback_cand = (cand_normal, cand_tilt, n_inl)
+            if abs(cand_tilt - 90.0) <= 25.0 and n_inl >= 50:
+                wall_normals.append(cand_normal)
+                wall_weights.append(float(n_inl))
 
             rem = rem.select_by_index(inlier_indices, invert=True)
 
-        chosen = best_candidate if best_candidate is not None else best_fallback_cand
+        chosen = best_candidate
+        if chosen is None and len(wall_normals) >= 2:
+            W_mat = np.zeros((3, 3), dtype=float)
+            for wn, ww in zip(wall_normals, wall_weights):
+                W_mat += ww * np.outer(wn, wn)
+            eigvals, eigvecs = np.linalg.eigh(W_mat)
+            ortho_up = eigvecs[:, 0]
+            if np.dot(ortho_up, ref_vec) < 0:
+                ortho_up = -ortho_up
+            ortho_up /= np.linalg.norm(ortho_up) + 1e-9
+            dot_val = float(np.clip(np.dot(ortho_up, ref_vec), -1.0, 1.0))
+            ortho_tilt = float(np.degrees(np.arccos(dot_val)))
+            if ortho_tilt <= 45.0:
+                chosen = (ortho_up, ortho_tilt, int(sum(wall_weights)))
+        if chosen is None:
+            chosen = best_fallback_cand
+
         if chosen is not None:
-            normal, tilt, inliers = chosen
+            base_normal, base_tilt, base_inliers = chosen
+            # Jointly refine vertical normal using all horizontalplanes and orthogonal vertical walls
+            M_joint = np.zeros((3, 3), dtype=float)
+            n_joint_planes = 0
+            for p_norm, p_inl in extracted_planes:
+                ang = float(np.degrees(np.arccos(np.clip(abs(np.dot(p_norm, base_normal)), 0.0, 1.0))))
+                if ang <= 15.0:
+                    M_joint += float(p_inl) * np.outer(p_norm, p_norm)
+                    n_joint_planes += 1
+                elif abs(ang - 90.0) <= 15.0:
+                    M_joint -= float(p_inl) * np.outer(p_norm, p_norm)
+                    n_joint_planes += 1
+            if n_joint_planes >= 2:
+                _, eigvecs_j = np.linalg.eigh(M_joint)
+                joint_up = eigvecs_j[:, -1]
+                if np.dot(joint_up, ref_vec) < 0:
+                    joint_up = -joint_up
+                joint_up /= np.linalg.norm(joint_up) + 1e-9
+                if np.dot(joint_up, base_normal) >= np.cos(np.radians(8.0)):
+                    base_normal = joint_up
+                    base_tilt = float(
+                        np.degrees(np.arccos(np.clip(np.dot(base_normal, ref_vec), -1.0, 1.0)))
+                    )
+
             axis = int(np.argmax(np.abs(ref_vec)))
-            return axis, normal, inliers, len(p_down.points), tilt, threshold
+            return axis, base_normal, base_inliers, len(p_down.points), base_tilt, threshold
 
         # Fallback to reference_up
         axis = int(np.argmax(np.abs(ref_vec)))
@@ -220,11 +385,8 @@ def _detect_manhattan_yaw_aabb(points: np.ndarray, up_axis: int = 2, max_sample:
 def detect_manhattan_yaw(points: np.ndarray, up_axis: int = 2, max_sample: int = 220_000) -> float:
     """Find dominant wall yaw rotation angle in [-45 deg, 45 deg] to align walls with X/Y axes.
 
-    Uses Dominant Wall Normal Consensus:
-    1. Filter for vertical wall normals (|n_z| < 0.25).
-    2. Compute theta = atan2(n_y, n_x) mod 90 deg.
-    3. Peak detection using circular histogram with sub-bin refinement.
-    4. Compute correction angle so walls align with coordinate axes (0 and 90 deg).
+    Uses Dominant Wall Normal Consensus combined with 2D mid-height wall-slice
+    bounding-box sharpness verification so curved interior fixtures cannot bias the wall yaw.
     """
     points = np.asarray(points, dtype=float)
     finite_mask = np.isfinite(points).all(axis=1)
@@ -280,18 +442,52 @@ def detect_manhattan_yaw(points: np.ndarray, up_axis: int = 2, max_sample: int =
         refined_peak = peak_angle
 
     delta = refined_peak if refined_peak <= 45.0 else (refined_peak - 90.0)
-    return float(-delta)
+    yaw_norm = float(-delta)
+
+    # Verify against 2D mid-height wall-slice bounding-box sharpness when vertical span is present
+    try:
+        z_vals = sample[:, up_axis]
+        z_lo = float(np.percentile(z_vals, 2))
+        z_hi = float(np.percentile(z_vals, 98))
+        dz = z_hi - z_lo
+        if dz > 0.30:
+            mid_mask = (z_vals >= z_lo + 0.20 * dz) & (z_vals <= z_lo + 0.85 * dz)
+            slice_xy = sample[mid_mask][:, [x_ax, y_ax]] if int(np.count_nonzero(mid_mask)) >= 200 else sample[:, [x_ax, y_ax]]
+        else:
+            slice_xy = sample[:, [x_ax, y_ax]]
+        if len(slice_xy) >= 200:
+            from app.services.occupancy_layout import estimate_manhattan_angle_bbox_sharpness
+            sharp_info = estimate_manhattan_angle_bbox_sharpness(slice_xy)
+            yaw_sharp = -float(sharp_info.get("angle_deg", 0.0))
+            if abs(yaw_sharp - yaw_norm) > 2.0:
+                def _bbox_area_at(ang_deg: float) -> float:
+                    th = np.deg2rad(ang_deg)
+                    c, s = float(np.cos(th)), float(np.sin(th))
+                    rot = slice_xy @ np.array([[c, -s], [s, c]], dtype=float).T
+                    sp = np.percentile(rot, 98, axis=0) - np.percentile(rot, 2, axis=0)
+                    return float(max(sp[0], 1e-3) * max(sp[1], 1e-3))
+
+                area_norm = _bbox_area_at(yaw_norm)
+                area_sharp = _bbox_area_at(yaw_sharp)
+                if area_sharp < area_norm * 0.96:
+                    return float(yaw_sharp)
+    except Exception:
+        pass
+
+    return yaw_norm
 
 
 def align_point_cloud_to_manhattan(
     pcd: o3d.geometry.PointCloud,
     R_init: np.ndarray | None = None,
     reference_up: np.ndarray = np.array([0.0, 0.0, 1.0]),
+    session_dir: str | None = None,
 ) -> tuple[o3d.geometry.PointCloud, dict]:
     """Level floor normal to vertical (+Z), align walls to X/Y axes, and set floor Z=0.
 
     If R_init is provided (e.g. camera-to-world rotation R_wc0), points are first
-    rotated into the world frame before leveling.
+    rotated into the world frame before leveling. If session_dir is provided,
+    multi-frame IMU gravity consensus is used to initialize reference_up.
     """
     work = o3d.geometry.PointCloud(pcd)
     work = work.remove_non_finite_points(remove_nan=True, remove_infinite=True)
@@ -303,14 +499,42 @@ def align_point_cloud_to_manhattan(
         R_init = np.asarray(R_init, dtype=float).reshape(3, 3)
         points = points @ R_init.T
 
-    center = points.mean(axis=0)
-    up_axis, normal, inliers, candidates, floor_tilt, threshold = detect_floor_normal(
-        points, reference_up=reference_up, max_tilt_deg=15.0
-    )
+    imu_up = estimate_vggt_gravity_up(session_dir) if session_dir else None
+    if imu_up is not None:
+        if R_init is not None:
+            imu_up = R_init @ imu_up
+        reference_up = imu_up
 
+    center = points.mean(axis=0)
     target = np.array([0.0, 0.0, 1.0])
-    level_rotation = rotation_from_vectors(normal, target)
-    leveled = (points - center) @ level_rotation.T + center
+    if imu_up is not None:
+        from app.services.occupancy_layout import estimate_manhattan_angle_bbox_sharpness
+        normal = imu_up / (np.linalg.norm(imu_up) + 1e-9)
+        up_axis, floor_tilt = angle_to_axis(normal)
+        inliers = len(points)
+        level_rotation = rotation_from_vectors(normal, target)
+        leveled = (points - center) @ level_rotation.T + center
+        for ax in (0, 1):
+            info_ax = estimate_manhattan_angle_bbox_sharpness(leveled[:, [ax, 2]])
+            ang_a = float(info_ax.get("angle_deg", 0.0))
+            if abs(ang_a) >= 45.0:
+                ang_a = ang_a - 90.0 if ang_a > 0 else ang_a + 90.0
+            if abs(ang_a) <= 15.0 and float(info_ax.get("bbox_area_improvement", 0.0)) >= 0.02:
+                rad = np.radians(ang_a)
+                ca, sa = float(np.cos(rad)), float(np.sin(rad))
+                R_a = (
+                    np.array([[ca, 0.0, -sa], [0.0, 1.0, 0.0], [sa, 0.0, ca]], dtype=float)
+                    if ax == 0
+                    else np.array([[1.0, 0.0, 0.0], [0.0, ca, -sa], [0.0, sa, ca]], dtype=float)
+                )
+                leveled = (leveled - center) @ R_a.T + center
+                level_rotation = R_a @ level_rotation
+    else:
+        up_axis, normal, inliers, candidates, floor_tilt, threshold = detect_floor_normal(
+            points, reference_up=reference_up, max_tilt_deg=15.0
+        )
+        level_rotation = rotation_from_vectors(normal, target)
+        leveled = (points - center) @ level_rotation.T + center
 
     yaw_deg = detect_manhattan_yaw(leveled, up_axis=2)
     yaw_rotation = yaw_rotation_matrix(2, yaw_deg)
@@ -337,6 +561,7 @@ def align_point_cloud_to_manhattan(
         "floor_inliers": int(inliers),
         "yaw_correction_deg": float(yaw_deg),
         "z_floor_offset": floor_z,
+        "imu_gravity_used": bool(imu_up is not None),
     }
     return work, info
 
@@ -348,6 +573,7 @@ def clean_and_align_point_cloud(
     stat_std: float = 2.8,
     R_init: np.ndarray | None = None,
     reference_up: np.ndarray = np.array([0.0, 0.0, 1.0]),
+    session_dir: str | None = None,
 ) -> tuple[o3d.geometry.PointCloud, dict]:
     """Clean point cloud (non-finite removal, voxel downsampling, SOR outlier removal) and align to Manhattan axes."""
     work = o3d.geometry.PointCloud(pcd)
@@ -363,105 +589,11 @@ def clean_and_align_point_cloud(
     clean_count = len(work.points)
 
     aligned_pcd, align_info = align_point_cloud_to_manhattan(
-        work, R_init=R_init, reference_up=reference_up
+        work, R_init=R_init, reference_up=reference_up, session_dir=session_dir
     )
     align_info["original_points"] = orig_count
     align_info["after_voxel_points"] = after_voxel_count
     align_info["output_points"] = clean_count
     return aligned_pcd, align_info
 
-
-def scale_point_cloud_to_metric(
-    pcd: o3d.geometry.PointCloud,
-    target_height_m: float | None = None,
-    target_length_m: float | None = None,
-    target_width_m: float | None = None,
-    uniform: bool = True,
-) -> o3d.geometry.PointCloud:
-    """Scale and orient Manhattan-aligned point cloud to exact Ground Truth metric dimensions.
-
-    Guarantees:
-    - Point cloud is verified and aligned to Manhattan axes before scaling.
-    - Long side is oriented along X, short side along Y (matching floorplan.json).
-    - Preserves orthogonal 90° room geometry.
-    - If uniform=True: uses isotropic Sim(3) scale s = median(s_x, s_y, s_z).
-    - If uniform=False: uses axis-aligned metric scaling with ratio clamping [0.5, 2.0].
-    - Origin (0, 0, 0) aligned with the room interior corner.
-    """
-    work = o3d.geometry.PointCloud(pcd)
-    work = work.remove_non_finite_points(remove_nan=True, remove_infinite=True)
-    if len(work.points) < 50:
-        return work
-
-    pts = np.asarray(work.points).copy()
-    z_floor = float(np.percentile(pts[:, 2], 1.5))
-    z_ceil = float(np.percentile(pts[:, 2], 98.5))
-    h_unscaled = max(0.2, z_ceil - z_floor)
-
-    # Scale factor mapping unscaled vertical extent to true metric height
-    target_h = float(target_height_m) if (target_height_m is not None and target_height_m > 0) else None
-    s_z = (target_h / h_unscaled) if target_h is not None else 1.0
-
-    # Verify and enforce Manhattan yaw alignment before scaling so orthogonal corners are preserved
-    residual_yaw = detect_manhattan_yaw(pts, up_axis=2)
-    rotated_yaw = False
-    r_yaw = np.eye(3)
-    if abs(residual_yaw) > 0.2:
-        r_yaw = yaw_rotation_matrix(2, residual_yaw)
-        c_xy = pts.mean(axis=0)
-        pts = (pts - c_xy) @ r_yaw.T + c_xy
-        rotated_yaw = True
-
-    # Orient long side along X, short side along Y (matching floorplan.json convention)
-    span_x0 = float(np.percentile(pts[:, 0], 98) - np.percentile(pts[:, 0], 2))
-    span_y0 = float(np.percentile(pts[:, 1], 98) - np.percentile(pts[:, 1], 2))
-    rotated_90 = False
-    r90 = np.eye(3)
-    if span_y0 > span_x0:
-        r90 = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
-        pts = pts @ r90.T
-        rotated_90 = True
-
-    # Compute span and origin on X and Y
-    x_p02 = float(np.percentile(pts[:, 0], 2))
-    x_p98 = float(np.percentile(pts[:, 0], 98))
-    span_x = max(0.2, x_p98 - x_p02)
-
-    y_p02 = float(np.percentile(pts[:, 1], 2))
-    y_p98 = float(np.percentile(pts[:, 1], 98))
-    span_y = max(0.2, y_p98 - y_p02)
-
-    s_x = (float(target_length_m) / span_x) if (target_length_m is not None and target_length_m > 0) else s_z
-    s_y = (float(target_width_m) / span_y) if (target_width_m is not None and target_width_m > 0) else s_z
-
-    if uniform:
-        candidate_scales = [s for s in (s_x, s_y, s_z) if s is not None and s > 0 and np.isfinite(s)]
-        s = float(np.median(candidate_scales)) if candidate_scales else 1.0
-        s_x = s
-        s_y = s
-        s_z = s
-    else:
-        # Guard against unnatural distortion: clamp scale to within [0.5, 2.0] of s_z
-        s_x = float(np.clip(s_x, 0.5 * s_z, 2.0 * s_z))
-        s_y = float(np.clip(s_y, 0.5 * s_z, 2.0 * s_z))
-
-    # Translate origin to (0.0, 0.0, 0.0) and scale to metric dimensions
-    pts[:, 0] = (pts[:, 0] - x_p02) * s_x
-    pts[:, 1] = (pts[:, 1] - y_p02) * s_y
-    pts[:, 2] = (pts[:, 2] - z_floor) * s_z
-
-    work.points = o3d.utility.Vector3dVector(pts)
-
-    if work.has_normals():
-        normals = np.asarray(work.normals).copy()
-        if rotated_yaw:
-            normals = normals @ r_yaw.T
-        if rotated_90:
-            normals = normals @ r90.T
-        scale_vec = np.array([s_x, s_y, s_z], dtype=float)
-        normals = normals / scale_vec
-        n_norms = np.linalg.norm(normals, axis=1, keepdims=True) + 1e-9
-        work.normals = o3d.utility.Vector3dVector(normals / n_norms)
-
-    return work
 

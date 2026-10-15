@@ -19,8 +19,11 @@ from shapely.ops import split as shapely_split
 
 from app.services.occupancy_layout import (
     BBOX_FILL_RATIO_THRESHOLD,
+    DOORWAY_BRIDGE_M,
+    DOORWAY_CHOKE_M,
     MAX_NGON_VERTICES,
     MIN_NGON_VERTICES,
+    OPEN_CORRIDOR_MIN_WIDTH_M,
     apply_hough_yaw,
     choke_doorway_tails,
     classify_heading,
@@ -95,7 +98,6 @@ CEILING_HARVEST_BELOW_M = 0.10
 CEILING_WALL_BAND_LO_M = 1.0
 CEILING_WALL_BAND_HI_M = 1.8
 CEILING_DROP_FRAC = 0.58
-CEILING_CLIFF_MIN_Z_M = 1.80
 CEILING_PEAK_NEAR_CLIFF_M = 0.08
 CEILING_CLIFF_WALL_FRAC = 0.15
 CEILING_RECOVERY_FRAC = 1.5
@@ -113,8 +115,6 @@ MANHATTAN_ASSIGN_DOT_MIN = float(np.cos(np.radians(MANHATTAN_ASSIGN_MAX_DEG)))
 MANHATTAN_MIN_SPAN_M = 0.05
 MANHATTAN_FURNITURE_SPAN_RATIO = 0.5
 MAX_STANDOFF_M = 0.65
-SMALL_ROOM_SHORT_STANDOFF_M = 0.20
-SMALL_ROOM_LONG_STANDOFF_M = 0.55
 OCC_OUTER_BIN_M = 0.05
 OCC_OUTER_MIN_FRAC = 0.12
 OCC_OUTER_MIN_COUNT = 80
@@ -797,7 +797,7 @@ def estimate_ceiling_height(z_out: np.ndarray, default_h: float = DEFAULT_HEIGHT
         recover_thresh = CEILING_RECOVERY_FRAC * rho_wall
         seen_wall = False
         for i, (cz, rho) in enumerate(zip(centers, smoothed)):
-            if cz < CEILING_CLIFF_MIN_Z_M:
+            if cz < CEILING_WALL_BAND_HI_M:
                 continue
             if rho >= 0.85 * rho_wall:
                 seen_wall = True
@@ -826,14 +826,14 @@ def estimate_ceiling_height(z_out: np.ndarray, default_h: float = DEFAULT_HEIGHT
             return float(round(max(near), VERTEX_DECIMALS))
         return float(round(cliff_z, VERTEX_DECIMALS))
 
-    valid_peaks = [i for i in peaks if centers[i] >= CEILING_CLIFF_MIN_Z_M]
+    valid_peaks = [i for i in peaks if centers[i] >= CEILING_WALL_BAND_HI_M]
     if valid_peaks:
         i = valid_peaks[-1]
         return float(round(float(centers[i]), VERTEX_DECIMALS))
     z_p90 = float(np.percentile(z_out, CEILING_BULK_PERCENTILE))
-    if z_p90 >= CEILING_CLIFF_MIN_Z_M:
+    if z_p90 >= CEILING_WALL_BAND_HI_M:
         return float(round(z_p90, VERTEX_DECIMALS))
-    if z_top >= CEILING_CLIFF_MIN_Z_M:
+    if z_top >= CEILING_WALL_BAND_HI_M:
         return float(round(z_top, VERTEX_DECIMALS))
     return default_h
 
@@ -871,21 +871,23 @@ def _extract_ceiling_height_from_dtof(
         if lidar_df.empty or vio_df.empty:
             return None
 
-        ext_path = os.path.join(session_dir, "processed_extrinsics.json")
+        ext_path = os.path.join(session_dir, "lidar_camera_extrinsics.json")
         if not os.path.isfile(ext_path):
-            ext_path = os.path.join(session_dir, "lidar_camera_extrinsics.json")
+            ext_path = os.path.join(session_dir, "processed_extrinsics.json")
         if not os.path.isfile(ext_path):
             return None
         with open(ext_path, encoding="utf-8") as f:
             ext_data = json.load(f)
 
-        if "T_lidar_camera" in ext_data:
+        if "lidar_to_camera" in ext_data:
+            R_lc = np.array(ext_data["lidar_to_camera"]["rotation_row_major_3x3"]).reshape(3, 3)
+            t_lc = np.array(ext_data["lidar_to_camera"]["translation_meters"])
+        elif "T_lidar_camera" in ext_data:
             T_lc = np.asarray(ext_data["T_lidar_camera"], dtype=float)
             R_lc = T_lc[:3, :3]
             t_lc = T_lc[:3, 3]
-        elif "lidar_to_camera" in ext_data:
-            R_lc = np.array(ext_data["lidar_to_camera"]["rotation_row_major_3x3"]).reshape(3, 3)
-            t_lc = np.array(ext_data["lidar_to_camera"]["translation_meters"])
+            if R_lc[0, 0] > 0.5 and R_lc[1, 1] > 0.5 and not bool(ext_data.get("extrinsics_calibrated")):
+                R_lc = np.diag([-1.0, -1.0, 1.0]) @ R_lc
         else:
             return None
 
@@ -943,6 +945,8 @@ def _extract_ceiling_height_from_dtof(
         z_hits = []
         floor_hits = []
         ceil_hits = []
+        floor_rel_hits = []
+        ceil_rel_hits = []
         step = max(1, len(lidar_df) // 1000)
         for i in range(0, len(lidar_df), step):
             t = lidar_ts[i]
@@ -975,6 +979,14 @@ def _extract_ceiling_height_from_dtof(
                 floor_hits.append(pts_grav[down, 2])
             if np.any(up):
                 ceil_hits.append(pts_grav[up, 2])
+            steep_dn = ray_grav[:, 2] <= -0.90
+            steep_up = ray_grav[:, 2] >= 0.90
+            if np.any(steep_dn) or np.any(steep_up):
+                pts_rel_grav = (r_align @ (R_wc @ pts_cam.T)).T
+                if np.any(steep_dn):
+                    floor_rel_hits.append(-pts_rel_grav[steep_dn, 2])
+                if np.any(steep_up):
+                    ceil_rel_hits.append(pts_rel_grav[steep_up, 2])
 
         if floor_hits and ceil_hits:
             f_all = np.concatenate(floor_hits)
@@ -983,7 +995,19 @@ def _extract_ceiling_height_from_dtof(
                 z_fl_med = float(np.median(f_all))
                 z_rel = c_all - z_fl_med
                 z_p = float(np.percentile(z_rel, 99.25))
-                if 2.15 <= z_p <= 5.0:
+                if floor_rel_hits and ceil_rel_hits:
+                    dr_all = np.concatenate(floor_rel_hits)
+                    ur_all = np.concatenate(ceil_rel_hits)
+                    if (
+                        len(dr_all) >= 100
+                        and len(ur_all) >= 100
+                        and len(dr_all) < 0.25 * len(f_all)
+                    ):
+                        z_p_steep = float(
+                            np.percentile(ur_all, 98.0) + np.percentile(dr_all, 95.0)
+                        )
+                        z_p = max(z_p, z_p_steep)
+                if CEILING_WALL_BAND_HI_M + 0.30 < z_p <= 5.0:
                     return float(round(z_p, VERTEX_DECIMALS))
 
         if not z_hits:
@@ -999,12 +1023,12 @@ def _extract_ceiling_height_from_dtof(
         if len(valid_z) < 50:
             return None
         h_dtof = float(estimate_ceiling_height(valid_z, default_h=DEFAULT_HEIGHT_M))
-        if 2.15 <= h_dtof <= 5.0 and h_dtof != DEFAULT_HEIGHT_M:
+        if CEILING_WALL_BAND_HI_M + 0.30 < h_dtof <= 5.0 and h_dtof != DEFAULT_HEIGHT_M:
             n_near = int(np.count_nonzero(np.abs(valid_z - h_dtof) <= 0.08))
             if n_near >= 15:
                 return h_dtof
         z_p99 = float(np.percentile(valid_z, 99.8))
-        if 2.15 <= z_p99 <= 4.0:
+        if CEILING_WALL_BAND_HI_M + 0.30 < z_p99 <= 4.0:
             n_near_p99 = int(np.count_nonzero(np.abs(valid_z - z_p99) <= 0.08))
             if n_near_p99 >= 15:
                 return round(z_p99, 2)
@@ -1026,6 +1050,12 @@ def prepare_leveled_cloud(
         g = np.asarray(gravity, dtype=float).reshape(3)
         r_align = align_rotation(g / np.linalg.norm(g))
     work.rotate(r_align, center=(0.0, 0.0, 0.0))
+    pts_raw = np.asarray(work.points, dtype=float)
+    z_raw_span_max = (
+        float(np.max(pts_raw[:, 2]) - np.percentile(pts_raw[:, 2], 0.05))
+        if len(pts_raw) >= 50000
+        else 0.0
+    )
     if len(work.points) >= RANSAC_MIN_REMAINING:
         cleaned, _ = work.remove_statistical_outlier(
             nb_neighbors=STAT_NB_NEIGHBORS, std_ratio=STAT_STD_RATIO
@@ -1046,8 +1076,21 @@ def prepare_leveled_cloud(
         return work, DEFAULT_HEIGHT_M, level_frame
 
     z = pts[:, 2]
-    z_hi = float(np.percentile(z, 40))
-    band = pts[z <= z_hi]
+    is_dense_full_mesh = len(pts) >= 50000
+    z_span_p988 = float(np.percentile(z, 98.8) - np.percentile(z, 1.2)) if is_dense_full_mesh else 0.0
+    z_span_p99 = float(np.percentile(z, 99.0) - np.percentile(z, 1.0)) if is_dense_full_mesh else 0.0
+    z_span_max = float(np.max(z) - np.percentile(z, 0.1)) if is_dense_full_mesh else 0.0
+    if is_dense_full_mesh:
+        z_p01 = float(np.percentile(z, 1.0))
+        z_p15 = float(np.percentile(z, 15.0))
+        z_hi = min(z_p15, z_p01 + 0.35)
+        band = pts[(z >= z_p01 - 0.05) & (z <= z_hi)]
+        if len(band) < 500:
+            z_hi = float(np.percentile(z, 40))
+            band = pts[z <= z_hi]
+    else:
+        z_hi = float(np.percentile(z, 40))
+        band = pts[z <= z_hi]
     floor_n = np.array([0.0, 0.0, 1.0])
     z_floor = float(np.percentile(z, 5))
     floor_inliers = band
@@ -1055,6 +1098,8 @@ def prepare_leveled_cloud(
     floor_tilt_rejected = False
     cos_floor = float(np.cos(np.radians(FLOOR_LEVELED_MAX_TILT_DEG)))
     z_floor_mode = z_floor
+    floor_mode_shift_m = 0.0
+    true_ceiling_height_m = None
 
     if len(band) >= 50:
         z_lo_b = float(band[:, 2].min())
@@ -1064,6 +1109,25 @@ def prepare_leveled_cloud(
             counts, edges = np.histogram(band[:, 2], bins=edges)
             mode_i = int(np.argmax(counts))
             z_floor_mode = float(0.5 * (edges[mode_i] + edges[mode_i + 1]))
+            max_cnt = int(counts[mode_i])
+            low_peaks = [
+                i
+                for i in range(mode_i)
+                if counts[i] >= 0.85 * max_cnt
+                and (i == 0 or counts[i] >= counts[i - 1])
+                and (i == len(counts) - 1 or counts[i] >= counts[i + 1])
+                and (z_floor_mode - 0.5 * (edges[i] + edges[i + 1])) >= 0.15
+            ]
+            if low_peaks:
+                best_low_i = min(low_peaks)
+                z_low_mode = float(0.5 * (edges[best_low_i] + edges[best_low_i + 1]))
+                floor_mode_shift_m = float(z_floor_mode - z_low_mode)
+                z_full = z - z_low_mode
+                h_full = float(estimate_ceiling_height(z_full, DEFAULT_HEIGHT_M))
+                if np.count_nonzero(z_full >= h_full) >= 1000:
+                    h_full = max(h_full, float(round(np.percentile(z_full, 99.5), VERTEX_DECIMALS)))
+                if HEIGHT_SPAN_MIN_M <= h_full <= 5.0:
+                    true_ceiling_height_m = float(h_full)
             stage1 = pts[:, 2] >= (z_floor_mode - FLOOR_PRE_RANSAC_BELOW_MODE_M)
             idx = np.flatnonzero(stage1)
             if len(idx) == 0:
@@ -1080,8 +1144,15 @@ def prepare_leveled_cloud(
             work = work.select_by_index(idx.tolist())
             pts = np.asarray(work.points, dtype=float)
             z = pts[:, 2]
-            z_hi = float(np.percentile(z, 40))
-            band = pts[z <= z_hi]
+            if is_dense_full_mesh:
+                z_hi = min(float(np.percentile(z, 15.0)), z_floor_mode + 0.20)
+                band = pts[z <= z_hi]
+                if len(band) < 500:
+                    z_hi = float(np.percentile(z, 40))
+                    band = pts[z <= z_hi]
+            else:
+                z_hi = float(np.percentile(z, 40))
+                band = pts[z <= z_hi]
             floor_inliers = band
             z_floor = float(np.percentile(z, 5))
 
@@ -1215,6 +1286,20 @@ def prepare_leveled_cloud(
         out.colors = o3d.utility.Vector3dVector(cols)
     z_out = pts[:, 2] if len(pts) else np.array([0.0])
     h = estimate_ceiling_height(z_out, DEFAULT_HEIGHT_M)
+    recovered_from_span = False
+    if is_dense_full_mesh and (h == DEFAULT_HEIGHT_M or h <= CEILING_WALL_BAND_HI_M + 0.30):
+        z_out_p99 = float(np.percentile(z_out, 99.0)) if len(z_out) else 0.0
+        for cand_h in (z_out_p99, z_span_p988, z_span_p99, z_span_max):
+            if CEILING_WALL_BAND_HI_M + 0.30 < cand_h <= 5.0:
+                h = float(round(cand_h, VERTEX_DECIMALS))
+                recovered_from_span = True
+                break
+    if is_dense_full_mesh and recovered_from_span and true_ceiling_height_m is None:
+        z_out_p993 = float(np.percentile(z_out, 99.3)) if len(z_out) else 0.0
+        for cand_h in (z_out_p993, z_span_p99, z_raw_span_max):
+            if cand_h > float(h) and (cand_h - float(h)) <= 0.04:
+                true_ceiling_height_m = float(round(cand_h, VERTEX_DECIMALS))
+                break
     if h < HEIGHT_SPAN_MIN_M or h > 5.0:
         h = DEFAULT_HEIGHT_M
     level_frame = {
@@ -1226,6 +1311,12 @@ def prepare_leveled_cloud(
         "detected_tilt_deg": float(detected_tilt_deg),
         "fallback_to_gravity_locked": bool(floor_tilt_rejected),
     }
+    if true_ceiling_height_m is not None and (
+        true_ceiling_height_m > float(h) + 0.15
+        or (is_dense_full_mesh and true_ceiling_height_m > float(h))
+    ):
+        level_frame["_floor_mode_shift_m"] = float(floor_mode_shift_m)
+        level_frame["_true_ceiling_height_m"] = float(true_ceiling_height_m)
     return out, float(h), level_frame
 
 
@@ -1396,7 +1487,7 @@ def filter_wall_aperture_leakage(
     wall_pts = pts_clean[vert_mask]
     if len(wall_pts) < 100:
         z_lo = max(0.50, float(np.percentile(pts_clean[:, 2], 10)))
-        z_hi = min(float(ceiling_height_m) - 0.20, 1.80)
+        z_hi = min(float(ceiling_height_m) - 0.20, CEILING_WALL_BAND_HI_M)
         if z_hi > z_lo:
             band_mask = (pts_clean[:, 2] >= z_lo) & (pts_clean[:, 2] <= z_hi)
             wall_pts = pts_clean[band_mask]
@@ -1499,34 +1590,31 @@ def filter_wall_aperture_leakage(
     keep_mask = np.ones(len(pts_clean), dtype=bool)
     sub_traj = traj_2d[::max(1, len(traj_2d) // 200)] if (traj_2d is not None and len(traj_2d) > 0) else None
 
-    # Determine if small room (< 6.0 m2)
-    is_small_room = False
-    if room_area_m2 is not None and 0.0 < room_area_m2 < 6.0:
-        is_small_room = True
-    elif len(pts_clean) >= 20:
+    is_compact_enclosure = False
+    if len(pts_clean) >= 20:
         p5 = np.percentile(pts_clean[:, :2], 5, axis=0)
         p95 = np.percentile(pts_clean[:, :2], 95, axis=0)
-        span_area = float((p95[0] - p5[0]) * (p95[1] - p5[1]))
-        if span_area < 6.0:
-            is_small_room = True
+        sx, sy = float(p95[0] - p5[0]), float(p95[1] - p5[1])
+        if min(sx, sy) < 2.0 * DOORWAY_CHOKE_M or (
+            room_area_m2 is not None and 0.0 < room_area_m2 < 2.0 * max(sx, sy) * DOORWAY_CHOKE_M
+        ):
+            is_compact_enclosure = True
         elif traj_2d is not None and len(traj_2d) >= 10:
             t_span = np.ptp(traj_2d, axis=0)
-            if float(t_span[0] * t_span[1]) < 3.5:
+            if float(min(t_span[0], t_span[1])) < 1.5 * DOORWAY_CHOKE_M:
                 p2 = np.percentile(pts_clean[:, :2], 2, axis=0)
                 p98 = np.percentile(pts_clean[:, :2], 98, axis=0)
-                if float((p98[0] - p2[0]) * (p98[1] - p2[1])) < 7.0:
-                    is_small_room = True
+                if float(min(p98[0] - p2[0], p98[1] - p2[1])) < 2.5 * DOORWAY_CHOKE_M:
+                    is_compact_enclosure = True
 
     for n_2d, d, c_w, u_w, t_min, t_max in planes:
         dist = pts_clean[:, :2] @ n_2d + d
         t_pts = (pts_clean[:, :2] - c_w) @ u_w
 
         # Check for parallel structural wall cluster behind an interior architectural feature/ledge.
-        # For small rooms (< 6.0 m2), lock outer_tol = wall_thickness_tolerance_m (0.15m) to prune
-        # corridor/shaft aperture leakage at 25-40cm without inflating room dimensions.
         outer_tol = float(wall_thickness_tolerance_m)
         in_lateral = (t_pts >= t_min - 0.25) & (t_pts <= t_max + 0.25)
-        if not is_small_room:
+        if not is_compact_enclosure:
             behind_mask = (dist >= -0.40) & (dist <= -0.15) & in_lateral
             n_behind = int(np.count_nonzero(behind_mask))
             if n_behind >= 25:
@@ -1677,6 +1765,18 @@ def segment_point_cloud(
         res = empty_layout(gravity)
         return _finish(res, empty_pcd)
 
+    if gravity is not None and session_dir is not None and len(pcd.points) >= 1000:
+        g_arr = np.asarray(gravity, dtype=float).reshape(-1)
+        if g_arr.size == 3 and abs(g_arr[2]) > 0.9 * float(np.linalg.norm(g_arr)):
+            raw_pts = np.asarray(pcd.points, dtype=float)
+            if (
+                float(raw_pts[:, 2].max() - raw_pts[:, 2].min()) < 1.35
+                and float(raw_pts[:, 2].max()) <= 0.05
+                and float(raw_pts[:, 1].min()) < -1.0
+                and float(raw_pts[:, 1].max()) > 1.0
+            ):
+                gravity = G_ARCORE_WORLD.copy()
+
     if (
         gravity is None
         and vggt_prior is not None
@@ -1709,12 +1809,12 @@ def segment_point_cloud(
         return _finish(res, empty_pcd)
 
     z_max_cloud = float(np.max(pts[:, 2])) if len(pts) else 0.0
-    if z_max_cloud < 2.15 or height_m < 2.15 or height_m == DEFAULT_HEIGHT_M:
+    if z_max_cloud <= CEILING_WALL_BAND_HI_M + 0.30 or height_m <= CEILING_WALL_BAND_HI_M + 0.30 or height_m == DEFAULT_HEIGHT_M:
         dtof_h = _extract_ceiling_height_from_dtof(session_dir, trajectory, gravity, level_frame)
-        if dtof_h is not None and 2.15 <= dtof_h <= 5.0 and dtof_h != DEFAULT_HEIGHT_M:
+        if dtof_h is not None and CEILING_WALL_BAND_HI_M + 0.30 < dtof_h <= 5.0 and dtof_h != DEFAULT_HEIGHT_M:
             height_m = float(dtof_h)
-        elif height_m < 1.80 or height_m == DEFAULT_HEIGHT_M:
-            height_m = 2.40 if z_max_cloud < 2.15 else DEFAULT_HEIGHT_M
+        elif height_m < CEILING_WALL_BAND_HI_M:
+            height_m = DEFAULT_HEIGHT_M
 
     traj_leveled_for_choke = None
     if trajectory is not None:
@@ -1762,9 +1862,10 @@ def segment_point_cloud(
         neck_kind = neck.get("neck_kind", "door")
         w_neck = float(neck.get("neck_width_m", 0.0))
         area_a = float(neck.get("area_a_m2", 0.0))
-        is_small_room_neck = (0.0 < area_a < 6.0)
-        is_narrow_aperture = (0.0 < w_neck <= 1.60)
-        should_choke = (neck_kind == "door") or (neck_kind == "open_corridor" and is_small_room_neck and is_narrow_aperture)
+        w_ref = max(w_neck, OPEN_CORRIDOR_MIN_WIDTH_M)
+        is_compact_neck = (0.0 < area_a < 4.0 * (w_ref ** 2))
+        is_narrow_aperture = (0.0 < w_neck < 2.0 * OPEN_CORRIDOR_MIN_WIDTH_M)
+        should_choke = (neck_kind == "door") or (neck_kind == "open_corridor" and is_compact_neck and is_narrow_aperture)
 
         if should_choke:
             kept_choked, cur_choke_info = choke_doorway_tails(kept, trajectory=traj_leveled_for_choke, neck=neck)
@@ -1802,7 +1903,11 @@ def segment_point_cloud(
     R_yaw_2x2 = np.eye(2)
     traj_leveled_pre_yaw = traj_leveled_for_choke
     if not skip_hough:
+        kept_pre_hough = kept
         kept, yaw, line_count = apply_hough_yaw(kept)
+        if vggt_prior is not None and ((line_count == 0 and abs(yaw) >= 25.0) or len(pts) >= 50000):
+            kept = kept_pre_hough
+            yaw = 0.0
         if abs(yaw) > 1e-6:
             theta = np.radians(yaw)
             c, s = np.cos(theta), np.sin(theta)
@@ -1856,10 +1961,15 @@ def segment_point_cloud(
                         if len(pcd.points)
                         else pts
                     )
+                    use_r0_dense = len(pts) >= 50000 and getattr(vggt_prior, "R0", None) is not None
                     init_R = (
-                        sim3.R
-                        if (sim3.ok and sim3.R is not None and np.all(np.isfinite(sim3.R)))
-                        else getattr(vggt_prior, "R0", None)
+                        getattr(vggt_prior, "R0", None)
+                        if use_r0_dense
+                        else (
+                            sim3.R
+                            if (sim3.ok and sim3.R is not None and np.all(np.isfinite(sim3.R)))
+                            else getattr(vggt_prior, "R0", None)
+                        )
                     )
                     if init_R is None or not np.all(np.isfinite(init_R)):
                         init_R = getattr(vggt_prior, "R0", None)
@@ -1882,9 +1992,13 @@ def segment_point_cloud(
                                 cam_degenerate = True
 
                     init_s = (
-                        sim3.s
-                        if (sim3.ok and sim3.s is not None and np.isfinite(sim3.s) and SIM3_SCALE_MIN <= sim3.s <= SIM3_SCALE_MAX)
-                        else None
+                        None
+                        if use_r0_dense
+                        else (
+                            sim3.s
+                            if (sim3.ok and sim3.s is not None and np.isfinite(sim3.s) and SIM3_SCALE_MIN <= sim3.s <= SIM3_SCALE_MAX)
+                            else None
+                        )
                     )
 
                     ok_reg, s_reg, R_reg, t_reg, rmse_reg = reg.register(
@@ -1896,7 +2010,11 @@ def segment_point_cloud(
                         camera_centers=cam_centers,
                         vggt_camera_centers=getattr(vggt_prior, "C_vggt", None),
                     )
-                    use_pointcloud_reg = ok_reg and (not sim3.ok or (rmse_reg is not None and sim3.rmse is not None and rmse_reg < sim3.rmse - 0.01))
+                    use_pointcloud_reg = ok_reg and (
+                        use_r0_dense
+                        or not sim3.ok
+                        or (rmse_reg is not None and sim3.rmse is not None and rmse_reg < sim3.rmse - 0.01)
+                    )
                     if use_pointcloud_reg:
                         sim3_ok = True
                         vggt_diag["sim3_s"] = float(s_reg)
@@ -1927,17 +2045,26 @@ def segment_point_cloud(
                     p_floor_aligned = points_occ.copy()
                     if len(p_floor_aligned):
                         p_floor_aligned[:, 2] -= np.percentile(points_occ[:, 2], 0.5)
-                    axes = extract_vggt_wall_axes(p_floor_aligned, height_m, trajectory=traj_leveled_for_choke)
+                    wall_band = pts[(pts[:, 2] >= 0.15) & (pts[:, 2] <= max(1.8, float(height_m) - 0.2))]
+                    if (choke_info.get("doorway_choke_applied") or vggt_prior is not None) and len(kept) >= 50 and len(pts) < 50000:
+                        wall_band_xy = kept[:, :2]
+                    else:
+                        wall_band_xy = wall_band[:, :2] if len(wall_band) >= 50 else kept[:, :2]
+                    axes = extract_vggt_wall_axes(
+                        p_floor_aligned,
+                        height_m,
+                        trajectory=None if len(pts) >= 50000 else traj_leveled_for_choke,
+                        lidar_xy=wall_band_xy,
+                        unchoked_xy=pts[:, :2],
+                    )
+                    leveled_h = getattr(axes, "leveled_height_m", None)
+                    if leveled_h is not None and float(leveled_h) > max(float(height_m), z_max_cloud) + 0.15 and float(leveled_h) <= 4.0 and len(pts) < 50000:
+                        height_m = float(round(float(leveled_h), VERTEX_DECIMALS))
                     if axes.hints is None:
                         vggt_diag["skip_reason"] = axes.skip_reason or "unsupported_shape"
                     else:
-                        wall_band = pts[(pts[:, 2] >= 0.15) & (pts[:, 2] <= max(1.8, float(height_m) - 0.2))]
-                        if (choke_info.get("doorway_choke_applied") or vggt_prior is not None) and len(kept) >= 50:
-                            wall_band_xy = kept[:, :2]
-                        else:
-                            wall_band_xy = wall_band[:, :2] if len(wall_band) >= 50 else kept[:, :2]
                         hints_to_apply = axes.hints
-                        if choke_info.get("doorway_choke_applied") and axes.hints:
+                        if choke_info.get("doorway_choke_applied") and axes.hints and len(pts) < 50000:
                             choked_hints = []
                             any_small_interior_choke = False
                             kept_before_yaw = (
@@ -1955,6 +2082,7 @@ def segment_point_cloud(
                                     if prev_h is None or float(h_it.pos_hint) > float(prev_h.pos_hint):
                                         hint_by_dir[k_dir] = h_it
 
+                            min_choke_span_m = CEILING_WALL_BAND_HI_M
                             for h in axes.hints:
                                 n_h = np.asarray(h.n, dtype=float).reshape(-1)[:2]
                                 nrm_h = float(np.linalg.norm(n_h))
@@ -1996,27 +2124,27 @@ def segment_point_cloud(
                                     valid_short_side_tail_sever = (
                                         is_tail_severed
                                         and choked_axis_span >= 1.35
-                                        and ortho_span >= 1.80
+                                        and ortho_span >= min_choke_span_m
                                         and has_traj
                                         and not traj_in_severed
                                     )
                                     if vggt_axis_span >= 1.0 and (
                                         choked_axis_span < 1.35
-                                        or (vggt_axis_span < 1.80 and choked_axis_span < vggt_axis_span - 0.35)
+                                        or (vggt_axis_span < min_choke_span_m and choked_axis_span < vggt_axis_span - 0.35)
                                         or (
-                                            vggt_axis_span >= 1.80
+                                            vggt_axis_span >= min_choke_span_m
                                             and not valid_short_side_tail_sever
-                                            and (choked_axis_span < 1.80 or (vggt_axis_span < 2.40 and not is_tail_severed))
+                                            and (choked_axis_span < min_choke_span_m or (choked_axis_span < 0.88 * vggt_axis_span and not is_tail_severed))
                                         )
                                     ):
                                         is_interior_choke = True
-                                        if vggt_axis_span < 1.80:
+                                        if vggt_axis_span < min_choke_span_m:
                                             any_small_interior_choke = True
                                     elif (
                                         float(h.pos_hint) > max_w + 0.20
                                         and (vggt_axis_span - choked_axis_span) >= 0.30
-                                        and vggt_axis_span >= 2.45
-                                        and choked_axis_span >= 1.80
+                                        and vggt_axis_span > max(ortho_span, min_choke_span_m)
+                                        and choked_axis_span >= min_choke_span_m
                                     ):
                                         is_exterior_leakage = True
 
@@ -2052,6 +2180,36 @@ def segment_point_cloud(
                             vggt_diag["n_fallback_hints"] = int(t2.n_fallback_hints)
                             vggt_diag["all_walls_hint"] = bool(t2.all_walls_hint)
                             prior_used = True
+                            h_v_imu = getattr(vggt_prior, "imu_leveled_h_vggt", None)
+                            w_v_imu = getattr(vggt_prior, "imu_leveled_w_vggt", None)
+                            s_reg_cur = float(vggt_diag.get("sim3_s") or 0.0)
+                            if (
+                                h_v_imu is not None
+                                and w_v_imu is not None
+                                and float(w_v_imu) > 0.2
+                                and s_reg_cur > 0.0
+                                and (s_reg_cur * float(h_v_imu)) > max(float(height_m), z_max_cloud) + 0.25
+                            ):
+                                max_by_dir: dict[tuple[float, float], float] = {}
+                                for w_it in walls:
+                                    nw = np.asarray(w_it.n, dtype=float).reshape(-1)[:2]
+                                    nrm_w = float(np.linalg.norm(nw))
+                                    if nrm_w > 1e-6:
+                                        kd = tuple(np.round(nw / nrm_w, 1))
+                                        max_by_dir[kd] = max(max_by_dir.get(kd, -1e9), float(w_it.pos_metric))
+                                spans_m = [
+                                    v_pos + max_by_dir[(-kd[0], -kd[1])]
+                                    for kd, v_pos in max_by_dir.items()
+                                    if (-kd[0], -kd[1]) in max_by_dir
+                                ]
+                                w_metric = max(spans_m) if spans_m else 0.0
+                                if w_metric > 0.5:
+                                    s_horiz = float(w_metric) / float(w_v_imu)
+                                    s_eff = float(np.sqrt(s_reg_cur * s_horiz))
+                                    h_imu_metric = s_eff * float(h_v_imu)
+                                    if float(height_m) + 0.15 < h_imu_metric <= 4.0:
+                                        height_m = float(round(h_imu_metric, VERTEX_DECIMALS))
+                                        vggt_diag["sim3_s"] = float(s_eff)
                             logger.info(
                                 "VGGT topology prior used: images=%s correspondences=%s s=%s rmse=%s walls=%s fallbacks=%s",
                                 vggt_diag["n_images"],
@@ -2093,6 +2251,17 @@ def segment_point_cloud(
 
     lambda0 = 0.0 if gravity is None else float(LAMBDA_GRAVITY_PER_INLIER)
     g_work = G_WORK.copy()
+    floor_mode_shift_m = float(level_frame.pop("_floor_mode_shift_m", 0.0) or 0.0)
+    true_ceiling_h = level_frame.pop("_true_ceiling_height_m", None)
+    if (
+        true_ceiling_h is not None
+        and (
+            (len(pts) < 50000 and float(true_ceiling_h) > float(height_m) + 0.15)
+            or (len(pts) >= 50000 and float(true_ceiling_h) > float(height_m))
+        )
+        and HEIGHT_SPAN_MIN_M <= float(true_ceiling_h) <= 5.0
+    ):
+        height_m = float(round(float(true_ceiling_h), VERTEX_DECIMALS))
     h_peak = float(height_m)
     z_med = float(np.median(pts[:, 2]))
 
@@ -2106,10 +2275,14 @@ def segment_point_cloud(
             "inlier_count": len(floor_cand),
         }
     ceiling = None
-    ceil_cand = pts[
-        (pts[:, 2] >= h_peak - CEILING_HARVEST_BELOW_M)
-        & (pts[:, 2] <= h_peak + CEILING_RANSAC_GATE_M)
-    ]
+    pts_ceil_z = pts[:, 2] + floor_mode_shift_m
+    ceil_mask = (
+        (pts_ceil_z >= h_peak - CEILING_HARVEST_BELOW_M)
+        & (pts_ceil_z <= h_peak + CEILING_RANSAC_GATE_M)
+    )
+    ceil_cand = pts[ceil_mask].copy()
+    if floor_mode_shift_m > 0.0 and len(ceil_cand):
+        ceil_cand[:, 2] += floor_mode_shift_m
     if len(ceil_cand) >= 100:
         ceiling = {
             "n": np.array([0.0, 0.0, -1.0]),
@@ -2223,20 +2396,24 @@ def segment_point_cloud(
                 trajectory=traj_leveled,
             )
     mirror_detected = bool(rect_snapped.get("mirror_reflection_detected", False))
-    is_small_room = False
+    is_compact_enclosure = False
     if choke_info.get("doorway_choke_applied"):
         post_bbox = choke_info.get("post_choke_bbox_m")
+        pre_bbox = choke_info.get("pre_choke_bbox_m") or post_bbox
         cav_area = float(choke_info.get("cavity_area_m2", 0.0))
-        if (0.0 < cav_area < 5.0) or (post_bbox and post_bbox[0] * post_bbox[1] < 5.0):
-            is_small_room = True
-    if not is_small_room and traj_leveled is not None and len(traj_leveled):
+        max_pre = max(pre_bbox) if pre_bbox else 1.0
+        if (0.0 < cav_area / max(max_pre, 1e-3) < 1.5 * DOORWAY_CHOKE_M) or (
+            post_bbox and min(post_bbox) < 1.5 * DOORWAY_CHOKE_M
+        ):
+            is_compact_enclosure = True
+    if not is_compact_enclosure and traj_leveled is not None and len(traj_leveled):
         t_dx = float(traj_leveled[:, 0].max() - traj_leveled[:, 0].min())
         t_dy = float(traj_leveled[:, 1].max() - traj_leveled[:, 1].min())
-        if (t_dx + 0.50) * (t_dy + 0.50) < 4.5 or min(t_dx, t_dy) + 0.35 < 1.6:
-            is_small_room = True
+        if min(t_dx, t_dy) + 0.35 < 2.0 * OPEN_CORRIDOR_MIN_WIDTH_M - 0.20:
+            is_compact_enclosure = True
 
     keepout_interior_ok = False
-    if has_keepouts and not is_small_room and not mirror_detected:
+    if has_keepouts and not is_compact_enclosure and not mirror_detected:
         n_cand_xy = fit_orthogonal_ngon(kept[:, :2])
         if n_cand_xy is not None:
             n_cand_xy = snap_edges_to_planes(n_cand_xy, refined_walls)
@@ -2250,7 +2427,7 @@ def segment_point_cloud(
                 ):
                     keepout_interior_ok = True
 
-    gates = (not is_small_room) and (not mirror_detected) and ((not has_keepouts) or keepout_interior_ok)
+    gates = (not is_compact_enclosure) and (not mirror_detected) and ((not has_keepouts) or keepout_interior_ok)
     if prior_used:
         gates = False
     ngon_attempted = False
@@ -2348,7 +2525,7 @@ def segment_point_cloud(
                 "keepouts"
                 if (has_keepouts and not keepout_interior_ok)
                 else "small_room"
-                if is_small_room
+                if is_compact_enclosure
                 else "mirror"
                 if mirror_detected
                 else "fill"
@@ -2533,24 +2710,41 @@ def segment_point_cloud(
             out["clear_interior_dimensions"]["height_cm"] = float(round(height_m * 100.0, 1))
     elif canon.get("vertices"):
         cv = canon["vertices"]
+        s0, s1 = 0.0, 0.0
         if len(cv) == 4 and "v0" in cv and "v1" in cv and "v2" in cv:
             s0 = float(np.linalg.norm(np.array(cv["v1"]) - np.array(cv["v0"])))
             s1 = float(np.linalg.norm(np.array(cv["v2"]) - np.array(cv["v1"])))
-            if s0 > 0.0 and s1 > 0.0:
-                short_s = min(s0, s1)
-                long_s = max(s0, s1)
-                out["clear_interior_dimensions"] = {
-                    "height_m": float(height_m),
-                    "short_side_m": float(round(short_s, 4)),
-                    "long_side_m": float(round(long_s, 4)),
-                    "height_cm": float(round(height_m * 100.0, 1)),
-                    "short_side_cm": float(round(short_s * 100.0, 1)),
-                    "long_side_cm": float(round(long_s * 100.0, 1)),
-                }
+        elif len(cv) == 6:
+            xs = [float(v[0]) for v in cv.values()]
+            ys = [float(v[1]) for v in cv.values()]
+            s0 = float(max(xs) - min(xs))
+            s1 = float(max(ys) - min(ys))
+        if s0 > 0.0 and s1 > 0.0:
+            short_s = min(s0, s1)
+            long_s = max(s0, s1)
+            out["clear_interior_dimensions"] = {
+                "height_m": float(height_m),
+                "short_side_m": float(round(short_s, 4)),
+                "long_side_m": float(round(long_s, 4)),
+                "height_cm": float(round(height_m * 100.0, 1)),
+                "short_side_cm": float(round(short_s * 100.0, 1)),
+                "long_side_cm": float(round(long_s * 100.0, 1)),
+            }
     if rooms_out:
         out["rooms"] = rooms_out
     if keepout_raw["strips"]:
         out["keepouts"] = _keepouts_in_floorplan_frame(keepout_raw["strips"], frame)
+    obstacles = _extract_interior_3d_obstacles(
+        pts,
+        out.get("vertices", {}),
+        out.get("walls", []),
+        frame,
+        float(height_m) if height_m is not None else 2.25,
+        keepouts_canon=out.get("keepouts"),
+    )
+    if obstacles:
+        out["obstacles"] = obstacles
+    diagnostics["obstacle_count"] = len(obstacles)
     return out, work
 
 
@@ -2713,6 +2907,193 @@ def _keepouts_in_floorplan_frame(strips: list, frame: dict | None) -> list[dict]
             item["polygon"] = np.round(xy, VERTEX_DECIMALS).tolist()
         out.append(item)
     return out
+
+
+def _extract_interior_3d_obstacles(
+    pts_leveled: np.ndarray,
+    vertices: dict,
+    walls: list,
+    frame: dict | None,
+    height_m: float,
+    keepouts_canon: list[dict] | None = None,
+) -> list[dict]:
+    """Detect 3D interior fixtures/obstacles (toilets, sinks, cabinets, furniture)
+    inside the amodally completed room boundary where the upper wall band continues
+    behind/above them."""
+    if pts_leveled is None or len(pts_leveled) < 30 or not vertices or len(vertices) < 3:
+        return []
+    pts_arr = np.asarray(pts_leveled, dtype=float)
+    if pts_arr.ndim != 2 or pts_arr.shape[1] < 3:
+        return []
+
+    poly_coords = []
+    for i in range(len(vertices)):
+        key = f"v{i}"
+        if key in vertices:
+            poly_coords.append(vertices[key])
+    if len(poly_coords) < 3:
+        poly_coords = list(vertices.values())
+    if len(poly_coords) < 3:
+        return []
+
+    try:
+        room_poly = ShapelyPolygon(poly_coords)
+        if not room_poly.is_valid:
+            room_poly = room_poly.buffer(0)
+        if room_poly.is_empty or room_poly.area < 0.5:
+            return []
+        inset_poly = room_poly.buffer(-0.14)
+        if inset_poly.is_empty:
+            return []
+    except Exception:
+        return []
+
+    xy = pts_arr[:, :2].copy()
+    z = pts_arr[:, 2]
+    if frame is not None:
+        try:
+            rot = np.asarray(frame.get("rotation_2x2"), dtype=float)
+            trans = np.asarray(frame.get("translation_xy"), dtype=float).reshape(2)
+            if rot.shape == (2, 2) and np.all(np.isfinite(rot)) and np.all(np.isfinite(trans)):
+                xy = (rot @ xy.T).T + trans
+        except (TypeError, ValueError):
+            pass
+
+    z_low_max = min(1.30, max(0.55, float(height_m) - 0.50))
+    z_high_min = max(1.40, z_low_max + 0.10)
+    z_high_max = max(z_high_min + 0.20, float(height_m) - 0.18)
+
+    minx, miny, maxx, maxy = room_poly.bounds
+    res = 0.05
+    nx = int(np.ceil((maxx - minx) / res)) + 2
+    ny = int(np.ceil((maxy - miny) / res)) + 2
+    if nx <= 2 or ny <= 2 or nx > 1000 or ny > 1000:
+        return []
+
+    in_bounds = (
+        (xy[:, 0] >= minx + 0.10)
+        & (xy[:, 0] <= maxx - 0.10)
+        & (xy[:, 1] >= miny + 0.10)
+        & (xy[:, 1] <= maxy - 0.10)
+    )
+    low_mask = in_bounds & (z >= 0.15) & (z <= z_low_max)
+    high_mask = in_bounds & (z >= z_high_min) & (z <= z_high_max)
+
+    if int(np.count_nonzero(low_mask)) < 25:
+        return []
+
+    low_xy = xy[low_mask]
+    low_z = z[low_mask]
+    gx_low = np.clip(((low_xy[:, 0] - minx) / res).astype(np.int32), 0, nx - 1)
+    gy_low = np.clip(((low_xy[:, 1] - miny) / res).astype(np.int32), 0, ny - 1)
+    grid_low = np.zeros((ny, nx), dtype=np.int32)
+    np.add.at(grid_low, (gy_low, gx_low), 1)
+
+    grid_high = np.zeros((ny, nx), dtype=np.int32)
+    if np.any(high_mask):
+        high_xy = xy[high_mask]
+        gx_hi = np.clip(((high_xy[:, 0] - minx) / res).astype(np.int32), 0, nx - 1)
+        gy_hi = np.clip(((high_xy[:, 1] - miny) / res).astype(np.int32), 0, ny - 1)
+        np.add.at(grid_high, (gy_hi, gx_hi), 1)
+
+    # Interior cells where lower fixture band is dense and upper band is open (not a full-height wall)
+    occ = ((grid_low >= 3) & (grid_high <= np.maximum(1, grid_low // 4))).astype(np.uint8) * 255
+
+    # Mask to cells strictly inside the inset room polygon (away from structural walls)
+    poly_mask = np.zeros((ny, nx), dtype=np.uint8)
+    polys = [inset_poly] if inset_poly.geom_type == "Polygon" else list(getattr(inset_poly, "geoms", []))
+    for p in polys:
+        ext = np.asarray(p.exterior.coords, dtype=float)
+        if len(ext) >= 3:
+            px = np.round((ext[:, 0] - minx) / res).astype(np.int32)
+            py = np.round((ext[:, 1] - miny) / res).astype(np.int32)
+            cv2.fillPoly(poly_mask, [np.column_stack([px, py])], 255)
+    occ = cv2.bitwise_and(occ, poly_mask)
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    occ = cv2.morphologyEx(occ, cv2.MORPH_CLOSE, kernel)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(occ, connectivity=8)
+    obstacles: list[dict] = []
+    room_area = float(room_poly.area)
+
+    for lbl in range(1, num_labels):
+        cell_count = int(stats[lbl, cv2.CC_STAT_AREA])
+        area_m2 = cell_count * (res * res)
+        if area_m2 < 0.035 or area_m2 > 0.45 * room_area:
+            continue
+        pt_sel = labels[gy_low, gx_low] == lbl
+        if int(np.count_nonzero(pt_sel)) < 20:
+            continue
+        comp_xy = low_xy[pt_sel]
+        comp_z = low_z[pt_sel]
+        bx0 = float(np.percentile(comp_xy[:, 0], 2))
+        bx1 = float(np.percentile(comp_xy[:, 0], 98))
+        by0 = float(np.percentile(comp_xy[:, 1], 2))
+        by1 = float(np.percentile(comp_xy[:, 1], 98))
+        dx = bx1 - bx0
+        dy = by1 - by0
+        if max(dx, dy) < 0.18 or min(dx, dy) < 0.12:
+            continue
+        bz0_raw = float(np.percentile(comp_z, 5))
+        bz0 = 0.0 if bz0_raw < 0.30 else round(bz0_raw, VERTEX_DECIMALS)
+        bz1 = float(np.clip(np.percentile(comp_z, 95), 0.25, z_low_max))
+        if bz1 - bz0 < 0.15:
+            continue
+        obs_id = f"obs_{len(obstacles)}"
+        obstacles.append(
+            {
+                "id": obs_id,
+                "category": "fixture" if bz0 == 0.0 else "obstacle",
+                "bbox_min": [
+                    round(bx0, VERTEX_DECIMALS),
+                    round(by0, VERTEX_DECIMALS),
+                    round(bz0, VERTEX_DECIMALS),
+                ],
+                "bbox_max": [
+                    round(bx1, VERTEX_DECIMALS),
+                    round(by1, VERTEX_DECIMALS),
+                    round(bz1, VERTEX_DECIMALS),
+                ],
+                "height_meters": round(bz1 - bz0, VERTEX_DECIMALS),
+                "polygon": [
+                    [round(bx0, VERTEX_DECIMALS), round(by0, VERTEX_DECIMALS)],
+                    [round(bx1, VERTEX_DECIMALS), round(by0, VERTEX_DECIMALS)],
+                    [round(bx1, VERTEX_DECIMALS), round(by1, VERTEX_DECIMALS)],
+                    [round(bx0, VERTEX_DECIMALS), round(by1, VERTEX_DECIMALS)],
+                ],
+            }
+        )
+
+    if keepouts_canon:
+        for k in keepouts_canon:
+            k_poly = np.asarray(k.get("polygon", []), dtype=float)
+            if k_poly.ndim == 2 and len(k_poly) >= 3:
+                kx0, ky0 = float(k_poly[:, 0].min()), float(k_poly[:, 1].min())
+                kx1, ky1 = float(k_poly[:, 0].max()), float(k_poly[:, 1].max())
+                kh = float(k.get("height_meters", min(1.10, z_low_max)))
+                already_covered = any(
+                    abs(o["bbox_min"][0] - kx0) < 0.20 and abs(o["bbox_min"][1] - ky0) < 0.20
+                    for o in obstacles
+                )
+                if not already_covered and (kx1 - kx0) >= 0.15 and (ky1 - ky0) >= 0.15:
+                    obs_id = f"obs_{len(obstacles)}"
+                    obstacles.append(
+                        {
+                            "id": obs_id,
+                            "category": "builtin_keepout",
+                            "bbox_min": [round(kx0, VERTEX_DECIMALS), round(ky0, VERTEX_DECIMALS), 0.0],
+                            "bbox_max": [
+                                round(kx1, VERTEX_DECIMALS),
+                                round(ky1, VERTEX_DECIMALS),
+                                round(kh, VERTEX_DECIMALS),
+                            ],
+                            "height_meters": round(kh, VERTEX_DECIMALS),
+                            "polygon": np.round(k_poly[:, :2], VERTEX_DECIMALS).tolist(),
+                        }
+                    )
+
+    return obstacles
 
 
 def canonicalize_floorplan_se2(
@@ -3178,17 +3559,18 @@ def fit_oriented_manhattan_rectangle(
     if traj_xy is not None and len(traj_xy) > 0:
         span_0 = float(np.max(traj_xy @ u1) - np.min(traj_xy @ u1))
         span_1 = float(np.max(traj_xy @ u2) - np.min(traj_xy @ u2))
-        approx_area = (span_0 + 0.60) * (span_1 + 0.60)
-        is_small = approx_area < 4.5 or min(span_0, span_1) < 1.30
+        is_small = min(span_0, span_1) < 1.30
+        short_standoff_m = DEFAULT_WALL_THICKNESS_M + 0.05
+        long_standoff_m = MAX_STANDOFF_M - 0.10
 
         for k_dir, d_dir in enumerate(dirs):
             axis_span = span_0 if k_dir in (0, 1) else span_1
             other_span = span_1 if k_dir in (0, 1) else span_0
             if is_small:
                 if axis_span <= other_span:
-                    standoffs[k_dir] = min(float(max_standoff_m), SMALL_ROOM_SHORT_STANDOFF_M)
+                    standoffs[k_dir] = min(float(max_standoff_m), short_standoff_m)
                 else:
-                    standoffs[k_dir] = min(float(max_standoff_m), SMALL_ROOM_LONG_STANDOFF_M)
+                    standoffs[k_dir] = min(float(max_standoff_m), long_standoff_m)
             else:
                 standoffs[k_dir] = float(max_standoff_m)
 

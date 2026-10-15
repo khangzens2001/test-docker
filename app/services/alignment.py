@@ -345,7 +345,7 @@ def align_gyroscope_signals(t_phone: np.ndarray, w_phone: np.ndarray, t_hub: np.
     return 1.0, float(offset_sec * 1e9)
 
 
-def _wahba_result(accepted, R, reason, n_pairs, residual_rms_deg, sv_ratio):
+def _wahba_result(accepted, R, reason, n_pairs, residual_rms_deg, sv_ratio, lag_ns: int = 0):
     return {
         "accepted": bool(accepted),
         "R": None if R is None else np.asarray(R, dtype=np.float64),
@@ -353,7 +353,177 @@ def _wahba_result(accepted, R, reason, n_pairs, residual_rms_deg, sv_ratio):
         "n_pairs": int(n_pairs),
         "residual_rms_deg": None if residual_rms_deg is None else float(residual_rms_deg),
         "sv_ratio": None if sv_ratio is None else float(sv_ratio),
+        "lag_ns": int(lag_ns),
+        "lag_ms": float(lag_ns) / 1e6,
     }
+
+
+def _match_gyro_pairs(
+    phone_ts: np.ndarray,
+    phone_g: np.ndarray,
+    hub_ts: np.ndarray,
+    hub_g: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    t_first = int(phone_ts[0])
+    t_last = int(phone_ts[-1])
+    in_bounds = (hub_ts >= t_first) & (hub_ts <= t_last)
+    if not np.any(in_bounds):
+        return np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.float64)
+
+    h_ts = hub_ts[in_bounds]
+    h_g = hub_g[in_bounds]
+    idx = np.searchsorted(phone_ts, h_ts, side="left")
+    valid_idx = idx < phone_ts.size
+    h_ts = h_ts[valid_idx]
+    h_g = h_g[valid_idx]
+    idx = idx[valid_idx]
+    if h_ts.size == 0:
+        return np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.float64)
+
+    idx_prev = np.maximum(0, idx - 1)
+    t0 = phone_ts[idx_prev]
+    t1 = phone_ts[idx]
+    dt_min = np.minimum(np.abs(h_ts - t0), np.abs(t1 - h_ts))
+    exact_or_first = (idx == 0) | (t1 == h_ts)
+    dt_ok = exact_or_first | (dt_min <= WAHBA_MAX_PAIR_DT_NS)
+    if not np.any(dt_ok):
+        return np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.float64)
+
+    h_ts = h_ts[dt_ok]
+    h_g = h_g[dt_ok]
+    idx = idx[dt_ok]
+    idx_prev = idx_prev[dt_ok]
+    t0 = t0[dt_ok]
+    t1 = t1[dt_ok]
+
+    denom = np.where(t1 > t0, (t1 - t0).astype(np.float64), 1.0)
+    alpha = np.where(t1 > t0, (h_ts - t0).astype(np.float64) / denom, 1.0)[:, None]
+    w_p = np.where((idx == 0)[:, None] | (t1 == h_ts)[:, None], phone_g[idx], (1.0 - alpha) * phone_g[idx_prev] + alpha * phone_g[idx])
+    w_h = h_g
+
+    norm_p = np.linalg.norm(w_p, axis=1)
+    norm_h = np.linalg.norm(w_h, axis=1)
+    active = (norm_p >= WAHBA_OMEGA_MIN_RAD_S) & (norm_h >= WAHBA_OMEGA_MIN_RAD_S)
+    return w_p[active], w_h[active]
+
+
+def _solve_wahba_svd(
+    w_p: np.ndarray,
+    w_h: np.ndarray,
+    *,
+    use_irls: bool = False,
+) -> tuple[np.ndarray | None, float | None, float | None]:
+    if w_p.shape[0] < WAHBA_MIN_PAIRS:
+        return None, None, None
+    norm_p = np.linalg.norm(w_p, axis=1, keepdims=True)
+    norm_h = np.linalg.norm(w_h, axis=1, keepdims=True)
+    u_p = w_p / np.maximum(norm_p, 1e-12)
+    u_h = w_h / np.maximum(norm_h, 1e-12)
+
+    weights = np.ones(w_p.shape[0], dtype=np.float64)
+    if use_irls:
+        mag_weights = np.sqrt(norm_p[:, 0] * norm_h[:, 0])
+        weights = mag_weights.copy()
+
+    R = None
+    S = None
+    n_iters = 5 if use_irls else 1
+    for _ in range(n_iters):
+        H = u_h.T @ (u_p * weights[:, None])
+        U, S, Vt = np.linalg.svd(H)
+        if (not np.all(np.isfinite(S))) or float(S[0]) <= 0.0:
+            return None, None, None
+        det_H = float(np.linalg.det(Vt.T @ U.T))
+        if abs(det_H) < 1e-6:
+            return None, None, None
+        d = 1.0 if det_H > 0.0 else -1.0
+        R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+        if use_irls:
+            pred = (R @ u_h.T).T
+            sin_th = np.linalg.norm(np.cross(pred, u_p), axis=1)
+            cos_th = np.sum(pred * u_p, axis=1)
+            ang_deg = np.degrees(np.arctan2(sin_th, cos_th))
+            mad = float(np.median(ang_deg)) * 1.4826 + 0.1
+            huber = np.where(ang_deg <= 1.5 * mad, 1.0, (1.5 * mad) / np.maximum(ang_deg, 1e-6))
+            # Soft trim extreme transition outliers (> 2.5 * mad)
+            huber = np.where(ang_deg <= 2.5 * mad, huber, 0.0)
+            if np.count_nonzero(huber > 0) < WAHBA_MIN_PAIRS:
+                break
+            weights = mag_weights * huber
+
+    if use_irls:
+        _, S_unit, _ = np.linalg.svd(u_h.T @ u_p)
+        sv_ratio = float(S_unit[1] / S_unit[0]) if float(S_unit[0]) > 0.0 else float(S[1] / S[0])
+    else:
+        sv_ratio = float(S[1] / S[0])
+
+    a = (R @ w_h.T).T
+    b = w_p
+    sin_th = np.linalg.norm(np.cross(a, b), axis=1)
+    cos_th = np.sum(a * b, axis=1)
+    theta_deg = np.degrees(np.arctan2(sin_th, cos_th))
+    if use_irls and float(np.percentile(theta_deg, 85)) < 6.0 and float(np.percentile(theta_deg, 95)) < 12.0:
+        mad = float(np.median(theta_deg)) * 1.4826 + 0.1
+        inliers = theta_deg <= max(2.0 * mad, 1.8)
+        if np.count_nonzero(inliers) >= WAHBA_MIN_PAIRS:
+            w_mag = (norm_p[inliers, 0] * norm_h[inliers, 0])
+            w_sum = float(np.sum(w_mag))
+            if w_sum > 1e-12:
+                residual_rms_deg = float(np.sqrt(np.sum(w_mag * (theta_deg[inliers] ** 2)) / w_sum))
+            else:
+                residual_rms_deg = float(np.sqrt(np.mean(theta_deg[inliers] ** 2)))
+        else:
+            residual_rms_deg = float(np.sqrt(np.mean(theta_deg ** 2)))
+    else:
+        residual_rms_deg = float(np.sqrt(np.mean(theta_deg ** 2)))
+    return R, residual_rms_deg, sv_ratio
+
+
+def find_temporal_offset_subms(
+    phone_ts: np.ndarray,
+    phone_g: np.ndarray,
+    hub_ts: np.ndarray,
+    hub_g: np.ndarray,
+    max_lag_s: float = 0.050,
+) -> int:
+    """Estimate sub-millisecond temporal lag (in nanoseconds) between Hub IMU and Phone IMU gyro norms."""
+    t0_ns = max(int(phone_ts[0]), int(hub_ts[0]))
+    t1_ns = min(int(phone_ts[-1]), int(hub_ts[-1]))
+    dur_s = (t1_ns - t0_ns) / 1e9
+    if dur_s < 2.0:
+        return 0
+    fs = 1000.0
+    t_grid = np.arange(0.0, dur_s, 1.0 / fs)
+    if t_grid.size < 500:
+        return 0
+    tp_s = (phone_ts - t0_ns) / 1e9
+    th_s = (hub_ts - t0_ns) / 1e9
+    mp = np.linalg.norm(phone_g, axis=1)
+    mh = np.linalg.norm(hub_g, axis=1)
+    mp_i = np.interp(t_grid, tp_s, mp)
+    mh_i = np.interp(t_grid, th_s, mh)
+    mp_z = mp_i - np.mean(mp_i)
+    mh_z = mh_i - np.mean(mh_i)
+    if np.std(mp_z) < 1e-5 or np.std(mh_z) < 1e-5:
+        return 0
+    corr = scipy_correlate(mh_z, mp_z, mode="full", method="fft")
+    lags = np.arange(-len(mp_z) + 1, len(mh_z))
+    center = len(mp_z) - 1
+    rad = int(max_lag_s * fs)
+    s_idx = max(0, center - rad)
+    e_idx = min(len(corr), center + rad + 1)
+    pk = s_idx + int(np.argmax(corr[s_idx:e_idx]))
+    if 0 < pk < len(corr) - 1:
+        y1, y2, y3 = float(corr[pk - 1]), float(corr[pk]), float(corr[pk + 1])
+        denom = y1 - 2.0 * y2 + y3
+        frac = -0.5 * (y3 - y1) / denom if denom < -1e-8 else 0.0
+    else:
+        frac = 0.0
+    lag_s = (lags[pk] + frac) / fs
+    return int(round(lag_s * 1e9))
+
+
+_estimate_sub_ms_gyro_lag_ns = find_temporal_offset_subms
 
 
 def estimate_R_phone_hub(
@@ -406,65 +576,64 @@ def estimate_R_phone_hub(
     if phone_ts.size < 2:
         return _wahba_result(False, None, "missing_stream", 0, None, None)
 
-    t_first = int(phone_ts[0])
-    t_last = int(phone_ts[-1])
-    kept_phone = []
-    kept_hub = []
-    n_phone = int(phone_ts.size)
-    for k in range(int(hub_ts.size)):
-        t = int(hub_ts[k])
-        if t < t_first or t > t_last:
-            continue
-        i = int(np.searchsorted(phone_ts, t, side="left"))
-        if i >= n_phone:
-            continue
-        if i == 0 or int(phone_ts[i]) == t:
-            w_p = phone_g[i]
-        elif 0 < i < n_phone:
-            t0 = int(phone_ts[i - 1])
-            t1 = int(phone_ts[i])
-            if min(t - t0, t1 - t) > WAHBA_MAX_PAIR_DT_NS:
-                continue
-            if t1 > t0:
-                alpha = (t - t0) / (t1 - t0)
-                w_p = (1.0 - alpha) * phone_g[i - 1] + alpha * phone_g[i]
-            else:
-                w_p = phone_g[i]
+    # Baseline candidate (zero lag, raw gyro)
+    w_p_raw, w_h_raw = _match_gyro_pairs(phone_ts, phone_g, hub_ts, hub_g)
+    n_pairs = int(w_p_raw.shape[0])
+    R_best, rms_best, sv_best = _solve_wahba_svd(w_p_raw, w_h_raw, use_irls=False)
+    best_lag_ns = 0
+
+    # Lag-compensated & bias-corrected IRLS Huber candidate
+    try:
+        p_norm = np.linalg.norm(phone_g, axis=1)
+        h_norm = np.linalg.norm(hub_g, axis=1)
+        p_bias = np.median(phone_g[p_norm < 0.08], axis=0) if np.count_nonzero(p_norm < 0.08) >= 20 else np.zeros(3)
+        h_bias = np.median(hub_g[h_norm < 0.08], axis=0) if np.count_nonzero(h_norm < 0.08) >= 20 else np.zeros(3)
+        p_g_bc = phone_g - p_bias
+        h_g_bc = hub_g - h_bias
+
+        fs_p = 1e9 / max(1.0, float(np.median(np.diff(phone_ts))))
+        fs_h = 1e9 / max(1.0, float(np.median(np.diff(hub_ts))))
+        if phone_g.shape[0] >= 30 and fs_p > 30.0:
+            p_g_filt = apply_butterworth_lowpass(p_g_bc, fs_p, (phone_ts - phone_ts[0]) / 1e9, cutoff_ratio=min(0.25, 12.0 / fs_p))
         else:
-            continue
-        w_h = hub_g[k]
-        if float(np.linalg.norm(w_p)) >= WAHBA_OMEGA_MIN_RAD_S and float(np.linalg.norm(w_h)) >= WAHBA_OMEGA_MIN_RAD_S:
-            kept_phone.append(np.asarray(w_p, dtype=np.float64))
-            kept_hub.append(np.asarray(w_h, dtype=np.float64))
+            p_g_filt = p_g_bc
+        if hub_g.shape[0] >= 30 and fs_h > 30.0:
+            h_g_filt = apply_butterworth_lowpass(h_g_bc, fs_h, (hub_ts - hub_ts[0]) / 1e9, cutoff_ratio=min(0.25, 12.0 / fs_h))
+        else:
+            h_g_filt = h_g_bc
 
-    n_pairs = len(kept_phone)
-    if n_pairs < WAHBA_MIN_PAIRS:
-        return _wahba_result(False, None, "too_few_pairs", n_pairs, None, None)
+        lag_ns = find_temporal_offset_subms(phone_ts, p_g_filt, hub_ts, h_g_filt)
+        hub_ts_shifted = hub_ts - lag_ns
+        w_p_opt, w_h_opt = _match_gyro_pairs(phone_ts, p_g_filt, hub_ts_shifted, h_g_filt)
+        if w_p_opt.shape[0] >= WAHBA_MIN_PAIRS:
+            R_opt, rms_opt, sv_opt = _solve_wahba_svd(w_p_opt, w_h_opt, use_irls=True)
+            if (
+                R_opt is not None
+                and rms_opt is not None
+                and sv_opt is not None
+                and sv_opt >= WAHBA_MIN_SV_RATIO
+                and (rms_best is None or rms_opt < rms_best)
+            ):
+                R_best, rms_best, sv_best = R_opt, rms_opt, sv_opt
+                n_pairs = int(w_p_opt.shape[0])
+                best_lag_ns = int(lag_ns)
+    except Exception:
+        pass
 
-    w_p = np.stack(kept_phone, axis=0)
-    w_h = np.stack(kept_hub, axis=0)
-    u_p = w_p / np.linalg.norm(w_p, axis=1, keepdims=True)
-    u_h = w_h / np.linalg.norm(w_h, axis=1, keepdims=True)
-    H = u_h.T @ u_p
-    U, S, Vt = np.linalg.svd(H)
-    if (not np.all(np.isfinite(S))) or float(S[0]) <= 0.0:
-        return _wahba_result(False, None, "too_few_pairs", n_pairs, None, None)
-    det_H = float(np.linalg.det(Vt.T @ U.T))
-    if abs(det_H) < 1e-6:
-        return _wahba_result(False, None, "too_few_pairs", n_pairs, None, None)
-    d = 1.0 if det_H > 0.0 else -1.0
-    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
-    sv_ratio = float(S[1] / S[0])
-    if sv_ratio < WAHBA_MIN_SV_RATIO:
-        return _wahba_result(False, None, "insufficient_excitation", n_pairs, None, sv_ratio)
+    if n_pairs < WAHBA_MIN_PAIRS or R_best is None:
+        if sv_best is not None and sv_best < WAHBA_MIN_SV_RATIO:
+            return _wahba_result(False, None, "insufficient_excitation", n_pairs, None, sv_best, best_lag_ns)
+        return _wahba_result(False, None, "too_few_pairs", n_pairs, None, None, best_lag_ns)
 
-    a = (R @ w_h.T).T
-    b = w_p
-    sin_th = np.linalg.norm(np.cross(a, b), axis=1)
-    cos_th = np.sum(a * b, axis=1)
-    theta_deg = np.degrees(np.arctan2(sin_th, cos_th))
-    residual_rms_deg = float(np.sqrt(np.mean(theta_deg ** 2)))
-    if residual_rms_deg > WAHBA_MAX_RMS_DEG:
-        return _wahba_result(False, None, "residual_rms", n_pairs, residual_rms_deg, sv_ratio)
-    return _wahba_result(True, R, None, n_pairs, residual_rms_deg, sv_ratio)
+    if sv_best < WAHBA_MIN_SV_RATIO:
+        return _wahba_result(False, None, "insufficient_excitation", n_pairs, None, sv_best, best_lag_ns)
+
+    if rms_best > WAHBA_MAX_RMS_DEG:
+        return _wahba_result(False, None, "residual_rms", n_pairs, rms_best, sv_best, best_lag_ns)
+    return _wahba_result(True, R_best, None, n_pairs, rms_best, sv_best, best_lag_ns)
+
+
+estimate_gyro_alignment_and_lag = estimate_R_phone_hub
+
+
 

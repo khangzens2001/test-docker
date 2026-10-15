@@ -72,10 +72,6 @@ def run_vggt_inference(
         os.unlink(vggt_dir)
         os.makedirs(vggt_dir, exist_ok=True)
 
-    from app.pipeline.runner import load_pose_table_for_tsdf
-    current_pose_df = load_pose_table_for_tsdf(session_dir, prefer_server_vio=True)
-    current_pose_source = current_pose_df.attrs.get("pose_source") if hasattr(current_pose_df, "attrs") else None
-
     if not force_recompute and os.path.isfile(cam_path) and os.path.isfile(npz_path) and os.path.isfile(man_path):
         try:
             with open(man_path, "r", encoding="utf-8") as f:
@@ -86,36 +82,30 @@ def run_vggt_inference(
                     has_colors = "colors" in check_npz
                     has_conf = "confidence" in check_npz
                     pts_len = len(check_npz["points"]) if "points" in check_npz else 0
-                    median_conf = float(np.median(check_npz["confidence"])) if has_conf and len(check_npz["confidence"]) > 0 else 0.0
                     max_conf = float(check_npz["confidence"].max()) if has_conf and len(check_npz["confidence"]) > 0 else 0.0
-                    valid_npz = has_colors and pts_len >= 200_000 and (median_conf >= 1.1 or max_conf >= 1.5)
+                    valid_npz = has_colors and pts_len >= 100_000 and max_conf >= 1.0
             except Exception:
                 valid_npz = False
 
-            if manifest_data.get("pose_source") == current_pose_source and valid_npz:
-                need_reclean = not os.path.isfile(clean_ply_path)
+            if valid_npz and len(manifest_data.get("frames", [])) >= 3:
+                vio_csv = os.path.join(session_dir, "processed_vio.csv")
+                need_reclean = (
+                    not os.path.isfile(clean_ply_path)
+                    or os.path.getmtime(npz_path) > os.path.getmtime(clean_ply_path)
+                    or (os.path.isfile(vio_csv) and os.path.getmtime(vio_csv) > os.path.getmtime(clean_ply_path))
+                )
                 if not need_reclean:
                     try:
                         import open3d as o3d
                         p_check = o3d.io.read_point_cloud(clean_ply_path)
-                        if len(p_check.points) < 200_000:
+                        if len(p_check.points) < 50_000:
                             need_reclean = True
                     except Exception:
                         need_reclean = True
                 if need_reclean:
                     try:
                         import open3d as o3d
-                        from scipy.spatial.transform import Rotation
                         from app.services.manhattan_alignment import clean_and_align_point_cloud
-                        cached_frames = manifest_data.get("frames", [])
-                        R_wc0 = None
-                        if cached_frames and "qx" in cached_frames[0]:
-                            try:
-                                f0 = cached_frames[0]
-                                q0 = [f0["qx"], f0["qy"], f0["qz"], f0["qw"]]
-                                R_wc0 = Rotation.from_quat(q0).as_matrix()
-                            except Exception as e_rot:
-                                logger.warning("Could not extract R_init from cached frame 0: %s", e_rot)
 
                         with np.load(npz_path) as npz:
                             c_pts = np.asarray(npz["points"], dtype=float)
@@ -125,18 +115,18 @@ def run_vggt_inference(
                         if c_cols is not None:
                             pcd_cached.colors = o3d.utility.Vector3dVector(c_cols)
                         clean_cached, _ = clean_and_align_point_cloud(
-                            pcd_cached, voxel=0.003, stat_neighbors=16, stat_std=2.8, R_init=R_wc0
+                            pcd_cached, voxel=0.003, stat_neighbors=16, stat_std=2.8, R_init=None, session_dir=session_dir
                         )
                         o3d.io.write_point_cloud(clean_ply_path, clean_cached, write_ascii=False)
                         logger.info("Generated clean Manhattan point cloud from cached npz: %s (%d points)",
                                     clean_ply_path, len(clean_cached.points))
                     except Exception as e:
                         logger.warning("Could not create clean ply from existing npz: %s", e)
-                logger.info("VGGT artifacts already exist in %s with matching pose_source '%s' and high fidelity (%d points); skipping inference.", vggt_dir, current_pose_source, pts_len)
+                logger.info("VGGT artifacts already exist in %s with pose_source '%s' and high fidelity (%d points); skipping inference.", vggt_dir, manifest_data.get("pose_source"), pts_len)
                 return True
             else:
-                logger.warning("VGGT artifacts need recomputing (pose_source match: %s, valid_npz: %s); forcing recomputation.",
-                               manifest_data.get("pose_source") == current_pose_source, valid_npz)
+                logger.warning("VGGT artifacts need recomputing (frames: %d, valid_npz: %s); forcing recomputation.",
+                               len(manifest_data.get("frames", [])), valid_npz)
                 force_recompute = True
         except Exception:
             force_recompute = True
@@ -205,6 +195,7 @@ def run_vggt_inference(
     else:
         model = VGGT.from_pretrained(model_id).to(device, dtype=dtype)
         model.eval()
+        # Disable depth head to save VRAM; only point head + camera head are needed for 3D layout prior
         model.depth_head = None
         _patch_vggt_pos_embed(model)
         should_del_model = True
@@ -406,7 +397,7 @@ def run_vggt_inference(
         o3d.io.write_point_cloud(raw_ply_path, raw_pcd, write_ascii=False)
 
         clean_pcd, clean_info = clean_and_align_point_cloud(
-            raw_pcd, voxel=0.003, stat_neighbors=16, stat_std=2.8, R_init=None
+            raw_pcd, voxel=0.003, stat_neighbors=16, stat_std=2.8, R_init=None, session_dir=session_dir
         )
         o3d.io.write_point_cloud(clean_ply_path, clean_pcd, write_ascii=False)
         logger.info(

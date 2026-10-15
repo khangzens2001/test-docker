@@ -337,13 +337,20 @@ class ServerSideVioEstimator:
                     odo_rots = Rotation.from_quat(qs).as_matrix()
 
         span_xy_odo = None
+        odo_horiz = None
         if odo_pos is not None and len(odo_pos) > 0:
-            finite_odo = np.all(np.isfinite(odo_pos[:, :2]), axis=1)
+            use_xz_horiz = (
+                odo_pos.shape[1] >= 3
+                and odo_rots is not None
+                and float(np.ptp(odo_pos[:, 2])) > 0.05
+            )
+            odo_horiz = odo_pos[:, [0, 2]] if use_xz_horiz else odo_pos[:, :2]
+            finite_odo = np.all(np.isfinite(odo_horiz), axis=1)
             if np.any(finite_odo):
-                span_xy_odo = float(np.max(np.ptp(odo_pos[finite_odo, :2], axis=0)))
+                span_xy_odo = float(np.max(np.ptp(odo_horiz[finite_odo], axis=0)))
 
-        # Check if small room from SPAD sensor depths
-        is_small_room = False
+        # Compute observed SPAD LiDAR 90th-percentile depth envelope (pure sensor statistic)
+        spad_depth_p90: Optional[float] = None
         if spad_lidar_df is not None and not spad_lidar_df.empty:
             valid_vals = []
             d_cols = [c for c in spad_lidar_df.columns if c.startswith("distance_") or (c.startswith("d") and c != "depth_grid") or c.isdigit()]
@@ -352,7 +359,7 @@ class ServerSideVioEstimator:
                     vals = spad_lidar_df[d_cols].to_numpy(dtype=float)
                     valid_vals.append(vals[(vals > 0.05) & np.isfinite(vals)].ravel())
                 except (ValueError, TypeError) as exc:
-                    logger.warning("is_small_room: skipping non-numeric SPAD columns %s: %s", d_cols, exc)
+                    logger.warning("spad_depth_p90: skipping non-numeric SPAD columns %s: %s", d_cols, exc)
             if "depth_grid" in spad_lidar_df.columns:
                 for g in spad_lidar_df["depth_grid"].dropna():
                     arr = np.asarray(g, dtype=float).ravel()
@@ -360,16 +367,45 @@ class ServerSideVioEstimator:
             if valid_vals:
                 all_valid = np.concatenate(valid_vals)
                 if len(all_valid) > 0:
-                    depth_p90 = float(np.percentile(all_valid, 90))
-                    if depth_p90 > 50.0:
-                        depth_p90 = depth_p90 / 1000.0
-                    if depth_p90 <= 2.50:
-                        is_small_room = True
+                    d_p90 = float(np.percentile(all_valid, 90))
+                    if d_p90 > 50.0:
+                        d_p90 = d_p90 / 1000.0
+                    spad_depth_p90 = d_p90
 
-        if is_small_room:
-            r_bound = 2.60
+        # Gate out corrupted / runaway external odometry (e.g. ARCore tracking loss > 2.2x LiDAR depth envelope)
+        odo_is_runaway = False
+        if odo_times is not None and odo_horiz is not None and len(odo_times) > 2:
+            dt_arr = np.diff(odo_times)
+            dp_arr = np.linalg.norm(np.diff(odo_horiz, axis=0), axis=1)
+            valid_dt = dt_arr > 1e-3
+            if np.any(valid_dt):
+                odo_p90_speed = float(np.percentile(dp_arr[valid_dt] / dt_arr[valid_dt], 90))
+                if odo_p90_speed > 0.90:
+                    odo_is_runaway = True
+        if span_xy_odo is not None and np.isfinite(span_xy_odo):
+            if spad_depth_p90 is not None and span_xy_odo > max(2.2 * spad_depth_p90, 4.0):
+                odo_is_runaway = True
+            elif span_xy_odo > 12.0:
+                odo_is_runaway = True
+
+        if odo_is_runaway:
+            logger.warning(
+                "Gating out runaway external odometry translation (span_xy_odo=%s, spad_depth_p90=%s)",
+                span_xy_odo,
+                spad_depth_p90,
+            )
+            odo_times = None
+            odo_pos = None
+            span_xy_odo = None
+            span_odo = None
+
+        if span_xy_odo is not None and np.isfinite(span_xy_odo) and span_xy_odo > 0:
+            r_bound = max(1.25 * float(span_xy_odo), 0.60)
+            if spad_depth_p90 is not None and spad_depth_p90 > 0:
+                r_bound = min(r_bound, 1.35 * float(spad_depth_p90))
         else:
-            r_bound = max(1.5 * float(span_xy_odo), 3.5) if (span_xy_odo is not None and np.isfinite(span_xy_odo) and span_xy_odo > 0) else 3.5
+            r_bound = (0.65 * float(spad_depth_p90)) if (spad_depth_p90 is not None and spad_depth_p90 > 0) else 2.50
+        z_bound = min(0.55 * float(spad_depth_p90), 1.20) if (spad_depth_p90 is not None and spad_depth_p90 > 0) else 1.20
 
         sync = EventDrivenTimeSynchronizer()
 
@@ -632,19 +668,20 @@ class ServerSideVioEstimator:
                                 eskf.state.p[:] = 0.0
                                 eskf.update_zupt(sigma_vel=0.005)
                             else:
-                                # In-flight ZUPT during camera tracking only when device is physically at rest
+                                # In-flight ZUPT and gravity-tilt lock during camera tracking
                                 w_mag = float(np.linalg.norm(gyro - eskf.state.bg))
                                 g_mag = float(np.linalg.norm(eskf.state.g)) if hasattr(eskf.state, "g") else 9.80665
                                 a_dyn = abs(float(np.linalg.norm(accel)) - g_mag)
+                                if a_dyn < 0.35 and hasattr(eskf, "update_gravity_tilt"):
+                                    eskf.update_gravity_tilt(accel, sigma_acc=0.25)
                                 if w_mag < 0.03 and a_dyn < 0.15:
                                     eskf.update_zupt(sigma_vel=0.01)
 
                             cur_v_mag = float(np.linalg.norm(eskf.state.v))
                             if cur_v_mag > 1.2:
                                 eskf.state.v *= (1.2 / cur_v_mag)
-                            if is_small_room:
-                                eskf.state.v[2] = float(np.clip(eskf.state.v[2], -0.80, 0.80))
-                                eskf.state.p[2] = float(np.clip(eskf.state.p[2], -1.60, 1.20))
+                            eskf.state.v[2] = float(np.clip(eskf.state.v[2], -0.80, 0.80))
+                            eskf.state.p[2] = float(np.clip(eskf.state.p[2], -z_bound, z_bound))
                         else:
                             F_list.append(np.eye(StateIndex.DIM))
                             pred_states.append(_copy_state(eskf.state))
@@ -805,6 +842,7 @@ class ServerSideVioEstimator:
 
                         # Check optical flow parallax / odometry speed for ZUPT
                         is_stationary = False
+                        du_med = None
                         w_curr = float(np.linalg.norm(latest_phone_gyro - eskf.state.bg)) if latest_phone_gyro is not None else 1.0
                         if len(matched_pts_prev) >= 10 and len(matched_pts_curr) >= 10:
                             p_norm = (matched_pts_prev - np.array([K[0, 2], K[1, 2]])) / np.array([K[0, 0], K[1, 1]])
@@ -815,7 +853,9 @@ class ServerSideVioEstimator:
                                     K[0, 0] * p_derot[:, 0] / p_derot[:, 2] + K[0, 2],
                                     K[1, 1] * p_derot[:, 1] / p_derot[:, 2] + K[1, 2],
                                 ])
-                                flow_res = np.linalg.norm(matched_pts_curr - u_derot, axis=1)
+                                du_trans = matched_pts_curr - u_derot
+                                flow_res = np.linalg.norm(du_trans, axis=1)
+                                du_med = np.median(du_trans, axis=0)
                                 if np.median(flow_res) < 1.0 and w_curr < 0.05:
                                     is_stationary = True
 
@@ -825,10 +865,11 @@ class ServerSideVioEstimator:
                             idx_odo = np.clip(np.searchsorted(odo_times, ts), 1, len(odo_times) - 1)
                             dt_o = max(1e-3, odo_times[idx_odo] - odo_times[idx_odo - 1])
                             dp_odo = odo_pos[idx_odo] - odo_pos[idx_odo - 1]
-                            s_odo = float(np.linalg.norm(dp_odo) / max(dt_o, 0.005))
+                            dp_odo_h = (R_vio_odo @ dp_odo)[:2] if R_vio_odo is not None else dp_odo
+                            s_odo = float(np.linalg.norm(dp_odo_h) / max(dt_o, 0.005))
                             if s_odo < 0.05 and w_curr < 0.05:
                                 is_stationary = True
-                            if s_odo > 2.5 or dt_o < 0.005 or float(np.linalg.norm(dp_odo)) > 0.50:
+                            if s_odo > 2.5 or dt_o < 0.005 or float(np.linalg.norm(dp_odo_h)) > 0.50:
                                 q_motion = 0.0
                             else:
                                 q_motion = float(np.clip(1.0 - max(0.0, s_odo - 1.2), 0.0, 1.0))
@@ -853,6 +894,25 @@ class ServerSideVioEstimator:
                             max_allowed_speed = max(1.2 * s_odo, 0.10)
                             if v_cur_speed > max_allowed_speed:
                                 eskf.state.v *= (max_allowed_speed / v_cur_speed)
+                        elif odo_times is None and du_med is not None and len(camera_snapshots) > 0:
+                            # Anchor translational velocity directly from derotated optical flow + SPAD LiDAR depth
+                            dt_cam = max(0.015, ts - camera_snapshots[-1]["timestamp"])
+                            z_med = float(spad_depth_p90) if (spad_depth_p90 is not None and spad_depth_p90 > 0.2) else 1.5
+                            if latest_spad_depth is not None:
+                                d_arr = np.asarray(latest_spad_depth, dtype=np.float64).ravel()
+                                d_val = d_arr[(d_arr >= 0.20) & (d_arr <= 5.0) & np.isfinite(d_arr)]
+                                if d_val.size >= 4:
+                                    z_med = float(np.median(d_val))
+                            vc_x = -float(du_med[0]) / max(float(K[0, 0]), 1.0) * z_med / dt_cam
+                            vc_y = -float(du_med[1]) / max(float(K[1, 1]), 1.0) * z_med / dt_cam
+                            v_flow_w = R_wc_now @ np.array([vc_x, vc_y, 0.0], dtype=np.float64)
+                            v_flow_w[2] = 0.0
+                            s_flow = float(np.linalg.norm(v_flow_w[:2]))
+                            max_flow_speed = 0.35
+                            if s_flow > max_flow_speed and s_flow > 1e-6:
+                                v_flow_w[:2] *= (max_flow_speed / s_flow)
+                            eskf.state.v[:2] = 0.35 * eskf.state.v[:2] + 0.65 * v_flow_w[:2]
+                            eskf.state.v[2] = float(np.clip(eskf.state.v[2] * 0.5, -0.25, 0.25))
 
                         v_mag = float(np.linalg.norm(eskf.state.v))
                         if v_mag > 1.2:
@@ -891,8 +951,10 @@ class ServerSideVioEstimator:
                                     idx_c = np.clip(np.searchsorted(odo_times, t_curr), 0, len(odo_times) - 1)
                                     dt_seg = max(1e-3, t_curr - t_prev)
                                     dp_raw = odo_pos[idx_c] - odo_pos[idx_p]
-                                    s_seg = float(np.linalg.norm(dp_raw) / max(dt_seg, 0.005))
-                                    if s_seg > 2.5 or dt_seg < 0.005 or float(np.linalg.norm(dp_raw)) > 0.50:
+                                    dp_raw_h = (R_vio_odo @ dp_raw)[:2] if R_vio_odo is not None else dp_raw
+                                    d_raw_norm = float(np.linalg.norm(dp_raw_h))
+                                    s_seg = float(d_raw_norm / max(dt_seg, 0.005))
+                                    if s_seg > 2.5 or dt_seg < 0.005 or d_raw_norm > 0.50:
                                         q_seg = 0.0
                                     else:
                                         q_seg = float(np.clip(1.0 - max(0.0, s_seg - 1.2), 0.0, 1.0))
@@ -911,11 +973,17 @@ class ServerSideVioEstimator:
                                                 d_eff = (1.0 - w_odo) * meas_norm + w_odo * d_odo
                                                 t_rel_meas = (t_rel_meas / meas_norm) * d_eff
                                     meas_norm = float(np.linalg.norm(t_rel_meas))
-                                    d_raw_norm = float(np.linalg.norm(dp_raw))
                                     max_step = min(0.35, max(1.2 * d_raw_norm, 0.10 * dt_seg)) if q_seg > 0.0 else 0.15
                                     if meas_norm > max_step and meas_norm > 1e-4:
                                         t_rel_meas = t_rel_meas * (max_step / meas_norm)
                                     t_rel_meas[2] = float(np.clip(t_rel_meas[2], -0.20, 0.20))
+                                else:
+                                    dt_seg = max(1e-3, ts - pgo_nodes_meta[-1]["timestamp"])
+                                    meas_norm = float(np.linalg.norm(t_rel_meas))
+                                    max_step = min(0.20, max(0.05, 0.30 * dt_seg))
+                                    if meas_norm > max_step and meas_norm > 1e-4:
+                                        t_rel_meas = t_rel_meas * (max_step / meas_norm)
+                                    t_rel_meas[2] = float(np.clip(t_rel_meas[2], -0.15, 0.15))
 
                                 info_trans = min(50.0, 10.0 + 40.0 * o_node)
                                 info_rot = 10.0
@@ -1055,7 +1123,7 @@ class ServerSideVioEstimator:
                                                     t_loop = t_loop * d_odo_loop
 
                                             t_norm = float(np.linalg.norm(t_loop))
-                                            loop_t_norm_max = 2.60 if is_small_room else max(3.5, (float(span_odo) * 1.2) if (span_odo is not None and np.isfinite(span_odo)) else 3.5)
+                                            loop_t_norm_max = max(float(r_bound), (float(span_odo) * 1.2) if (span_odo is not None and np.isfinite(span_odo)) else float(r_bound))
                                             eff_ang_deg = ang_deg_odo if ang_deg_odo is not None else ang_deg
                                             logger.info("LOOP CANDIDATE: %d -> %d, inliers=%d, t_norm=%.3f, max=%.3f, t_err=%.3f, ang_deg=%.2f, eff_ang=%.2f", past_node_id, query_node_id, inliers, t_norm, loop_t_norm_max, t_err, ang_deg, eff_ang_deg)
                                             # Physical room bound: adaptively bounded by scan odometry scale
@@ -1158,6 +1226,13 @@ class ServerSideVioEstimator:
                     if meas_norm > max_step and meas_norm > 1e-4:
                         t_rel_meas = t_rel_meas * (max_step / meas_norm)
                     t_rel_meas[2] = float(np.clip(t_rel_meas[2], -0.20, 0.20))
+                else:
+                    dt_seg = max(1e-3, last_snap["timestamp"] - pgo_nodes_meta[-1]["timestamp"])
+                    meas_norm = float(np.linalg.norm(t_rel_meas))
+                    max_step = min(0.20, max(0.05, 0.30 * dt_seg))
+                    if meas_norm > max_step and meas_norm > 1e-4:
+                        t_rel_meas = t_rel_meas * (max_step / meas_norm)
+                    t_rel_meas[2] = float(np.clip(t_rel_meas[2], -0.15, 0.15))
 
                 info_trans = min(50.0, 10.0 + 40.0 * o_node)
                 info_rot = 10.0
@@ -1463,7 +1538,7 @@ class ServerSideVioEstimator:
                 T_wc = T_wb @ T_bc
                 R_filter[idx] = T_wc[:3, :3]
                 t_filter[idx] = T_wc[:3, 3]
-                t_filter[idx, 2] = float(np.clip(t_filter[idx, 2], -1.60, 1.20))
+                t_filter[idx, 2] = float(np.clip(t_filter[idx, 2], -z_bound, z_bound))
 
             # Initialize PGO node poses
             if pgo_nodes_meta:
@@ -1484,7 +1559,7 @@ class ServerSideVioEstimator:
                         R_prev_node, t_prev_node = pgo.nodes[nid - 1]
                         R_ij, t_ij = edge_map[nid - 1]
                         t_curr = t_prev_node + R_prev_node @ t_ij
-                        t_curr[2] = float(np.clip(t_curr[2], -1.60, 1.20))
+                        t_curr[2] = float(np.clip(t_curr[2], -z_bound, z_bound))
                         d_xy = float(np.linalg.norm(t_curr[:2] - p0_init[:2]))
                         if d_xy > r_bound:
                             t_curr[:2] = p0_init[:2] + (t_curr[:2] - p0_init[:2]) * (r_bound / d_xy)
@@ -1542,7 +1617,7 @@ class ServerSideVioEstimator:
                 logger.warning("PGO NaN detected, reverting to R_filter, t_filter")
                 R_final, t_final = R_filter, t_filter
 
-            t_final[:, 2] = np.clip(t_final[:, 2], -1.60, 1.20)
+            t_final[:, 2] = np.clip(t_final[:, 2], -z_bound, z_bound)
             d_xy_final = np.linalg.norm(t_final[:, :2] - t_final[0, :2], axis=1)
             mask_rad = d_xy_final > r_bound
             if np.any(mask_rad):
@@ -1992,6 +2067,96 @@ def _odometry_aabb_span_decoupled(session_dir: str) -> tuple[float | None, float
         return None, None, n
     span_xy, span_z = _aabb_span_decoupled(xyz[finite])
     return span_xy, span_z, n
+
+
+def evaluate_trajectory_sanity(
+    trajectory_or_df: list[dict] | pd.DataFrame,
+    *,
+    spad_depth_p90: float | None = None,
+    max_speed_mps: float = 2.5,
+) -> dict[str, Any]:
+    """Evaluate ecological and physical sanity of a 3D trajectory against dToF range bounds."""
+    if isinstance(trajectory_or_df, pd.DataFrame):
+        if trajectory_or_df.empty or not {"x", "y", "z"}.issubset(trajectory_or_df.columns):
+            return {
+                "sane": False,
+                "is_runaway": False,
+                "span_xy_m": 0.0,
+                "span_z_m": 0.0,
+                "span_xyz_m": 0.0,
+                "p99_speed_mps": 0.0,
+                "jump_ratio": 0.0,
+                "reason": "empty_trajectory",
+            }
+        xyz = trajectory_or_df[["x", "y", "z"]].to_numpy(dtype=np.float64)
+        if "timestamp" in trajectory_or_df.columns:
+            ts = trajectory_or_df["timestamp"].to_numpy(dtype=np.float64)
+        elif "device_timestamp_ns" in trajectory_or_df.columns:
+            ts = trajectory_or_df["device_timestamp_ns"].to_numpy(dtype=np.float64) / 1e9
+        else:
+            ts = np.arange(len(xyz), dtype=np.float64) * 0.0333333
+    elif isinstance(trajectory_or_df, list) and len(trajectory_or_df) > 0:
+        xyz = np.array([[float(r["x"]), float(r["y"]), float(r["z"])] for r in trajectory_or_df], dtype=np.float64)
+        ts = np.array(
+            [float(r.get("timestamp", float(r.get("device_timestamp_ns", 0.0)) / 1e9)) for r in trajectory_or_df],
+            dtype=np.float64,
+        )
+    else:
+        return {
+            "sane": False,
+            "is_runaway": False,
+            "span_xy_m": 0.0,
+            "span_z_m": 0.0,
+            "span_xyz_m": 0.0,
+            "p99_speed_mps": 0.0,
+            "jump_ratio": 0.0,
+            "reason": "empty_trajectory",
+        }
+
+    if not np.all(np.isfinite(xyz)):
+        return {
+            "sane": False,
+            "is_runaway": True,
+            "span_xy_m": 0.0,
+            "span_z_m": 0.0,
+            "span_xyz_m": 0.0,
+            "p99_speed_mps": 0.0,
+            "jump_ratio": 1.0,
+            "reason": "non_finite_poses",
+        }
+
+    span_xyz = _aabb_span_xyz(xyz)
+    span_xy, span_z = _aabb_span_decoupled(xyz)
+
+    p99_speed = 0.0
+    jump_ratio = 0.0
+    if len(xyz) >= 2:
+        dt = np.diff(ts)
+        dp = np.linalg.norm(np.diff(xyz, axis=0), axis=1)
+        speeds = dp / np.maximum(dt, 1e-3)
+        p99_speed = float(np.percentile(speeds, 99))
+        jumps = (dt > 0.1) & (np.round(dp, 2) > 0.20)
+        jump_ratio = float(np.count_nonzero(jumps)) / float(len(dp))
+
+    max_xy = max(2.2 * float(spad_depth_p90), 3.5) if (spad_depth_p90 is not None and spad_depth_p90 > 0) else 12.0
+    is_runaway = bool(span_xy > max_xy or span_z > 2.50 or p99_speed > max_speed_mps)
+    sane = bool((not is_runaway) and (jump_ratio <= 0.01) and (len(xyz) >= 2))
+    reason = None
+    if is_runaway:
+        reason = "runaway_span_or_speed"
+    elif jump_ratio > 0.01:
+        reason = "jump_dt"
+
+    return {
+        "sane": sane,
+        "is_runaway": is_runaway,
+        "span_xy_m": float(span_xy),
+        "span_z_m": float(span_z),
+        "span_xyz_m": float(span_xyz),
+        "p99_speed_mps": float(p99_speed),
+        "jump_ratio": float(jump_ratio),
+        "reason": reason,
+    }
 
 
 def _make_default_gates() -> dict[str, Any]:

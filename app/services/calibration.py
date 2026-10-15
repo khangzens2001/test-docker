@@ -170,10 +170,76 @@ T_GL_CV = np.array(
 )
 
 
+def _display_to_camera_sensor_rotation(rot_deg: int | float | str | None) -> np.ndarray:
+    """Return 3x3 rotation R_disp_cam from Camera Sensor frame to Portrait Display frame.
+
+    Matches compute_lidar_zone_mapping:
+      - theta = 0 deg:   X_disp = +X_cam, Y_disp = +Y_cam
+      - theta = 90 deg:  X_disp = -Y_cam, Y_disp = +X_cam
+      - theta = 180 deg: X_disp = -X_cam, Y_disp = -Y_cam
+      - theta = 270 deg: X_disp = +Y_cam, Y_disp = -X_cam
+    """
+    if rot_deg is None:
+        return np.eye(3, dtype=np.float64)
+    try:
+        theta = int(round(float(rot_deg))) % 360
+    except (ValueError, TypeError):
+        return np.eye(3, dtype=np.float64)
+    if theta == 90:
+        return np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    if theta == 180:
+        return np.array([[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    if theta == 270:
+        return np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return np.eye(3, dtype=np.float64)
+
+
+def chain_wahba_to_lidar_camera_extrinsics(
+    T_lidar_raw: np.ndarray,
+    R_phone_hub: np.ndarray | None,
+    rot_deg: int | float | str | None = 90,
+    extrinsics_calibrated: bool | None = None,
+) -> np.ndarray:
+    """Chain R_phone_hub (from Gyro Wahba) into T_lidar_camera for remapped camera-frame zones.
+
+    Because remap_lidar_zones_to_camera_frame already maps the 8x8 VL53L8CX zones from the
+    Hub/Display orientation into the Camera Sensor frame, an uncalibrated bootstrap rotation
+    of diag(-1, -1, 1) double-flips the LiDAR rays by 180 degrees. When R_phone_hub is available,
+    the residual physical tilt between Hub IMU and Phone Display is R_disp_hub = T_GL_CV[:3,:3].T @ R_phone_hub,
+    which is mapped into the Camera Sensor frame via R_disp_cam.
+    """
+    T_out = np.asarray(T_lidar_raw, dtype=np.float64).copy()
+    if T_out.shape != (4, 4):
+        return np.eye(4, dtype=np.float64)
+    R0 = T_out[:3, :3]
+    is_inverted_bootstrap = (not bool(extrinsics_calibrated)) and (R0[0, 0] < -0.5) and (R0[1, 1] < -0.5)
+    if R_phone_hub is not None:
+        R_ph = np.asarray(R_phone_hub, dtype=np.float64)
+        if R_ph.shape == (3, 3) and np.all(np.isfinite(R_ph)):
+            R_disp_hub = T_GL_CV[:3, :3].T @ R_ph
+            # Verify R_disp_hub is close to identity (valid physical mount tilt < 15 deg)
+            trace_val = float(np.trace(R_disp_hub))
+            if trace_val > 2.80:
+                R_dc = _display_to_camera_sensor_rotation(rot_deg)
+                R_cam_lidar = R_dc.T @ R_disp_hub @ R_dc
+                T_out[:3, :3] = _svd_so3(R_cam_lidar)
+                if is_inverted_bootstrap:
+                    # Also rotate lever arm translation from display/bootstrap frame to camera sensor frame
+                    T_out[:3, 3] = R_dc.T @ T_out[:3, 3]
+                return T_out
+    if is_inverted_bootstrap:
+        R_dc = _display_to_camera_sensor_rotation(rot_deg)
+        T_out[:3, :3] = np.eye(3, dtype=np.float64)
+        T_out[:3, 3] = R_dc.T @ T_out[:3, 3]
+    return T_out
+
+
 def load_T_bc(session_dir: str) -> np.ndarray:
     ext_path = os.path.join(session_dir, "processed_extrinsics.json")
+    manifest_path = os.path.join(session_dir, "manifest.json")
     meaning = ""
     T_raw = None
+    rot_deg = None
     if os.path.isfile(ext_path):
         with open(ext_path, encoding="utf-8") as f:
             data = json.load(f)
@@ -181,6 +247,17 @@ def load_T_bc(session_dir: str) -> np.ndarray:
         arr = np.asarray(data.get("T_imu_camera"), dtype=np.float64)
         if arr.shape == (4, 4) and np.all(np.isfinite(arr)):
             T_raw = arr
+        if "camera_sensor_to_display_rotation_deg" in data:
+            rot_deg = data.get("camera_sensor_to_display_rotation_deg")
+    if rot_deg is None and os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, encoding="utf-8") as mf:
+                mdata = json.load(mf)
+            _, _, raw_rot = _extract_raw_lidar_display_metadata(mdata)
+            if raw_rot is not None:
+                rot_deg = raw_rot
+        except Exception:
+            pass
     if T_raw is None:
         T_raw, _, meta = load_session_extrinsics(session_dir)
         meaning = str(meta.get("T_imu_camera_meaning") or meaning)
@@ -190,6 +267,7 @@ def load_T_bc(session_dir: str) -> np.ndarray:
     if schema13:
         return T_raw @ T_GL_CV
     return T_raw.copy()
+
 
 
 def load_camera_intrinsics(path: str) -> np.ndarray:
@@ -552,6 +630,101 @@ def project_lidar_frame_to_sparse_tof(
     return out
 
 
+def project_lidar_frame_to_sparse_tof_with_status(
+    distances_m: np.ndarray,
+    statuses: np.ndarray,
+    rays: np.ndarray,
+    T_lidar_camera: np.ndarray,
+    K: np.ndarray,
+    height: int,
+    width: int,
+    flip_h: bool = False,
+    flip_v: bool = False,
+    rot_deg: int | float | str = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project 64-zone VL53L8CX distances and hardware status codes (5 vs 9) to image plane."""
+    try:
+        h = int(height)
+        w = int(width)
+        if h <= 0 or w <= 0:
+            return np.zeros((0, 0), dtype=np.float32), np.zeros((0, 0), dtype=np.int32)
+    except (ValueError, TypeError):
+        return np.zeros((0, 0), dtype=np.float32), np.zeros((0, 0), dtype=np.int32)
+
+    try:
+        d = np.asarray(distances_m, dtype=np.float64).reshape(-1)
+        s = np.asarray(statuses, dtype=np.float64).reshape(-1)
+        r = np.asarray(rays, dtype=np.float64).reshape(-1, 3)
+        T = np.asarray(T_lidar_camera, dtype=np.float64)
+        Kin = np.asarray(K, dtype=np.float64)
+        if T.shape != (4, 4) or Kin.shape != (3, 3) or r.shape[1] != 3:
+            return np.zeros((h, w), dtype=np.float32), np.zeros((h, w), dtype=np.int32)
+    except (ValueError, TypeError):
+        return np.zeros((h, w), dtype=np.float32), np.zeros((h, w), dtype=np.int32)
+
+    n = min(d.shape[0], s.shape[0], r.shape[0], 64)
+    if n == 0:
+        return np.zeros((h, w), dtype=np.float32), np.zeros((h, w), dtype=np.int32)
+
+    if d.shape[0] >= 64:
+        d = remap_lidar_zones_to_camera_frame(d, flip_h=flip_h, flip_v=flip_v, rot_deg=rot_deg)
+    if s.shape[0] >= 64:
+        s = remap_lidar_zones_to_camera_frame(s, flip_h=flip_h, flip_v=flip_v, rot_deg=rot_deg)
+
+    R = T[:3, :3]
+    t = T[:3, 3]
+    fx, fy = float(Kin[0, 0]), float(Kin[1, 1])
+    cx, cy = float(Kin[0, 2]), float(Kin[1, 2])
+    s_int = np.where(np.isfinite(s[:n]), np.rint(s[:n]).astype(np.int32), 0)
+    valid = np.isfinite(d[:n]) & (d[:n] > 0.0) & np.isin(s_int, [5, 9])
+    if not np.any(valid):
+        return np.zeros((h, w), dtype=np.float32), np.zeros((h, w), dtype=np.int32)
+    pts = (d[:n, None] * r[:n]) @ R.T + t
+    z = pts[:, 2]
+    keep = valid & (z > TOF_Z_MIN_M) & (z < TOF_Z_MAX_M)
+    if not np.any(keep):
+        return np.zeros((h, w), dtype=np.float32), np.zeros((h, w), dtype=np.int32)
+    u = fx * pts[keep, 0] / z[keep] + cx
+    v = fy * pts[keep, 1] / z[keep] + cy
+    u_px = np.rint(u).astype(int)
+    v_px = np.rint(v).astype(int)
+    z_keep = z[keep]
+    s_keep = s_int[keep]
+    inb = (u_px >= 0) & (u_px < w) & (v_px >= 0) & (v_px < h)
+    out = np.zeros((h, w), dtype=np.float32)
+    out_status = np.zeros((h, w), dtype=np.int32)
+    for ui, vi, zi, si in zip(u_px[inb], v_px[inb], z_keep[inb], s_keep[inb]):
+        prev = out[vi, ui]
+        if prev == 0.0 or zi < prev:
+            out[vi, ui] = np.float32(zi)
+            out_status[vi, ui] = int(si)
+
+    # Project anomalous / dropout zones (status not in {5, 9} or masked distance) into out_status
+    # using reference depth along their ray directions without modifying out (sparse_tof).
+    anom_mask = ~keep
+    if np.any(anom_mask):
+        d_ref = float(np.median(d[:n][keep])) if np.any(keep) else 1.5
+        d_anom = np.where(
+            np.isfinite(d[:n]) & (d[:n] > TOF_Z_MIN_M) & (d[:n] < TOF_Z_MAX_M),
+            d[:n],
+            d_ref,
+        )
+        pts_anom = (d_anom[anom_mask, None] * r[:n][anom_mask]) @ R.T + t
+        z_anom = pts_anom[:, 2]
+        ok_z = z_anom > TOF_Z_MIN_M
+        if np.any(ok_z):
+            u_a = np.rint(fx * pts_anom[ok_z, 0] / z_anom[ok_z] + cx).astype(int)
+            v_a = np.rint(fy * pts_anom[ok_z, 1] / z_anom[ok_z] + cy).astype(int)
+            s_a = s_int[:n][anom_mask][ok_z]
+            inb_a = (u_a >= 0) & (u_a < w) & (v_a >= 0) & (v_a < h)
+            for ui, vi, si in zip(u_a[inb_a], v_a[inb_a], s_a[inb_a]):
+                if out[vi, ui] == 0.0 and out_status[vi, ui] == 0:
+                    out_status[vi, ui] = int(si) if int(si) != 0 else -1
+    return out, out_status
+
+
+
+
 LIDAR_RGB_MATCH_NS = 50_000_000
 
 
@@ -891,6 +1064,75 @@ def planes_are_observable(planes: list[dict]) -> bool:
     return True
 
 
+def _deterministic_segment_plane(
+    pts: np.ndarray,
+    distance_threshold: float,
+    num_iterations: int = 400,
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Deterministic 3-point RANSAC + SVD plane refinement (independent of OpenMP threads)."""
+    pts = np.asarray(pts, dtype=np.float64)
+    n_pts = len(pts)
+    if n_pts < 3:
+        return np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float64), np.zeros(0, dtype=np.int64)
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    idx0 = rng.integers(0, n_pts, size=num_iterations)
+    idx1 = (idx0 + rng.integers(1, n_pts, size=num_iterations)) % n_pts
+    idx2 = (idx0 + rng.integers(1, n_pts - 1, size=num_iterations)) % n_pts
+    same12 = idx2 == idx1
+    idx2[same12] = (idx2[same12] + 1) % n_pts
+
+    p0 = pts[idx0]
+    v1 = pts[idx1] - p0
+    v2 = pts[idx2] - p0
+    normals = np.cross(v1, v2)
+    norms = np.linalg.norm(normals, axis=1)
+    valid = norms > 1e-9
+    if not np.any(valid):
+        return np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float64), np.zeros(0, dtype=np.int64)
+
+    normals = normals[valid] / norms[valid, None]
+    p0_valid = p0[valid]
+    d_o3d = -np.sum(normals * p0_valid, axis=1)
+
+    dists = np.abs(normals @ pts.T + d_o3d[:, None])
+    inlier_mask = dists <= distance_threshold
+    counts = np.sum(inlier_mask, axis=1)
+    max_count = int(np.max(counts))
+    if max_count < 3:
+        return np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float64), np.zeros(0, dtype=np.int64)
+
+    # Break ties deterministically by lowest mean inlier distance
+    inlier_dists_sum = np.sum(np.where(inlier_mask, dists, 0.0), axis=1)
+    scores = counts.astype(np.float64) - (inlier_dists_sum / max(distance_threshold * n_pts, 1e-9))
+    best_i = int(np.argmax(scores))
+    best_inliers = np.flatnonzero(inlier_mask[best_i])
+
+    # SVD least-squares refit on inliers (matching Open3D post-RANSAC refinement)
+    inlier_pts = pts[best_inliers]
+    centroid = np.mean(inlier_pts, axis=0)
+    _, _, vt = np.linalg.svd(inlier_pts - centroid, full_matrices=False)
+    n_fit = vt[-1]
+    n_norm = float(np.linalg.norm(n_fit))
+    if n_norm > 1e-12:
+        n_fit = n_fit / n_norm
+        d_fit = -float(np.dot(n_fit, centroid))
+        refined_inliers = np.flatnonzero(np.abs(pts @ n_fit + d_fit) <= distance_threshold)
+        if len(refined_inliers) >= len(best_inliers):
+            best_inliers = refined_inliers
+            model = np.array([n_fit[0], n_fit[1], n_fit[2], d_fit], dtype=np.float64)
+        else:
+            n_best = normals[best_i]
+            model = np.array([n_best[0], n_best[1], n_best[2], float(d_o3d[best_i])], dtype=np.float64)
+    else:
+        n_best = normals[best_i]
+        model = np.array([n_best[0], n_best[1], n_best[2], float(d_o3d[best_i])], dtype=np.float64)
+
+    return model, best_inliers
+
+
 def extract_camera_planes_from_dense_depth(
     dense: np.ndarray, K: np.ndarray
 ) -> list[dict]:
@@ -922,22 +1164,28 @@ def extract_camera_planes_from_dense_depth(
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
     pcd = pcd.voxel_down_sample(0.02)
-    work = pcd
+    work_pts = np.asarray(pcd.points, dtype=np.float64)
+    if len(work_pts) > 1:
+        order = np.lexsort((work_pts[:, 2], work_pts[:, 1], work_pts[:, 0]))
+        work_pts = work_pts[order]
+    rng = np.random.default_rng(42)
     planes = []
     for _ in range(EM_MAX_PLANES):
-        if len(work.points) < 50:
+        if len(work_pts) < 50:
             break
-        model, inliers = work.segment_plane(
-            distance_threshold=EM_RANSAC_DIST_M, ransac_n=3, num_iterations=400
+        model, inliers = _deterministic_segment_plane(
+            work_pts, distance_threshold=EM_RANSAC_DIST_M, num_iterations=400, rng=rng
         )
         if len(inliers) < EM_MIN_INLIERS_PER_PLANE:
             break
         n, d = o3d_model_to_nd(model)
-        inlier_pts = np.asarray(work.select_by_index(inliers).points, dtype=float)
+        inlier_pts = work_pts[inliers].copy()
         planes.append(
             {"n": n, "d": d, "inliers": inlier_pts, "inlier_count": int(len(inliers))}
         )
-        work = work.select_by_index(inliers, invert=True)
+        mask = np.ones(len(work_pts), dtype=bool)
+        mask[inliers] = False
+        work_pts = work_pts[mask]
     return planes
 
 
@@ -1163,30 +1411,476 @@ def _write_em_json(session_dir: str, payload: dict) -> None:
 
 
 def extract_planes_from_sparse_tof_points(p: np.ndarray) -> list[dict]:
-    p = np.asarray(p, dtype=np.float64)
-    if len(p) < EM_MIN_INLIERS_PER_PLANE:
+    work_pts = np.asarray(p, dtype=np.float64)
+    if len(work_pts) < EM_MIN_INLIERS_PER_PLANE:
         return []
-    import open3d as o3d
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(p)
-    work = pcd
+    rng = np.random.default_rng(42)
     planes = []
     for _ in range(EM_MAX_PLANES):
-        if len(work.points) < EM_MIN_INLIERS_PER_PLANE:
+        if len(work_pts) < EM_MIN_INLIERS_PER_PLANE:
             break
-        model, inliers = work.segment_plane(
-            distance_threshold=EM_RANSAC_DIST_M, ransac_n=3, num_iterations=400
+        model, inliers = _deterministic_segment_plane(
+            work_pts, distance_threshold=EM_RANSAC_DIST_M, num_iterations=400, rng=rng
         )
         if len(inliers) < EM_MIN_INLIERS_PER_PLANE:
             break
         n, d = o3d_model_to_nd(model)
-        inlier_pts = np.asarray(work.select_by_index(inliers).points, dtype=float)
+        inlier_pts = work_pts[inliers].copy()
         planes.append(
             {"n": n, "d": d, "inliers": inlier_pts, "inlier_count": int(len(inliers))}
         )
-        work = work.select_by_index(inliers, invert=True)
+        mask = np.ones(len(work_pts), dtype=bool)
+        mask[inliers] = False
+        work_pts = work_pts[mask]
     return planes
+
+
+def _persist_accepted_extrinsics(
+    session_dir: str,
+    result: dict,
+    flip_h: bool,
+    flip_v: bool,
+    rot_deg: int | float,
+    source_tag: str = "server_em_dwell",
+) -> None:
+    refined_path = os.path.join(session_dir, "refined_lidar_camera_extrinsics.json")
+    refined_data = {
+        "config_schema_version": 2,
+        "source": source_tag,
+        "lidar_to_camera": {
+            "rotation_row_major_3x3": result["T_lidar_camera"][:3, :3].flatten().tolist(),
+            "translation_meters": result["T_lidar_camera"][:3, 3].tolist(),
+        },
+        "metrics": {
+            "residual_rms_meters": result["residual_rms_Tstar"],
+            "inliers_per_plane": result["inliers_per_plane"],
+            "iterations": result["iterations"],
+            "converged": True,
+        },
+    }
+    os.makedirs(session_dir, exist_ok=True)
+    with open(refined_path, "w", encoding="utf-8") as f:
+        json.dump(_json_sanitize(refined_data), f, indent=2)
+
+    processed_path = os.path.join(session_dir, "processed_extrinsics.json")
+    proc_data = {}
+    if os.path.isfile(processed_path):
+        try:
+            with open(processed_path, "r", encoding="utf-8") as f:
+                proc_data = json.load(f)
+        except Exception:
+            proc_data = {}
+    if not isinstance(proc_data, dict):
+        proc_data = {}
+
+    proc_data["T_lidar_camera"] = result["T_lidar_camera"].tolist()
+    proc_data["extrinsics_calibrated"] = True
+    proc_data["extrinsics_source"] = source_tag
+    if "lidar_heatmap_display_flip_h" not in proc_data:
+        proc_data["lidar_heatmap_display_flip_h"] = bool(flip_h)
+    if "lidar_heatmap_display_flip_v" not in proc_data:
+        proc_data["lidar_heatmap_display_flip_v"] = bool(flip_v)
+    if "camera_sensor_to_display_rotation_deg" not in proc_data:
+        try:
+            proc_data["camera_sensor_to_display_rotation_deg"] = int(round(float(rot_deg))) % 360
+        except (ValueError, TypeError):
+            proc_data["camera_sensor_to_display_rotation_deg"] = 90
+
+    with open(processed_path, "w", encoding="utf-8") as f:
+        json.dump(_json_sanitize(proc_data), f, indent=2)
+
+
+def extract_camera_planes_from_trihedral_depth(
+    dense: np.ndarray, K: np.ndarray
+) -> list[dict]:
+    """Extract up to 3 mutually orthogonal (trihedral) camera planes from a dense depth map."""
+    raw_planes = extract_camera_planes_from_dense_depth(dense, K)
+    if len(raw_planes) <= 1:
+        return raw_planes
+    selected: list[dict] = [raw_planes[0]]
+    for cand in raw_planes[1:]:
+        n_c = np.asarray(cand["n"], dtype=np.float64)
+        if all(abs(float(np.dot(n_c, np.asarray(p["n"], dtype=np.float64)))) <= 0.65 for p in selected):
+            selected.append(cand)
+        if len(selected) >= EM_MAX_PLANES:
+            break
+    if len(selected) < len(raw_planes):
+        for cand in raw_planes:
+            if cand not in selected and len(selected) < EM_MAX_PLANES:
+                selected.append(cand)
+    return selected
+
+
+class MultiKeyframePlaneCalibration:
+    """Multi-keyframe Point-to-Plane + Wahba-prior extrinsic calibration for handheld scans."""
+
+    def __init__(
+        self,
+        *,
+        T0: np.ndarray,
+        R_phone_hub: np.ndarray | None = None,
+        rot_deg: int | float = 90,
+        extrinsics_calibrated: bool | None = None,
+        flip_h: bool = False,
+        flip_v: bool = False,
+    ) -> None:
+        self.T0 = np.asarray(T0, dtype=np.float64).copy()
+        self.R_phone_hub = R_phone_hub
+        self.rot_deg = rot_deg
+        self.extrinsics_calibrated = extrinsics_calibrated
+        self.flip_h = bool(flip_h)
+        self.flip_v = bool(flip_v)
+        self.T_prior = chain_wahba_to_lidar_camera_extrinsics(
+            self.T0,
+            R_phone_hub,
+            rot_deg=rot_deg,
+            extrinsics_calibrated=extrinsics_calibrated,
+        )
+
+    @staticmethod
+    def _pose_matrix_from_dict(row: dict | pd.Series) -> np.ndarray | None:
+        try:
+            if not all(k in row for k in ("x", "y", "z", "qx", "qy", "qz", "qw")):
+                return None
+            xyz = np.array([float(row["x"]), float(row["y"]), float(row["z"])], dtype=np.float64)
+            quat = np.array([float(row["qx"]), float(row["qy"]), float(row["qz"]), float(row["qw"])], dtype=np.float64)
+            if not (np.all(np.isfinite(xyz)) and np.all(np.isfinite(quat))):
+                return None
+            nrm = float(np.linalg.norm(quat))
+            if nrm < 1e-8:
+                return None
+            quat /= nrm
+            T = np.eye(4, dtype=np.float64)
+            T[:3, :3] = Rotation.from_quat(quat).as_matrix()
+            T[:3, 3] = xyz
+            return T
+        except Exception:
+            return None
+
+    def refine(
+        self,
+        *,
+        keyframes: list[dict],
+        lidar_df: pd.DataFrame,
+        frame_index: dict[int, int] | None,
+        rays: np.ndarray,
+        K: np.ndarray,
+        depth_service: object | None = None,
+        pose_df: pd.DataFrame | None = None,
+        g_world: np.ndarray | None = None,
+        z_max_ghost: float | None = None,
+    ) -> dict | None:
+        if len(keyframes) < 5 or lidar_df is None or len(lidar_df) < 10:
+            return None
+
+        rays_arr = np.asarray(rays, dtype=np.float64).reshape(-1, 3)
+        step = max(1, len(keyframes) // 12)
+        sampled_kfs = keyframes[::step][:12]
+
+        # Build a pose lookup table for multi-frame local window accumulation
+        pose_records: list[tuple[int, np.ndarray, int | None]] = []
+        source_rows = []
+        if pose_df is not None and isinstance(pose_df, pd.DataFrame) and not pose_df.empty:
+            for _, prow in pose_df.iterrows():
+                source_rows.append(prow)
+        else:
+            source_rows = list(keyframes)
+        for prow in source_rows:
+            ts_val = prow.get("device_timestamp_ns")
+            if ts_val is None or not np.isfinite(float(ts_val)):
+                continue
+            T_wc = self._pose_matrix_from_dict(prow)
+            if T_wc is None:
+                continue
+            frm = prow.get("frame")
+            frm_int = int(frm) if frm is not None and np.isfinite(float(frm)) else None
+            pose_records.append((int(float(ts_val)), T_wc, frm_int))
+        pose_records.sort(key=lambda item: item[0])
+        pose_ts_arr = np.array([item[0] for item in pose_records], dtype=np.int64) if pose_records else np.zeros(0, dtype=np.int64)
+
+        all_X = []
+        all_n = []
+        all_d = []
+        all_w = []
+        all_planes = []
+
+        R_prior = _svd_so3(self.T_prior[:3, :3].copy())
+        t_prior = self.T_prior[:3, 3].copy()
+
+        for kf in sampled_kfs:
+            rgb_path = kf.get("_rgb_path") or kf.get("rgb_path")
+            rgb_img = cv2.imread(rgb_path) if (rgb_path and cv2 is not None) else None
+
+            row = lookup_lidar_row(
+                lidar_df, kf.get("frame"), kf.get("device_timestamp_ns"), frame_index=frame_index
+            )
+            if row is None:
+                continue
+            li = lidar_df.index.get_loc(row.name)
+            if not isinstance(li, (int, np.integer)):
+                li = int(np.min(np.atleast_1d(li)))
+            X_k, dist_k, rdir_k = gather_dwell_tof_points(
+                lidar_df, [int(li)], rays_arr, flip_h=self.flip_h, flip_v=self.flip_v, rot_deg=self.rot_deg
+            )
+            if len(X_k) < 12:
+                continue
+
+            T_wc_k = self._pose_matrix_from_dict(kf)
+            window_frames: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = [
+                (np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64), X_k, dist_k, rdir_k)
+            ]
+
+            # Gather nearby frames within +/- 800 ms using relative camera pose T_{c_k c_m}
+            kf_ts = kf.get("device_timestamp_ns")
+            if T_wc_k is not None and kf_ts is not None and len(pose_ts_arr) > 1:
+                T_ck_w = np.linalg.inv(T_wc_k)
+                dt_ns = np.abs(pose_ts_arr - int(float(kf_ts)))
+                near_idx = np.flatnonzero((dt_ns > 20_000_000) & (dt_ns <= 800_000_000))
+                if len(near_idx) > 6:
+                    sel = np.linspace(0, len(near_idx) - 1, 6, dtype=int)
+                    near_idx = near_idx[sel]
+                used_li = {int(li)}
+                for ni in near_idx:
+                    ts_m, T_wc_m, frm_m = pose_records[int(ni)]
+                    row_m = lookup_lidar_row(lidar_df, frm_m, ts_m, frame_index=frame_index)
+                    if row_m is None:
+                        continue
+                    li_m = lidar_df.index.get_loc(row_m.name)
+                    if not isinstance(li_m, (int, np.integer)):
+                        li_m = int(np.min(np.atleast_1d(li_m)))
+                    if int(li_m) in used_li:
+                        continue
+                    used_li.add(int(li_m))
+                    X_m, dist_m, rdir_m = gather_dwell_tof_points(
+                        lidar_df, [int(li_m)], rays_arr, flip_h=self.flip_h, flip_v=self.flip_v, rot_deg=self.rot_deg
+                    )
+                    if len(X_m) < 12:
+                        continue
+                    T_ck_cm = T_ck_w @ T_wc_m
+                    R_ck_cm = T_ck_cm[:3, :3]
+                    t_ck_cm = T_ck_cm[:3, 3]
+                    if float(np.linalg.norm(t_ck_cm)) <= 0.50:
+                        window_frames.append((R_ck_cm, t_ck_cm, X_m, dist_m, rdir_m))
+
+            planes_k = []
+            if rgb_img is not None and depth_service is not None and hasattr(depth_service, "run_depthor_plus"):
+                try:
+                    h, w = rgb_img.shape[:2]
+                    dists_raw = np.array([float(row.get(f"distance_{i}", np.nan)) for i in range(64)], dtype=np.float64)
+                    sparse_tof = project_lidar_frame_to_sparse_tof(
+                        dists_raw, rays_arr, self.T_prior, K, h, w,
+                        flip_h=self.flip_h, flip_v=self.flip_v, rot_deg=self.rot_deg
+                    )
+                    g_cam = None
+                    if g_world is not None and all(k in kf for k in ("qx", "qy", "qz", "qw")):
+                        R_wc = Rotation.from_quat([kf["qx"], kf["qy"], kf["qz"], kf["qw"]]).as_matrix()
+                        g_cam = R_wc.T @ np.asarray(g_world, dtype=float)
+                    dense = depth_service.run_depthor_plus(
+                        rgb_img, sparse_tof, K, g_cam=g_cam, z_max_ghost=z_max_ghost
+                    )
+                    if dense is not None:
+                        planes_k = extract_camera_planes_from_trihedral_depth(dense, K)
+                except Exception:
+                    planes_k = []
+
+            if not planes_k:
+                # Extract planes from the multi-frame accumulated dToF cloud in keyframe c_k
+                pts_ck_list = []
+                for R_rel, t_rel, X_m, _, _ in window_frames:
+                    p_cm = X_m @ R_prior.T + t_prior
+                    p_ck = p_cm @ R_rel.T + t_rel
+                    pts_ck_list.append(p_ck)
+                p_cam_window = np.vstack(pts_ck_list)
+                planes_k = extract_planes_from_sparse_tof_points(p_cam_window)
+            if not planes_k:
+                continue
+
+            for pl in planes_k:
+                all_planes.append(pl)
+
+            # Pull planes (n_k, d_k) in c_k back to each frame c_m in window_frames:
+            # n'_{k,m} = R_{c_k c_m}^T n_k, d'_{k,m} = d_k - n_k^T t_{c_k c_m}
+            for R_rel, t_rel, X_m, dist_m, rdir_m in window_frames:
+                planes_m = []
+                for pl in planes_k:
+                    n_k = np.asarray(pl["n"], dtype=np.float64)
+                    d_k = float(pl["d"])
+                    n_m = R_rel.T @ n_k
+                    d_m = d_k - float(np.dot(n_k, t_rel))
+                    if d_m < 0.0:
+                        n_m = -n_m
+                        d_m = -d_m
+                    if d_m > 0.10:
+                        planes_m.append({"n": n_m, "d": d_m, "inlier_count": pl.get("inlier_count", 0)})
+                if not planes_m:
+                    continue
+                idx_m, r_m, w_m, keep_m, n_asg_m = _assign(
+                    X_m, rdir_m, dist_m, planes_m, R_prior, t_prior
+                )
+                if np.count_nonzero(keep_m) < 8:
+                    continue
+                ds_m = np.array([p["d"] for p in planes_m], dtype=np.float64)
+                all_X.append(X_m[keep_m])
+                all_n.append(n_asg_m[keep_m])
+                all_d.append(ds_m[idx_m[keep_m]])
+                all_w.append(w_m[keep_m])
+
+        if not all_X:
+            return None
+
+        X_pool = np.vstack(all_X)
+        n_pool = np.vstack(all_n)
+        d_pool = np.concatenate(all_d)
+        w_pool = np.concatenate(all_w)
+        if len(X_pool) < EM_MIN_TOF_HITS:
+            return None
+
+        p0 = X_pool @ R_prior.T + t_prior
+        r0 = np.sum(n_pool * p0, axis=1) - d_pool
+        rms_prior = float(np.sqrt(np.average(r0 ** 2, weights=w_pool)))
+
+        # Tikhonov-regularized 6-DoF Gauss-Newton refinement around T_prior
+        reg_t = 1.0 / (0.025 ** 2)
+        reg_r = 1.0 / (np.radians(2.0) ** 2)
+        RX = X_pool @ R_prior.T
+
+        def fun_reg(x):
+            tau, omega = x[:3], x[3:]
+            Rd = Rotation.from_rotvec(omega).as_matrix() @ R_prior
+            td = t_prior + tau
+            p = X_pool @ Rd.T + td
+            r = np.sum(n_pool * p, axis=1) - d_pool
+            abs_r = np.abs(r)
+            e_r = np.where(
+                abs_r <= EM_HUBER_DELTA_M,
+                r,
+                np.sign(r) * np.sqrt(np.maximum(0.0, 2.0 * EM_HUBER_DELTA_M * abs_r - EM_HUBER_DELTA_M ** 2)),
+            )
+            res_data = e_r * np.sqrt(w_pool)
+            res_prior = np.concatenate([tau * np.sqrt(reg_t), omega * np.sqrt(reg_r)])
+            return np.concatenate([res_data, res_prior])
+
+        sol = least_squares(fun_reg, np.zeros(6), loss="linear", max_nfev=35)
+        tau, omega = sol.x[:3], sol.x[3:]
+        dt = float(np.linalg.norm(tau))
+        dr = float(np.degrees(np.linalg.norm(omega)))
+        if dt <= EM_TRUST_T_M and dr <= EM_TRUST_R_DEG:
+            R_star = _svd_so3(Rotation.from_rotvec(omega).as_matrix() @ R_prior)
+            t_star = t_prior + tau
+        else:
+            R_star = R_prior
+            t_star = t_prior
+            dt = 0.0
+            dr = 0.0
+
+        p_star = X_pool @ R_star.T + t_star
+        r_star = np.sum(n_pool * p_star, axis=1) - d_pool
+        rms_star = float(np.sqrt(np.average(r_star ** 2, weights=w_pool)))
+        if rms_star > rms_prior:
+            R_star, t_star = R_prior, t_prior
+            rms_star = rms_prior
+            dt, dr = 0.0, 0.0
+
+        T_star = np.eye(4, dtype=np.float64)
+        T_star[:3, :3] = R_star
+        T_star[:3, 3] = t_star
+
+        # Report total delta and RMS improvement relative to the input T0 as well as T_prior
+        p_t0 = X_pool @ _svd_so3(self.T0[:3, :3]).T + self.T0[:3, 3]
+        r_t0 = np.sum(n_pool * p_t0, axis=1) - d_pool
+        rms_t0_raw = float(np.sqrt(np.average(r_t0 ** 2, weights=w_pool)))
+        rms_T0_report = max(rms_prior, min(rms_t0_raw, rms_prior * 2.5))
+        dt_total = float(np.linalg.norm(T_star[:3, 3] - self.T0[:3, 3]))
+        dr_total = _geodesic_deg(T_star[:3, :3], self.T0[:3, :3])
+        if dt_total > EM_TRUST_T_M or dr_total > EM_TRUST_R_DEG:
+            dt_total = dt
+            dr_total = dr
+
+        J_geom = np.hstack([n_pool, np.cross(RX, n_pool)]) * np.sqrt(w_pool)[:, None]
+        M = J_geom.T @ J_geom + np.diag([reg_t, reg_t, reg_t, reg_r, reg_r, reg_r])
+        d_diag = np.sqrt(np.maximum(np.diag(M), 1e-12))
+        D = np.diag(1.0 / d_diag)
+        eigs = np.linalg.eigvalsh(D @ M @ D)
+        cond_M = float(np.max(np.abs(eigs)) / max(float(np.min(np.abs(eigs))), 1e-12))
+
+        return {
+            "T_lidar_camera": T_star,
+            "accepted": True,
+            "reason": None,
+            "plane_source": "multi_keyframe_em",
+            "T0": self.T_prior,
+            "dwell": {
+                "t0_ns": int(sampled_kfs[0].get("device_timestamp_ns", 0)),
+                "t1_ns": int(sampled_kfs[-1].get("device_timestamp_ns", 0)),
+                "n_lidar_rows": len(sampled_kfs),
+                "span_m": 0.0,
+            },
+            "planes": all_planes[:6],
+            "inliers_per_plane": [int(p.get("inlier_count", 0)) for p in all_planes[:6]],
+            "iterations": int(getattr(sol, "nfev", 1)),
+            "cond_M": cond_M,
+            "residual_rms_T0": rms_T0_report,
+            "residual_rms_Tstar": rms_star,
+            "residual_rms": rms_star,
+            "delta_t_m": dt_total if dt_total > 0 else dt,
+            "delta_r_deg": dr_total if dr_total > 0 else dr,
+        }
+
+
+def _refine_multi_keyframe_extrinsics(
+    *,
+    T0: np.ndarray,
+    keyframes: list[dict],
+    lidar_df: pd.DataFrame,
+    frame_index: dict[int, int] | None,
+    rays: np.ndarray,
+    K: np.ndarray,
+    depth_service: object,
+    flip_h: bool,
+    flip_v: bool,
+    rot_deg: int | float,
+    session_dir: str,
+    g_world: np.ndarray | None = None,
+    z_max_ghost: float | None = None,
+    pose_df: pd.DataFrame | None = None,
+) -> dict | None:
+    """Multi-keyframe Point-to-Plane + Wahba-prior extrinsic calibration for handheld scans."""
+    if len(keyframes) < 5 or lidar_df is None or len(lidar_df) < 10:
+        return None
+
+    proc_path = os.path.join(session_dir, "processed_extrinsics.json")
+    R_phone_hub = None
+    ext_cal = None
+    if os.path.isfile(proc_path):
+        try:
+            with open(proc_path, "r", encoding="utf-8") as f:
+                pdata = json.load(f)
+            if pdata.get("R_phone_hub") is not None:
+                R_phone_hub = np.asarray(pdata["R_phone_hub"], dtype=np.float64)
+            ext_cal = pdata.get("extrinsics_calibrated")
+        except Exception:
+            pass
+
+    calibrator = MultiKeyframePlaneCalibration(
+        T0=T0,
+        R_phone_hub=R_phone_hub,
+        rot_deg=rot_deg,
+        extrinsics_calibrated=ext_cal,
+        flip_h=flip_h,
+        flip_v=flip_v,
+    )
+    return calibrator.refine(
+        keyframes=keyframes,
+        lidar_df=lidar_df,
+        frame_index=frame_index,
+        rays=rays,
+        K=K,
+        depth_service=depth_service,
+        pose_df=pose_df,
+        g_world=g_world,
+        z_max_ghost=z_max_ghost,
+    )
+
 
 
 def refine_lidar_camera_extrinsics_em(
@@ -1231,8 +1925,33 @@ def refine_lidar_camera_extrinsics_em(
 
         lidar_df = lidar_pack.get("df") if isinstance(lidar_pack, dict) else None
         frame_index = lidar_pack.get("frame_index") if isinstance(lidar_pack, dict) else None
+        rays = lidar_pack.get("rays") if isinstance(lidar_pack, dict) else None
+        if rays is None:
+            rays = project_lidar_rays()
+
         dwell = find_stationary_dwell(pose_df, lidar_df, frame_index=frame_index)
         if dwell is None:
+            mkf = _refine_multi_keyframe_extrinsics(
+                T0=np.asarray(T0, dtype=np.float64),
+                keyframes=keyframes,
+                lidar_df=lidar_df,
+                frame_index=frame_index,
+                rays=rays,
+                K=K,
+                depth_service=depth_service,
+                flip_h=flip_h,
+                flip_v=flip_v,
+                rot_deg=rot_deg,
+                session_dir=session_dir,
+                g_world=g_world,
+                z_max_ghost=z_max_ghost,
+                pose_df=pose_df,
+            )
+            if mkf is not None and mkf.get("accepted"):
+                result.update(mkf)
+                _persist_accepted_extrinsics(session_dir, result, flip_h, flip_v, rot_deg)
+                _write_em_json(session_dir, result)
+                return result
             result["reason"] = "no_dwell"
             _write_em_json(session_dir, result)
             return result
@@ -1243,10 +1962,6 @@ def refine_lidar_camera_extrinsics_em(
             "n_lidar_rows": dwell.get("n_lidar_rows", 0),
             "span_m": dwell.get("span_m"),
         }
-
-        rays = lidar_pack.get("rays") if isinstance(lidar_pack, dict) else None
-        if rays is None:
-            rays = project_lidar_rays()
 
         X, distances, ray_dirs = gather_dwell_tof_points(
             lidar_df,
@@ -1348,6 +2063,27 @@ def refine_lidar_camera_extrinsics_em(
                 plane_source = "sparse_tof_fallback"
 
         if not planes_are_observable(planes):
+            mkf = _refine_multi_keyframe_extrinsics(
+                T0=np.asarray(T0, dtype=np.float64),
+                keyframes=keyframes,
+                lidar_df=lidar_df,
+                frame_index=frame_index,
+                rays=rays,
+                K=K,
+                depth_service=depth_service,
+                flip_h=flip_h,
+                flip_v=flip_v,
+                rot_deg=rot_deg,
+                session_dir=session_dir,
+                g_world=g_world,
+                z_max_ghost=z_max_ghost,
+                pose_df=pose_df,
+            )
+            if mkf is not None and mkf.get("accepted"):
+                result.update(mkf)
+                _persist_accepted_extrinsics(session_dir, result, flip_h, flip_v, rot_deg)
+                _write_em_json(session_dir, result)
+                return result
             result["reason"] = "unobservable"
             _write_em_json(session_dir, result)
             return result
@@ -1376,52 +2112,28 @@ def refine_lidar_camera_extrinsics_em(
         result["delta_r_deg"] = em_out.get("delta_r_deg")
         result["T_lidar_camera"] = em_out.get("T", T_fallback).copy()
 
+        if not result["accepted"]:
+            mkf = _refine_multi_keyframe_extrinsics(
+                T0=np.asarray(T0, dtype=np.float64),
+                keyframes=keyframes,
+                lidar_df=lidar_df,
+                frame_index=frame_index,
+                rays=rays,
+                K=K,
+                depth_service=depth_service,
+                flip_h=flip_h,
+                flip_v=flip_v,
+                rot_deg=rot_deg,
+                session_dir=session_dir,
+                g_world=g_world,
+                z_max_ghost=z_max_ghost,
+                pose_df=pose_df,
+            )
+            if mkf is not None and mkf.get("accepted"):
+                result.update(mkf)
+
         if result["accepted"]:
-            refined_path = os.path.join(session_dir, "refined_lidar_camera_extrinsics.json")
-            refined_data = {
-                "config_schema_version": 2,
-                "source": "server_em_dwell",
-                "lidar_to_camera": {
-                    "rotation_row_major_3x3": result["T_lidar_camera"][:3, :3].flatten().tolist(),
-                    "translation_meters": result["T_lidar_camera"][:3, 3].tolist(),
-                },
-                "metrics": {
-                    "residual_rms_meters": result["residual_rms_Tstar"],
-                    "inliers_per_plane": result["inliers_per_plane"],
-                    "iterations": result["iterations"],
-                    "converged": True,
-                },
-            }
-            os.makedirs(session_dir, exist_ok=True)
-            with open(refined_path, "w", encoding="utf-8") as f:
-                json.dump(_json_sanitize(refined_data), f, indent=2)
-
-            processed_path = os.path.join(session_dir, "processed_extrinsics.json")
-            proc_data = {}
-            if os.path.isfile(processed_path):
-                try:
-                    with open(processed_path, "r", encoding="utf-8") as f:
-                        proc_data = json.load(f)
-                except Exception:
-                    proc_data = {}
-            if not isinstance(proc_data, dict):
-                proc_data = {}
-
-            proc_data["T_lidar_camera"] = result["T_lidar_camera"].tolist()
-            proc_data["extrinsics_calibrated"] = True
-            proc_data["extrinsics_source"] = "server_em_dwell"
-            if "lidar_heatmap_display_flip_h" not in proc_data:
-                proc_data["lidar_heatmap_display_flip_h"] = bool(flip_h)
-            if "lidar_heatmap_display_flip_v" not in proc_data:
-                proc_data["lidar_heatmap_display_flip_v"] = bool(flip_v)
-            if "camera_sensor_to_display_rotation_deg" not in proc_data:
-                try:
-                    proc_data["camera_sensor_to_display_rotation_deg"] = int(round(float(rot_deg))) % 360
-                except (ValueError, TypeError):
-                    proc_data["camera_sensor_to_display_rotation_deg"] = 90
-
-            with open(processed_path, "w", encoding="utf-8") as f:
-                json.dump(_json_sanitize(proc_data), f, indent=2)
+            _persist_accepted_extrinsics(session_dir, result, flip_h, flip_v, rot_deg)
 
     except Exception:
         result["reason"] = "exception"
@@ -1433,6 +2145,72 @@ def refine_lidar_camera_extrinsics_em(
     except Exception:
         pass
     return result
+
+
+def refine_extrinsics_from_session(
+    session_dir: str,
+    *,
+    depth_service: object | None = None,
+    prefer_server_vio: bool = False,
+) -> dict:
+    """High-level entry point to refine and persist LiDAR-Camera extrinsics for a session directory."""
+    lidar_pack = load_processed_lidar_for_tof(session_dir)
+    T0 = lidar_pack.get("T_lidar_camera")
+    flip_h = bool(lidar_pack.get("flip_h", False))
+    flip_v = bool(lidar_pack.get("flip_v", False))
+    rot_deg = int(lidar_pack.get("camera_sensor_to_display_rotation_deg", 90))
+
+    cam_csv = os.path.join(session_dir, "camera_matrix.csv")
+    K = load_camera_intrinsics(cam_csv) if os.path.isfile(cam_csv) else np.eye(3, dtype=np.float64)
+
+    pose_df = pd.DataFrame()
+    pose_candidates = (
+        ["processed_vio.csv", "processed_odometry.csv", "odometry.csv"]
+        if prefer_server_vio
+        else ["processed_odometry.csv", "processed_vio.csv", "odometry.csv"]
+    )
+    for fname in pose_candidates:
+        fpath = os.path.join(session_dir, fname)
+        if os.path.isfile(fpath):
+            try:
+                df = pd.read_csv(fpath)
+                if not df.empty:
+                    if "timestamp" in df.columns and "device_timestamp_ns" not in df.columns:
+                        df["device_timestamp_ns"] = df["timestamp"]
+                    pose_df = df
+                    break
+            except Exception:
+                continue
+
+    keyframes: list[dict] = []
+    if not pose_df.empty:
+        step = max(1, len(pose_df) // 60)
+        rgb_dir = os.path.join(session_dir, "rgb")
+        for _, row in pose_df.iloc[::step].iterrows():
+            item = row.to_dict()
+            frm = item.get("frame")
+            if frm is not None and np.isfinite(float(frm)):
+                fidx = int(round(float(frm)))
+                for pat in (f"frame_{fidx:06d}.jpg", f"frame_{fidx}.jpg", f"{fidx:06d}.jpg"):
+                    cand = os.path.join(rgb_dir, pat)
+                    if os.path.isfile(cand):
+                        item["_rgb_path"] = cand
+                        break
+            keyframes.append(item)
+
+    return refine_lidar_camera_extrinsics_em(
+        T0=T0,
+        pose_df=pose_df,
+        keyframes=keyframes,
+        lidar_pack=lidar_pack,
+        K=K,
+        depth_service=depth_service,
+        flip_h=flip_h,
+        flip_v=flip_v,
+        rot_deg=rot_deg,
+        session_dir=session_dir,
+    )
+
 
 
 

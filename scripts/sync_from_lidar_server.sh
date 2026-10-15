@@ -107,7 +107,8 @@ if [ -f "$SOURCE_DIR/scripts/export_vggt_keyframes.py" ]; then
 path = '$TARGET_DIR/scripts/export_vggt_keyframes.py'
 with open(path, 'r', encoding='utf-8') as f:
     c = f.read()
-c = c.replace('from app.tasks.pipeline import load_pose_table_for_tsdf', '''try:
+if 'from app.pipeline.runner import load_pose_table_for_tsdf' not in c:
+    c = c.replace('from app.tasks.pipeline import load_pose_table_for_tsdf', '''try:
     from app.pipeline.runner import load_pose_table_for_tsdf
 except ImportError:
     from app.tasks.pipeline import load_pose_table_for_tsdf''')
@@ -135,7 +136,7 @@ if os.path.exists(path):
     # 1. Tương thích DEFAULT_VGGT_SPACE
     old_space = 'DEFAULT_VGGT_SPACE = \"/home/zenzen2411/development/projects/test-docker/vggt-space\"'
     new_space = 'DEFAULT_VGGT_SPACE = \"/app/vggt-space\" if os.path.isdir(\"/app/vggt-space\") else \"/home/zenzen2411/development/projects/test-docker/vggt-space\"'
-    if old_space in c:
+    if old_space in c and '/app/vggt-space' not in c:
         c = c.replace(old_space, new_space)
         
     # 2. Safe import export_vggt_keyframes
@@ -144,7 +145,7 @@ if os.path.exists(path):
     from scripts.export_vggt_keyframes import export_vggt_keyframes
 except ImportError:
     from export_vggt_keyframes import export_vggt_keyframes'''
-    if old_imp in c:
+    if old_imp in c and 'from export_vggt_keyframes import export_vggt_keyframes' not in c:
         c = c.replace(old_imp, new_imp)
 
     # 3. Model preloading reuse

@@ -329,6 +329,9 @@ def enrich_layout(layout: dict | None) -> dict:
         out["diagnostics"] = copy.deepcopy(layout["diagnostics"])
     if isinstance(layout.get("rooms"), list):
         out["rooms"] = copy.deepcopy(layout["rooms"])
+    obstacles = layout.get("obstacles")
+    if isinstance(obstacles, list) and obstacles:
+        out["obstacles"] = copy.deepcopy(obstacles)
     keepouts = layout.get("keepouts")
     if isinstance(keepouts, list) and keepouts:
         out["keepouts"] = copy.deepcopy(keepouts)

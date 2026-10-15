@@ -92,6 +92,30 @@ class SRESKF:
         R_cov = np.array([[float(sigma_z) ** 2]])
         return self.update_measurement(y, H, R_cov, chi2_mult=3.0)
 
+    def update_gravity_tilt(self, accel_body: np.ndarray, sigma_acc: float = 0.25) -> bool:
+        """Constrain roll/pitch tilt using body-frame specific force during low dynamic acceleration."""
+        a_unbiased = np.asarray(accel_body, dtype=np.float64) - self.state.ba
+        g_norm = float(np.linalg.norm(self.state.g))
+        a_norm = float(np.linalg.norm(a_unbiased))
+        if abs(a_norm - g_norm) > 0.6 or a_norm < 1e-3:
+            return False
+        g_body = self.state.R.T @ self.state.g
+        pred_a = -g_body
+        y = a_unbiased - pred_a
+        gx, gy, gz = float(g_body[0]), float(g_body[1]), float(g_body[2])
+        skew_g_body = np.array(
+            [
+                [0.0, -gz, gy],
+                [gz, 0.0, -gx],
+                [-gy, gx, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        H = np.zeros((3, I.DIM), dtype=np.float64)
+        H[:, I.ORI] = -skew_g_body
+        R_cov = (float(sigma_acc) ** 2) * np.eye(3, dtype=np.float64)
+        return self.update_measurement(y, H, R_cov, chi2_mult=3.0)
+
     def update_measurement(
         self, innovation: np.ndarray, H: np.ndarray, R_cov: np.ndarray, chi2_mult: float = 1.0
     ) -> bool:
