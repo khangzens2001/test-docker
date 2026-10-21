@@ -14,16 +14,23 @@ if TEST_DOCKER_ROOT not in sys.path:
 if VGGT_SPACE not in sys.path:
     sys.path.insert(0, VGGT_SPACE)
 
-import backend_api_extended_manhattan as backend
+if __name__ != "__mp_main__":
+    import backend_api_extended_manhattan as backend
 
 def main():
     print("=" * 80)
     print("🚀 BẮT ĐẦU KIỂM THỬ PIPELINE TRONG WORKSPACE TEST-DOCKER")
     print("=" * 80)
 
-    benchmark_src = "/home/zenzen2411/development/projects/lidar_room_scan_server/data/benchmark_new_scan"
-    if not os.path.isdir(benchmark_src):
-        print(f"❌ Không tìm thấy thư mục benchmark tại: {benchmark_src}")
+    candidates = [
+        os.environ.get("BENCHMARK_SRC", ""),
+        "/benchmark_input",
+        "/home/zenzen2411/development/projects/lidar_room_scan_server/data/input_scan_drive",
+        "/home/zenzen2411/development/projects/lidar_room_scan_server/data/benchmark_new_scan",
+    ]
+    benchmark_src = next((p for p in candidates if p and os.path.isdir(p)), "")
+    if not benchmark_src:
+        print(f"❌ Không tìm thấy thư mục benchmark tại: {candidates}")
         sys.exit(1)
 
     # Tạo thư mục test session độc lập
@@ -51,6 +58,10 @@ def main():
     )
     t_elapsed = time.time() - t0
     print(f"✅ Pipeline hoàn tất trong {t_elapsed:.2f} giây!")
+    if isinstance(meta, dict) and meta.get("timings"):
+        print("⏱️ Chi tiết thời gian từng bước:")
+        for k, v in meta["timings"].items():
+            print(f"   • {k}: {v}s")
 
     # Thu thập và kiểm tra các file đầu ra
     print("\n" + "=" * 80)

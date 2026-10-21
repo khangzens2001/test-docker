@@ -53,10 +53,59 @@ def _patch_vggt_pos_embed(model):
         logger.warning("Could not patch VGGT _apply_pos_embed: %s", e)
 
 
+def _load_and_preprocess_vggt_images(
+    img_paths: list[str],
+    session_dir: str,
+    load_and_preprocess_images_fn,
+) -> tuple[torch.Tensor, bool]:
+    """Load keyframe images for VGGT, rotating to upright display orientation when needed."""
+    rot_deg = 0
+    sess_manifest = os.path.join(session_dir, "manifest.json")
+    if os.path.isfile(sess_manifest):
+        try:
+            with open(sess_manifest, "r", encoding="utf-8") as f:
+                rot_deg = int(json.load(f).get("camera_sensor_to_display_rotation_deg", 0) or 0) % 360
+        except Exception:
+            rot_deg = 0
+
+    if rot_deg not in (90, 180, 270):
+        return load_and_preprocess_images_fn(img_paths), False
+
+    import cv2
+
+    tensors = []
+    target_size = 518
+    patch_size = 14
+    out_w, out_h = None, None
+    for p in img_paths:
+        bgr = cv2.imread(p, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError(f"Could not read image: {p}")
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        if rot_deg == 90:
+            rgb = cv2.rotate(rgb, cv2.ROTATE_90_CLOCKWISE)
+        elif rot_deg == 180:
+            rgb = cv2.rotate(rgb, cv2.ROTATE_180)
+        elif rot_deg == 270:
+            rgb = cv2.rotate(rgb, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        h, w = rgb.shape[:2]
+        if out_w is None or out_h is None:
+            if h >= w:
+                out_h = target_size
+                out_w = max(patch_size, int(round((w * (target_size / float(h))) / patch_size) * patch_size))
+            else:
+                out_w = target_size
+                out_h = max(patch_size, int(round((h * (target_size / float(w))) / patch_size) * patch_size))
+        resized = cv2.resize(rgb, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        t_img = torch.from_numpy(resized).permute(2, 0, 1).float() / 255.0
+        tensors.append(t_img)
+    return torch.stack(tensors, dim=0), True
+
+
 def run_vggt_inference(
     session_dir: str,
     force_recompute: bool = False,
-    max_points: int = 3_000_000,
+    max_points: int = 750_000,
     model_id: str = "facebook/VGGT-1B",
 ) -> bool:
     """Run VGGT on session keyframes to produce cameras.json and project_point_cloud.npz."""
@@ -193,12 +242,19 @@ def run_vggt_inference(
         _patch_vggt_pos_embed(model)
         should_del_model = False
     else:
-        model = VGGT.from_pretrained(model_id).to(device, dtype=dtype)
-        model.eval()
-        # Disable depth head to save VRAM; only point head + camera head are needed for 3D layout prior
+        model = VGGT.from_pretrained(model_id)
+        # Disable depth head before GPU transfer to save VRAM and host RAM
         model.depth_head = None
+        model = model.to(device, dtype=dtype)
+        model.eval()
         _patch_vggt_pos_embed(model)
         should_del_model = True
+        gc.collect()
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 
     # Patch aggregator to offload intermediate tokens to CPU (saves ~4.3GB VRAM)
     from vggt.models.aggregator import slice_expand_and_flatten
@@ -231,6 +287,9 @@ def run_vggt_inference(
         f_idx = 0
         g_idx = 0
         out_list = []
+        needed_layers = set(getattr(model.point_head, "intermediate_layer_idx", [4, 11, 17, 23])) | {
+            model.aggregator.aa_block_num - 1
+        }
 
         for _ in range(model.aggregator.aa_block_num):
             for attn_t in model.aggregator.aa_order:
@@ -244,8 +303,13 @@ def run_vggt_inference(
                     )
 
             for i in range(len(f_inter)):
-                concat_inter = torch.cat([f_inter[i], g_inter[i]], dim=-1)
-                out_list.append(concat_inter.cpu())
+                layer_idx = len(out_list)
+                if layer_idx in needed_layers:
+                    concat_inter = torch.cat([f_inter[i], g_inter[i]], dim=-1)
+                    out_list.append(concat_inter.cpu())
+                else:
+                    out_list.append(None)
+            del f_inter, g_inter
 
         return out_list, model.aggregator.patch_start_idx
 
@@ -254,7 +318,10 @@ def run_vggt_inference(
 
     try:
         logger.info("Preprocessing %d keyframes for VGGT...", len(img_paths))
-        images = load_and_preprocess_images(img_paths).to(device, dtype=dtype)
+        images, is_upright = _load_and_preprocess_vggt_images(
+            img_paths, session_dir, load_and_preprocess_images
+        )
+        images = images.to(device, dtype=dtype)
         if images.dim() == 4:
             images = images.unsqueeze(0)
 
@@ -269,13 +336,14 @@ def run_vggt_inference(
                 pose_enc_list = model.camera_head(cam_tokens)
                 pose_enc = pose_enc_list[-1]
 
-                # Point head chunked processing (spatial striding [::3, ::3] extracts ~30k points per frame)
+                # Point head chunked processing (border-cropped [4:-4:2, 4:-4:2] striding)
                 B, S, _, H, W = images.shape
                 chunk_size = 4
-                conf_threshold = 0.25
+                per_frame_quota = max(1, int(max_points // max(1, S)))
                 all_pts = []
                 all_conf = []
                 all_colors = []
+                all_fidx = []
 
                 for s_idx in range(0, S, chunk_size):
                     e_idx = min(s_idx + chunk_size, S)
@@ -288,17 +356,63 @@ def run_vggt_inference(
                     pts_c, conf_c = model.point_head._forward_impl(
                         chunk_tokens, img_chunk, patch_start_idx, 0, e_idx - s_idx
                     )
+                    pts_c = pts_c.float()
+                    conf_c = conf_c.float()
 
-                    pts_sub = pts_c[:, :, ::3, ::3, :].reshape(-1, 3).cpu()
-                    conf_sub = conf_c[:, :, ::3, ::3].reshape(-1).cpu()
-                    img_chunk_perm = img_chunk.permute(0, 1, 3, 4, 2)[:, :, ::3, ::3, :]
-                    col_sub = (img_chunk_perm.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).reshape(-1, 3).cpu()
+                    if H > 16 and W > 16:
+                        pts_sub_4d = pts_c[:, :, 4:-4:2, 4:-4:2, :]
+                        conf_sub_3d = conf_c[:, :, 4:-4:2, 4:-4:2]
+                        img_chunk_perm = img_chunk.permute(0, 1, 3, 4, 2)[:, :, 4:-4:2, 4:-4:2, :]
+                    else:
+                        pts_sub_4d = pts_c[:, :, ::2, ::2, :]
+                        conf_sub_3d = conf_c[:, :, ::2, ::2]
+                        img_chunk_perm = img_chunk.permute(0, 1, 3, 4, 2)[:, :, ::2, ::2, :]
 
-                    mask = torch.isfinite(pts_sub).all(dim=-1) & torch.isfinite(conf_sub) & (conf_sub > conf_threshold)
-                    if mask.any():
-                        all_pts.append(pts_sub[mask])
-                        all_conf.append(conf_sub[mask])
-                        all_colors.append(col_sub[mask])
+                    n_in_chunk = e_idx - s_idx
+                    for local_f in range(n_in_chunk):
+                        fid = s_idx + local_f
+                        pts_f = pts_sub_4d[0, local_f].reshape(-1, 3).cpu()
+                        conf_f = conf_sub_3d[0, local_f].reshape(-1).cpu()
+                        rgb_f = img_chunk_perm[0, local_f].float().clamp(0.0, 1.0).reshape(-1, 3).cpu()
+                        col_f = (rgb_f * 255.0).round().to(torch.uint8)
+                        mask_f = (
+                            torch.isfinite(pts_f).all(dim=-1)
+                            & torch.isfinite(conf_f)
+                            & (conf_f >= 1.0)
+                        )
+                        if mask_f.any():
+                            pts_f = pts_f[mask_f]
+                            conf_f = conf_f[mask_f]
+                            rgb_f = rgb_f[mask_f]
+                            col_f = col_f[mask_f]
+                            if len(conf_f) > per_frame_quota:
+                                sat_f = rgb_f.max(dim=-1).values - rgb_f.min(dim=-1).values
+                                lum_f = 0.299 * rgb_f[:, 0] + 0.587 * rgb_f[:, 1] + 0.114 * rgb_f[:, 2]
+                                rg_f = rgb_f[:, 0] - rgb_f[:, 1]
+                                gr_f = rgb_f[:, 1] - rgb_f[:, 0]
+                                # Boost salient colored/fixture pixels so smooth objects (basins, doors, mirrors, shelves)
+                                # are not discarded in favor of high-frequency tile grout lines
+                                salience = (
+                                    (sat_f >= 0.08).float() * 2.0
+                                    + (rg_f >= 0.06).float() * 2.5
+                                    + (gr_f >= 0.04).float() * 2.5
+                                    + ((lum_f <= 0.32) | (lum_f >= 0.88)).float() * 1.0
+                                )
+                                # Also give a bonus to every 2nd pixel so background wall/floor remains spatially uniform
+                                uniform_grid = torch.zeros_like(conf_f)
+                                uniform_grid[::2] = 1.5
+                                score_f = conf_f + salience + uniform_grid
+                                top_k_idx = torch.topk(
+                                    score_f, k=per_frame_quota, largest=True, sorted=False
+                                ).indices
+                                top_k_idx, _ = torch.sort(top_k_idx)
+                                pts_f = pts_f[top_k_idx]
+                                conf_f = conf_f[top_k_idx]
+                                col_f = col_f[top_k_idx]
+                            all_pts.append(pts_f)
+                            all_conf.append(conf_f)
+                            all_colors.append(col_f)
+                            all_fidx.append(torch.full((len(pts_f),), fid, dtype=torch.int32))
 
                 if device == "cuda":
                     torch.cuda.empty_cache()
@@ -307,10 +421,12 @@ def run_vggt_inference(
                     pts_valid = torch.cat(all_pts, dim=0).float().numpy()
                     conf_valid = torch.cat(all_conf, dim=0).float().numpy()
                     colors_valid = torch.cat(all_colors, dim=0).numpy()
+                    fidx_valid = torch.cat(all_fidx, dim=0).numpy()
                 else:
                     pts_valid = np.empty((0, 3), dtype=np.float32)
                     conf_valid = np.empty((0,), dtype=np.float32)
                     colors_valid = np.empty((0, 3), dtype=np.uint8)
+                    fidx_valid = np.empty((0,), dtype=np.int32)
 
         dur_infer = time.time() - t_infer
         logger.info("VGGT forward pass completed in %.2fs. Peak VRAM: %.1f MB",
@@ -345,6 +461,7 @@ def run_vggt_inference(
         all_pts = None
         all_conf = None
         all_colors = None
+        all_fidx = None
         gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -366,6 +483,7 @@ def run_vggt_inference(
         cameras_doc = {
             "model_id": model_id,
             "convention": "opencv_w2c",
+            "image_orientation": "upright" if is_upright else "sensor",
             "cameras": cams,
         }
         os.makedirs(vggt_dir, exist_ok=True)
@@ -374,16 +492,29 @@ def run_vggt_inference(
         logger.info("Saved %d camera poses to %s", len(cams), cam_path)
 
         # 5. Extract points & write project_point_cloud.npz, project_point_cloud.ply, project_point_cloud_clean.ply
-        mask = np.isfinite(pts_valid).all(axis=-1) & np.isfinite(conf_valid)
+        mask = np.isfinite(pts_valid).all(axis=-1) & np.isfinite(conf_valid) & (conf_valid >= 1.0)
         pts_valid = pts_valid[mask]
         conf_valid = conf_valid[mask]
         colors_valid = colors_valid[mask]
+        fidx_valid = fidx_valid[mask]
 
         if len(pts_valid) > max_points:
-            stride = int(np.ceil(len(pts_valid) / max_points))
-            pts_valid = pts_valid[::stride]
-            conf_valid = conf_valid[::stride]
-            colors_valid = colors_valid[::stride]
+            top_idx = np.sort(np.argsort(conf_valid)[-max_points:])
+            pts_valid = pts_valid[top_idx]
+            conf_valid = conf_valid[top_idx]
+            colors_valid = colors_valid[top_idx]
+            fidx_valid = fidx_valid[top_idx]
+
+        # Save NPZ before clean_and_align_point_cloud so estimate_vggt_gravity_up can refine against 3D planes
+        np.savez_compressed(
+            npz_path,
+            points=pts_valid,
+            confidence=conf_valid,
+            colors=colors_valid,
+            frame_indices=fidx_valid,
+            image_names=np.array([fr["vggt_filename"] for fr in frames[:len(ext_np)]]),
+        )
+        logger.info("Saved %d 3D points with RGB colors to %s", len(pts_valid), npz_path)
 
         import open3d as o3d
         from app.services.manhattan_alignment import clean_and_align_point_cloud
@@ -404,15 +535,6 @@ def run_vggt_inference(
             "Cleaned & Manhattan-aligned VGGT point cloud: %d -> %d points (saved to %s)",
             len(pts_valid), len(clean_pcd.points), clean_ply_path,
         )
-
-        np.savez_compressed(
-            npz_path,
-            points=pts_valid,
-            confidence=conf_valid,
-            colors=colors_valid,
-            image_names=np.array([fr["vggt_filename"] for fr in frames[:len(ext_np)]]),
-        )
-        logger.info("Saved %d 3D points with RGB colors to %s", len(pts_valid), npz_path)
 
         total_dur = time.time() - t_start
         logger.info("VGGT processing complete for session in %.2fs!", total_dur)

@@ -152,6 +152,7 @@ class ReconstructionService:
             )
             if not pcd.has_colors():
                 raise ValueError("TSDF produced empty mesh.")
+            pcd.normals = o3d.utility.Vector3dVector()
             ok_ply = o3d.io.write_point_cloud(ply_tmp, pcd, write_ascii=False)
             if (
                 not ok_glb
@@ -192,16 +193,26 @@ class ReconstructionService:
         if gravity is not None and not is_usable_gravity(gravity):
             return empty_layout(gravity), empty_pcd
 
-        if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
-            return empty_layout(gravity), empty_pcd
+        if isinstance(mesh, o3d.geometry.PointCloud):
+            pcd = mesh
+        elif hasattr(mesh, "triangles") and len(mesh.triangles) == 0 and len(mesh.vertices) > 0:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = mesh.vertices
+            if mesh.has_vertex_colors():
+                pcd.colors = mesh.vertex_colors
+            if mesh.has_vertex_normals():
+                pcd.normals = mesh.vertex_normals
+        else:
+            if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+                return empty_layout(gravity), empty_pcd
 
-        try:
-            o3d.utility.random.seed(42)
-            np.random.seed(42)
-            mesh = _decimate_if_needed(mesh)
-            pcd = mesh.sample_points_uniformly(number_of_points=MESH_SAMPLE_POINTS)
-        except Exception:
-            return empty_layout(gravity), empty_pcd
+            try:
+                o3d.utility.random.seed(42)
+                np.random.seed(42)
+                mesh = _decimate_if_needed(mesh)
+                pcd = mesh.sample_points_uniformly(number_of_points=MESH_SAMPLE_POINTS)
+            except Exception:
+                return empty_layout(gravity), empty_pcd
 
         if len(pcd.points) == 0:
             return empty_layout(gravity), empty_pcd
@@ -230,6 +241,7 @@ class ReconstructionService:
             return
         os.makedirs(session_dir, exist_ok=True)
         painted = o3d.geometry.PointCloud(pcd)
+        painted.normals = o3d.utility.Vector3dVector()
         n = len(painted.points)
         rgb = np.tile(np.array(WHITEFLAT_RGB, dtype=float) / 255.0, (n, 1))
         painted.colors = o3d.utility.Vector3dVector(rgb)
@@ -261,10 +273,28 @@ class ReconstructionService:
             write_visual_ply,
             get_metric_vggt_cloud,
             build_poisson_mesh_from_cloud,
+            layout_xy_polygon,
         )
 
         try:
-            if vggt_prior is None:
+            xy_poly = layout_xy_polygon(layout) if isinstance(layout, dict) else np.zeros((0, 2))
+            skip_vggt = (
+                isinstance(layout, dict)
+                and isinstance(layout.get("diagnostics"), dict)
+                and isinstance(layout["diagnostics"].get("vggt_prior"), dict)
+                and layout["diagnostics"]["vggt_prior"].get("skip_reason") == "disabled_by_config"
+            )
+            if skip_vggt:
+                for stale_name in ("reconstructed_vggt_dense.ply", "reconstructed_poisson.glb"):
+                    stale_path = os.path.join(session_dir, stale_name)
+                    if os.path.isfile(stale_path):
+                        try:
+                            os.unlink(stale_path)
+                        except OSError:
+                            pass
+            if vggt_prior is not None and hasattr(vggt_prior, "prior"):
+                vggt_prior = vggt_prior.prior
+            if vggt_prior is None and not skip_vggt:
                 try:
                     from app.services.vggt_prior import load_vggt_prior
                     res = load_vggt_prior(session_dir)
@@ -273,7 +303,10 @@ class ReconstructionService:
                     vggt_prior = None
 
             if vggt_prior is not None and hasattr(vggt_prior, "points") and len(vggt_prior.points) >= 50:
-                ref_pts = np.asarray(mesh.vertices) if len(mesh.vertices) else None
+                if isinstance(mesh, o3d.geometry.PointCloud):
+                    ref_pts = np.asarray(mesh.points) if len(mesh.points) else None
+                else:
+                    ref_pts = np.asarray(mesh.vertices) if len(mesh.vertices) else None
                 pcd_room, pcd_vio = get_metric_vggt_cloud(
                     vggt_prior, layout, gravity, reference_points=ref_pts
                 )
@@ -297,13 +330,50 @@ class ReconstructionService:
                             "Exported Poisson mesh (%d triangles) to reconstructed_poisson.glb for session %s",
                             len(poisson_mesh.triangles), session_dir,
                         )
-                        # Keep TSDF outputs intact: only write reconstructed.glb/reconstructed.ply if they don't exist
                         glb_final = os.path.join(session_dir, "reconstructed.glb")
                         if not os.path.isfile(glb_final):
                             write_triangle_mesh_glb(poisson_mesh, glb_final)
                         ply_final = os.path.join(session_dir, "reconstructed.ply")
                         if not os.path.isfile(ply_final):
-                            write_visual_ply(pcd_room if len(pcd_room.points) > 0 else visual, session_dir, "reconstructed.ply")
+                            write_visual_ply(
+                                pcd_room if len(pcd_room.points) > 0 else visual,
+                                session_dir,
+                                "reconstructed.ply",
+                            )
+                        elif ref_pts is not None and len(ref_pts) >= 1000 and len(xy_poly) == 4:
+                            tsdf_vis, _ = build_visual_clouds(
+                                mesh,
+                                layout,
+                                gravity,
+                                number_of_points=number_of_points or POINT_CLOUD_SAMPLE_POINTS,
+                                vggt_prior=None,
+                            )
+                            if len(tsdf_vis.points) >= 1000:
+                                if len(visual.points) >= 20_000 and visual.has_colors() and tsdf_vis.has_colors():
+                                    v_pts = np.asarray(visual.points, dtype=float)
+                                    v_cols = np.asarray(visual.colors, dtype=float)
+                                    t_pts = np.asarray(tsdf_vis.points, dtype=float)
+                                    t_cols = np.asarray(tsdf_vis.colors, dtype=float)
+                                    w_lim = float(np.max(t_pts[:, 0]))
+                                    d_lim = float(np.max(t_pts[:, 1]))
+                                    d_w_v = np.minimum(
+                                        np.minimum(np.abs(v_pts[:, 0]), np.abs(v_pts[:, 0] - w_lim)),
+                                        np.minimum(np.abs(v_pts[:, 1]), np.abs(v_pts[:, 1] - d_lim)),
+                                    )
+                                    hi_fix = (d_w_v > 0.015) & (d_w_v <= 0.36) & (v_pts[:, 2] >= 0.44)
+                                    v_y0_green = (np.abs(v_pts[:, 1]) <= 0.015) & ((v_cols[:, 1] - v_cols[:, 0]) >= 0.025)
+                                    if int(np.count_nonzero(v_y0_green)) >= 200:
+                                        v_y0 = np.abs(v_pts[:, 1]) <= 0.015
+                                        t_not_y0 = np.abs(t_pts[:, 1]) > 0.015
+                                        t_pts = np.vstack([t_pts[t_not_y0], v_pts[v_y0]])
+                                        t_cols = np.vstack([t_cols[t_not_y0], v_cols[v_y0]])
+                                    if np.any(hi_fix):
+                                        t_pts = np.vstack([t_pts, v_pts[hi_fix]])
+                                        t_cols = np.vstack([t_cols, v_cols[hi_fix]])
+                                    tsdf_vis = o3d.geometry.PointCloud()
+                                    tsdf_vis.points = o3d.utility.Vector3dVector(t_pts)
+                                    tsdf_vis.colors = o3d.utility.Vector3dVector(t_cols)
+                                write_visual_ply(tsdf_vis, session_dir, "reconstructed.ply")
                     return
 
             visual, dollhouse = build_visual_clouds(
@@ -311,6 +381,9 @@ class ReconstructionService:
             )
             write_visual_ply(visual, session_dir, "reconstructed_visual.ply")
             write_visual_ply(dollhouse, session_dir, "reconstructed_dollhouse.ply")
+            ply_final = os.path.join(session_dir, "reconstructed.ply")
+            if os.path.isfile(ply_final) and len(visual.points) >= 1000 and len(xy_poly) == 4:
+                write_visual_ply(visual, session_dir, "reconstructed.ply")
         except Exception:
             logger.exception("export_visual_artifacts failed")
 

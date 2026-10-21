@@ -475,7 +475,7 @@ def mask_lidar_zones(lidar_df: pd.DataFrame) -> pd.DataFrame:
         dist_col = f"distance_{i}"
         status_col = f"status_{i}"
         out[dist_col] = out[dist_col].astype(float) / 1000.0
-        invalid = ~out[status_col].isin([5, 9]) | (out[dist_col] < 0.020) | (out[dist_col] > 4.0)
+        invalid = ~out[status_col].isin([5, 6, 9]) | (out[dist_col] < 0.020) | (out[dist_col] > 4.0)
         out.loc[invalid, dist_col] = np.nan
     return out
 

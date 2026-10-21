@@ -337,9 +337,12 @@ def align_gyroscope_signals(t_phone: np.ndarray, w_phone: np.ndarray, t_hub: np.
                     offsets_chunks.append(float(local_offset))
                     
         if len(t_chunks) >= 2:
-            poly = np.polyfit(t_chunks, offsets_chunks, 1)
+            t_ref = float(t_phone_sec[0])
+            t_rel = np.asarray(t_chunks, dtype=np.float64) - t_ref
+            poly = np.polyfit(t_rel, np.asarray(offsets_chunks, dtype=np.float64), 1)
             s = float(1.0 + poly[0])
-            c = float(poly[1] * 1e9)
+            c_sec = float(poly[1] - poly[0] * t_ref)
+            c = float(c_sec * 1e9)
             return s, c
             
     return 1.0, float(offset_sec * 1e9)

@@ -56,6 +56,7 @@ from app.services.calibration import (
     project_lidar_frame_to_sparse_tof_with_status,
     refine_extrinsics_from_session,
     refine_lidar_camera_extrinsics_em,
+    resolve_sensor_to_vio_rotation,
     should_skip_tof_keyframe,
 )
 from app.services.depth_completion import DepthCompletionService, GHOST_RANGE_FLOOR_M
@@ -1104,6 +1105,11 @@ def run_3d_reconstruction(
     ):
         publish_session_vio(session_dir)
         gc.collect()
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
     recon_timings["vio_sec"] = round(time.time() - t_vio, 3)
 
     t_kf = time.time()
@@ -1242,19 +1248,33 @@ def run_3d_reconstruction(
 
         session_R_dc = None
         if pose_df is not None and pose_df.attrs.get("pose_source") == "server_vio" and rot_deg and keyframes:
-            r_dc_cand = _display_to_camera_sensor_rotation(rot_deg)
-            if not np.allclose(r_dc_cand, np.eye(3)):
-                z0_list = []
-                z1_list = []
-                for kf_c in keyframes[:20]:
+            R_wc_list = []
+            if all(c in pose_df.columns for c in ("qx", "qy", "qz", "qw")) and len(pose_df) > 0:
+                try:
+                    R_wc_list = Rotation.from_quat(
+                        pose_df[["qx", "qy", "qz", "qw"]].to_numpy(dtype=np.float64)
+                    ).as_matrix()
+                except Exception:
+                    R_wc_list = []
+            if len(R_wc_list) == 0:
+                for kf_c in keyframes:
                     try:
-                        r_m = Rotation.from_quat([kf_c["qx"], kf_c["qy"], kf_c["qz"], kf_c["qw"]]).as_matrix()
-                        z0_list.append(abs(float(r_m[2, 0])))
-                        z1_list.append(abs(float(r_m[2, 1])))
+                        R_wc_list.append(
+                            Rotation.from_quat([kf_c["qx"], kf_c["qy"], kf_c["qz"], kf_c["qw"]]).as_matrix()
+                        )
                     except Exception:
                         pass
-                if z0_list and float(np.median(z0_list)) < 0.5 and float(np.median(z1_list)) >= 0.4:
-                    session_R_dc = r_dc_cand
+            w_probe = int(round(2.0 * float(k[0, 2]))) if k is not None and k.shape == (3, 3) and k[0, 2] > 10 else None
+            h_probe = int(round(2.0 * float(k[1, 2]))) if k is not None and k.shape == (3, 3) and k[1, 2] > 10 else None
+            r_dc_resolved = resolve_sensor_to_vio_rotation(
+                rot_deg,
+                img_w=w_probe,
+                img_h=h_probe,
+                R_wc_all=np.asarray(R_wc_list) if len(R_wc_list) else None,
+                g_world=g_world,
+            )
+            if not np.allclose(r_dc_resolved, np.eye(3)):
+                session_R_dc = r_dc_resolved
 
         def _prep_keyframe(kf):
             rgb = cv2.imread(kf["_rgb_path"]) if cv2 is not None else None
@@ -1368,11 +1388,26 @@ def run_3d_reconstruction(
         except Exception:
             pass
         gc.collect()
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 
         if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
             raise ValueError("TSDF produced empty mesh.")
 
         reconstruction_service.export_mesh_artifacts(mesh, session_dir)
+        glb_disk_path = os.path.join(session_dir, "reconstructed.glb")
+        if os.path.isfile(glb_disk_path):
+            try:
+                import open3d as o3d
+
+                glb_mesh = o3d.io.read_triangle_mesh(glb_disk_path)
+                if len(glb_mesh.vertices) > 0 and len(glb_mesh.triangles) > 0:
+                    mesh = glb_mesh
+            except Exception:
+                pass
         recon_timings["tsdf_integration_sec"] = round(time.time() - t_tsdf, 3)
 
         vggt_prior = None

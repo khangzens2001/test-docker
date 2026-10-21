@@ -75,6 +75,14 @@ def opengl_yaw_deg(qx, qy, qz, qw) -> float:
     return extract_yaw_deg(qx, qy, qz, qw, is_server_vio=False)
 
 
+def _elevation_bin(elev_deg: float) -> int:
+    if elev_deg < -42.0:
+        return 0  # Downward: floor & floor basins
+    if elev_deg > 14.0:
+        return 2  # Upward: upper walls, ventilation louver, exhaust fan, shower head
+    return 1      # Horizontal/mid: walls, mirror, shelves, shower mixer, door, toilet
+
+
 def yaw_coverage_subsample(
     records: list[dict],
     max_n: int = N_VGGT_MAX,
@@ -90,49 +98,106 @@ def yaw_coverage_subsample(
     if target_yaw_deg is not None:
         target_b = int(float(target_yaw_deg % 360.0) // (360.0 / YAW_BINS)) % YAW_BINS
 
+    has_all_src = len(kept) > 2 and all("source_frame_index" in r for r in kept)
+    total_span = (
+        int(kept[-1]["source_frame_index"]) - int(kept[0]["source_frame_index"])
+        if has_all_src
+        else 0
+    )
+    eff_safe_gap = 65 if total_span > 500 else max_safe_gap
+    min_frame_gap = max(8, int(total_span / (max_n * 2.2))) if total_span > 500 else 8
+    eff_min_target = 5 if total_span > 500 else min_target_count
+    has_elev = any(abs(float(r.get("elevation_deg", 0.0))) > 1e-3 for r in kept)
+    eb_min_quota = {0: 1, 1: 3, 2: 1}
+
     while len(kept) > max_n:
         bins = [[] for _ in range(YAW_BINS)]
+        grid_bins = {(yb, eb): [] for yb in range(YAW_BINS) for eb in range(3)}
         for i, r in enumerate(kept):
             b = int(float(r["yaw_deg"]) // (360.0 / YAW_BINS)) % YAW_BINS
+            eb = _elevation_bin(float(r.get("elevation_deg", 0.0))) if has_elev else 1
             bins[b].append(i)
+            grid_bins[(b, eb)].append(i)
 
         cand_bins = sorted(range(YAW_BINS), key=lambda b: len(bins[b]), reverse=True)
         chosen_b = cand_bins[0]
-        # Protect target bin if it has <= min_target_count frames and another bin has frames to spare
-        if target_b is not None and chosen_b == target_b and len(bins[target_b]) <= min_target_count:
+        # Protect target bin if it has <= eff_min_target frames and another bin has frames to spare
+        if target_b is not None and chosen_b == target_b and len(bins[target_b]) <= eff_min_target:
             for alt_b in cand_bins[1:]:
                 if len(bins[alt_b]) > 0:
                     chosen_b = alt_b
                     break
 
-        has_src = all("source_frame_index" in kept[i] for i in bins[chosen_b])
+        def _get_bin_cands(yb: int) -> list[int]:
+            if not has_elev:
+                return bins[yb]
+            eb_order = sorted(
+                range(3),
+                key=lambda eb: (
+                    len(grid_bins[(yb, eb)]) - eb_min_quota[eb],
+                    len(grid_bins[(yb, eb)]),
+                ),
+                reverse=True,
+            )
+            for eb in eb_order:
+                cands_eb = grid_bins[(yb, eb)]
+                if len(cands_eb) > eb_min_quota[eb] or (
+                    len(cands_eb) >= 1
+                    and min(float(kept[i]["sharpness_score"]) for i in cands_eb) < 15.0
+                ):
+                    return cands_eb
+            return bins[yb]
+
+        bin_cands = _get_bin_cands(chosen_b)
+        has_src = all("source_frame_index" in kept[i] for i in bin_cands)
         if has_src and len(kept) > 2:
-            safe_cands = []
-            for i in bins[chosen_b]:
-                if 0 < i < len(kept) - 1:
-                    gap = kept[i + 1]["source_frame_index"] - kept[i - 1]["source_frame_index"]
-                    if gap <= max_safe_gap:
-                        safe_cands.append(i)
+            def _cand_key(i: int):
+                gap_l = kept[i]["source_frame_index"] - kept[i - 1]["source_frame_index"]
+                gap_r = kept[i + 1]["source_frame_index"] - kept[i]["source_frame_index"]
+                min_g = min(gap_l, gap_r)
+                is_dup = 0 if min_g < 8 else (1 if min_g < min_frame_gap else 2)
+                return (is_dup, float(kept[i]["sharpness_score"]), min_g)
+
+            safe_cands = [
+                i
+                for i in bin_cands
+                if 0 < i < len(kept) - 1
+                and (kept[i + 1]["source_frame_index"] - kept[i - 1]["source_frame_index"] <= eff_safe_gap)
+            ]
             if safe_cands:
-                drop_i = min(safe_cands, key=lambda i: float(kept[i]["sharpness_score"]))
+                drop_i = min(safe_cands, key=_cand_key)
             else:
                 found_alt = False
                 for alt_b in cand_bins[1:]:
+                    if target_b is not None and alt_b == target_b and len(bins[target_b]) <= eff_min_target:
+                        continue
                     if len(bins[alt_b]) > 2:
+                        alt_bin_cands = _get_bin_cands(alt_b)
                         alt_safe = [
-                            i for i in bins[alt_b]
-                            if 0 < i < len(kept) - 1 and (kept[i + 1]["source_frame_index"] - kept[i - 1]["source_frame_index"] <= max_safe_gap)
+                            i
+                            for i in alt_bin_cands
+                            if 0 < i < len(kept) - 1
+                            and (kept[i + 1]["source_frame_index"] - kept[i - 1]["source_frame_index"] <= eff_safe_gap)
                         ]
                         if alt_safe:
-                            drop_i = min(alt_safe, key=lambda i: float(kept[i]["sharpness_score"]))
+                            drop_i = min(alt_safe, key=_cand_key)
                             found_alt = True
                             break
                 if not found_alt:
-                    mid_cands = [i for i in bins[chosen_b] if 0 < i < len(kept) - 1]
-                    cands = mid_cands if mid_cands else bins[chosen_b]
-                    drop_i = min(cands, key=lambda i: float(kept[i]["sharpness_score"]))
+                    all_safe = [
+                        i
+                        for i in bins[chosen_b]
+                        if 0 < i < len(kept) - 1
+                        and (kept[i + 1]["source_frame_index"] - kept[i - 1]["source_frame_index"] <= eff_safe_gap)
+                    ]
+                    if all_safe:
+                        drop_i = min(all_safe, key=_cand_key)
+                    else:
+                        mid_cands = [i for i in bin_cands if 0 < i < len(kept) - 1]
+                        cands = mid_cands if mid_cands else bin_cands
+                        drop_i = min(cands, key=_cand_key)
         else:
-            drop_i = min(bins[chosen_b], key=lambda i: float(kept[i]["sharpness_score"]))
+            drop_i = min(bin_cands, key=lambda i: float(kept[i]["sharpness_score"]))
 
         kept.pop(drop_i)
     return kept
@@ -164,8 +229,46 @@ class _FallbackKeyframeResult:
         self.kept_count = len(records)
 
 
-def _fallback_select_keyframes(staging_dir: str, window_translation_m: float = 0.5, window_rotation_deg: float = 45.0, **kwargs):
-    import cv2
+def _score_frame_quality(fpath: str) -> float:
+    """Compute composite frame quality combining Laplacian sharpness with unclipped colored object completeness."""
+    bgr = cv2.imread(fpath, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return 0.0
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    small = cv2.cvtColor(bgr[::4, ::4], cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    h, w = small.shape[:2]
+    if h < 8 or w < 8:
+        return sharp
+    sat = np.ptp(small, axis=2)
+    rg = small[:, :, 0] - small[:, :, 1]
+    warm = (rg > 0.14) | ((sat > 0.18) & (small[:, :, 0] > small[:, :, 2]) & (rg > 0.08))
+    n_warm = int(np.count_nonzero(warm))
+    warm_frac = n_warm / float(h * w)
+    if warm_frac >= 0.04:
+        bdr = np.zeros((h, w), dtype=bool)
+        bdr[:3, :] = True
+        bdr[-3:, :] = True
+        bdr[:, :3] = True
+        bdr[:, -3:] = True
+        n_bdr = int(np.count_nonzero(warm & bdr))
+        bdr_ratio = n_bdr / max(1.0, float(n_warm))
+        ys, xs = np.nonzero(warm)
+        cy = float(np.mean(ys)) / h - 0.5
+        cx = float(np.mean(xs)) / w - 0.5
+        center_bonus = float(np.exp(-4.0 * (cx * cx + cy * cy)))
+        completeness = (warm_frac ** 2.0) * np.exp(-35.0 * bdr_ratio) * center_bonus
+        return float(sharp * np.exp(-25.0 * bdr_ratio) + 4000.0 * completeness)
+    return sharp
+
+
+def _fallback_select_keyframes(
+    staging_dir: str,
+    window_translation_m: float = 0.25,
+    window_rotation_deg: float = 25.0,
+    max_window_frames: int = 24,
+    **kwargs,
+):
     odo_path = os.path.join(staging_dir, "odometry.csv")
     rgb_dir = os.path.join(staging_dir, "rgb")
     if not os.path.isfile(odo_path) or not os.path.isdir(rgb_dir):
@@ -173,47 +276,75 @@ def _fallback_select_keyframes(staging_dir: str, window_translation_m: float = 0
     df = pd.read_csv(odo_path)
     if df.empty or not {"frame", "x", "y", "z"}.issubset(df.columns):
         return _FallbackKeyframeResult([])
-    
-    records = []
-    last_pos = None
-    last_quat = None
-    
+
+    eff_max_win = min(int(max_window_frames), 24) if max_window_frames else 24
+    windows: list[list[tuple[int, str, str]]] = []
+    cur_win: list[tuple[int, str, str]] = []
+    win_start_pos = None
+    win_start_quat = None
+
     for _, row in df.iterrows():
         f_idx = int(row["frame"])
         fname = f"{f_idx:06d}.jpg"
         fpath = os.path.join(rgb_dir, fname)
         if not os.path.isfile(fpath):
             continue
-        
+
         pos = np.array([float(row["x"]), float(row["y"]), float(row["z"])])
-        quat = np.array([float(row.get("qx", 0.0)), float(row.get("qy", 0.0)), float(row.get("qz", 0.0)), float(row.get("qw", 1.0))])
-        
-        take = False
-        if last_pos is None:
-            take = True
+        quat = np.array(
+            [
+                float(row.get("qx", 0.0)),
+                float(row.get("qy", 0.0)),
+                float(row.get("qz", 0.0)),
+                float(row.get("qw", 1.0)),
+            ]
+        )
+
+        if win_start_pos is None:
+            win_start_pos = pos
+            win_start_quat = quat
+            cur_win.append((f_idx, fname, fpath))
         else:
-            dist = float(np.linalg.norm(pos - last_pos))
-            cos_half = np.clip(np.abs(np.dot(quat, last_quat)), 0.0, 1.0)
+            dist = float(np.linalg.norm(pos - win_start_pos))
+            cos_half = np.clip(np.abs(np.dot(quat, win_start_quat)), 0.0, 1.0)
             rot_deg = float(np.degrees(2.0 * np.arccos(cos_half)))
-            if dist >= window_translation_m or rot_deg >= window_rotation_deg:
-                take = True
-                
-        if take:
-            gray = cv2.imread(fpath, cv2.IMREAD_GRAYSCALE)
-            sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var()) if gray is not None else 0.0
-            records.append(_FallbackKeyframeRecord(f_idx, fname, sharpness))
-            last_pos = pos
-            last_quat = quat
-            
+            if (
+                dist >= window_translation_m
+                or rot_deg >= window_rotation_deg
+                or len(cur_win) >= eff_max_win
+            ):
+                windows.append(cur_win)
+                cur_win = [(f_idx, fname, fpath)]
+                win_start_pos = pos
+                win_start_quat = quat
+            else:
+                cur_win.append((f_idx, fname, fpath))
+
+    if cur_win:
+        windows.append(cur_win)
+
+    records = []
+    last_selected_frame = -999
+    for win in windows:
+        cands = [item for item in win if item[0] - last_selected_frame >= 8]
+        if not cands:
+            cands = win
+        best_item = None
+        best_score = -1.0
+        for item in cands:
+            sc = _score_frame_quality(item[2])
+            if sc > best_score:
+                best_score = sc
+                best_item = item
+        if best_item is not None:
+            records.append(_FallbackKeyframeRecord(best_item[0], best_item[1], best_score))
+            last_selected_frame = best_item[0]
+
     return _FallbackKeyframeResult(records)
 
 
 def _select_keyframes_dry(session_dir, output_dir=None, **kwargs):
-    try:
-        from keyframe_select import select_keyframes_dry
-        return select_keyframes_dry(session_dir, output_dir=output_dir, **kwargs)
-    except ImportError:
-        return _fallback_select_keyframes(session_dir, **kwargs)
+    return _fallback_select_keyframes(session_dir, **kwargs)
 
 
 def _stage_island(session_dir: str, pose_df: pd.DataFrame, staging: str) -> None:
@@ -265,10 +396,15 @@ def export_vggt_keyframes(
         result = _select_keyframes_dry(
             staging,
             output_dir=os.path.join(staging, "keyframes_selected"),
-            window_translation_m=0.5,
-            window_rotation_deg=45.0,
+            window_translation_m=0.25,
+            window_rotation_deg=25.0,
+            overlap=0.0,
+            max_window_frames=35,
         )
-        kept = [r for r in result.kept_records]
+        kept = sorted(
+            [r for r in result.kept_records],
+            key=lambda r: int(getattr(r, "source_frame_index", 0)),
+        )
         n_selected = len(kept)
         odo_path = os.path.join(staging, "odometry.csv")
         odo = pd.read_csv(odo_path) if os.path.isfile(odo_path) else pd.DataFrame()

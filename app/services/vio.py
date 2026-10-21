@@ -279,6 +279,21 @@ class EventDrivenTimeSynchronizer:
                 cb(evt)
 
 
+def _nearest_odo_idx(odo_times: np.ndarray, t: float) -> int:
+    """Return index of element in sorted 1D array `odo_times` closest to `t`."""
+    n = len(odo_times)
+    if n <= 1:
+        return 0
+    idx = int(np.searchsorted(odo_times, t))
+    if idx <= 0:
+        return 0
+    if idx >= n:
+        return n - 1
+    if abs(odo_times[idx] - t) < abs(t - odo_times[idx - 1]):
+        return idx
+    return idx - 1
+
+
 class ServerSideVioEstimator:
     """Server-side Multi-Sensor VIO Estimator Facade.
 
@@ -353,7 +368,13 @@ class ServerSideVioEstimator:
         spad_depth_p90: Optional[float] = None
         if spad_lidar_df is not None and not spad_lidar_df.empty:
             valid_vals = []
-            d_cols = [c for c in spad_lidar_df.columns if c.startswith("distance_") or (c.startswith("d") and c != "depth_grid") or c.isdigit()]
+            d_cols = [
+                c
+                for c in spad_lidar_df.columns
+                if c.startswith("distance_")
+                or (c.startswith("d") and c[1:].isdigit())
+                or c.isdigit()
+            ]
             if d_cols:
                 try:
                     vals = spad_lidar_df[d_cols].to_numpy(dtype=float)
@@ -794,6 +815,10 @@ class ServerSideVioEstimator:
 
                         if latest_spad_depth is not None and hasattr(eskf, "update_floor_distance"):
                             d_grid = np.asarray(latest_spad_depth, dtype=np.float64)
+                            if bool(flip_h or flip_v or (rot_deg != 0)):
+                                d_grid = remap_lidar_zones_to_camera_frame(
+                                    d_grid, flip_h=flip_h, flip_v=flip_v, rot_deg=rot_deg
+                                )
                             if d_grid.ndim == 2:
                                 hg, wg = d_grid.shape
                                 if R_C_floor is None or R_C_floor.shape != (hg * wg, 3):
@@ -947,8 +972,8 @@ class ServerSideVioEstimator:
                                 if odo_times is not None and len(odo_times) > 1:
                                     t_prev = pgo_nodes_meta[-1]["timestamp"]
                                     t_curr = ts
-                                    idx_p = np.clip(np.searchsorted(odo_times, t_prev), 0, len(odo_times) - 1)
-                                    idx_c = np.clip(np.searchsorted(odo_times, t_curr), 0, len(odo_times) - 1)
+                                    idx_p = _nearest_odo_idx(odo_times, t_prev)
+                                    idx_c = _nearest_odo_idx(odo_times, t_curr)
                                     dt_seg = max(1e-3, t_curr - t_prev)
                                     dp_raw = odo_pos[idx_c] - odo_pos[idx_p]
                                     dp_raw_h = (R_vio_odo @ dp_raw)[:2] if R_vio_odo is not None else dp_raw
@@ -1063,6 +1088,10 @@ class ServerSideVioEstimator:
                             has_pts_3d = (p_c is not None and len(p_c) >= 15 and np.count_nonzero(p_c[:, 2] > 0.05) >= 15)
                             if is_real_orb and not has_pts_3d and latest_spad_depth is not None and len(pts_2d) >= 12:
                                 depth_grid = np.asarray(latest_spad_depth, dtype=np.float64)
+                                if bool(flip_h or flip_v or (rot_deg != 0)):
+                                    depth_grid = remap_lidar_zones_to_camera_frame(
+                                        depth_grid, flip_h=flip_h, flip_v=flip_v, rot_deg=rot_deg
+                                    )
                                 if depth_grid.ndim == 2:
                                     hg_s, wg_s = depth_grid.shape
                                     gx = np.clip((pts_2d[:, 0] / max(w_img, 1.0) * wg_s).astype(int), 0, wg_s - 1)
@@ -1107,8 +1136,8 @@ class ServerSideVioEstimator:
                                             if odo_times is not None and len(odo_times) > 1:
                                                 t_past = pgo_nodes_meta[past_node_id]["timestamp"]
                                                 t_query = pgo_nodes_meta[query_node_id]["timestamp"]
-                                                idx_p = np.clip(np.searchsorted(odo_times, t_past), 0, len(odo_times) - 1)
-                                                idx_q = np.clip(np.searchsorted(odo_times, t_query), 0, len(odo_times) - 1)
+                                                idx_p = _nearest_odo_idx(odo_times, t_past)
+                                                idx_q = _nearest_odo_idx(odo_times, t_query)
                                                 d_odo_loop = float(np.linalg.norm(odo_pos[idx_q] - odo_pos[idx_p]))
 
                                                 if odo_rots is not None and len(odo_rots) > max(idx_p, idx_q):
@@ -1197,8 +1226,8 @@ class ServerSideVioEstimator:
                 if odo_times is not None and len(odo_times) > 1:
                     t_prev = pgo_nodes_meta[-1]["timestamp"]
                     t_curr = last_snap["timestamp"]
-                    idx_p = np.clip(np.searchsorted(odo_times, t_prev), 0, len(odo_times) - 1)
-                    idx_c = np.clip(np.searchsorted(odo_times, t_curr), 0, len(odo_times) - 1)
+                    idx_p = _nearest_odo_idx(odo_times, t_prev)
+                    idx_c = _nearest_odo_idx(odo_times, t_curr)
                     dt_seg = max(1e-3, t_curr - t_prev)
                     dp_raw = odo_pos[idx_c] - odo_pos[idx_p]
                     s_seg = float(np.linalg.norm(dp_raw) / max(dt_seg, 0.005))
@@ -1267,6 +1296,10 @@ class ServerSideVioEstimator:
                                 p_c_last = np.empty((0, 3), dtype=float)
                                 if latest_spad_depth is not None:
                                     depth_grid = np.asarray(latest_spad_depth, dtype=np.float64)
+                                    if bool(flip_h or flip_v or (rot_deg != 0)):
+                                        depth_grid = remap_lidar_zones_to_camera_frame(
+                                            depth_grid, flip_h=flip_h, flip_v=flip_v, rot_deg=rot_deg
+                                        )
                                     if depth_grid.ndim == 2:
                                         hg_s, wg_s = depth_grid.shape
                                         h_l, w_l = last_gray.shape[:2]
@@ -1355,6 +1388,10 @@ class ServerSideVioEstimator:
                                 spad_src = cand_spad
 
                         if spad_src is not None and spad_src.ndim == 2:
+                            if bool(flip_h or flip_v or (rot_deg != 0)):
+                                spad_src = remap_lidar_zones_to_camera_frame(
+                                    spad_src, flip_h=flip_h, flip_v=flip_v, rot_deg=rot_deg
+                                )
                             hg_s, wg_s = spad_src.shape
                             w_img_ref = float(w_img) if 'w_img' in locals() and w_img else 640.0
                             h_img_ref = float(h_img) if 'h_img' in locals() and h_img else 360.0
@@ -1398,8 +1435,8 @@ class ServerSideVioEstimator:
                         if odo_times is not None and len(odo_times) > 1:
                             te = e_m["timestamp"]
                             tl = l_m["timestamp"]
-                            ip = np.clip(np.searchsorted(odo_times, te), 0, len(odo_times) - 1)
-                            iq = np.clip(np.searchsorted(odo_times, tl), 0, len(odo_times) - 1)
+                            ip = _nearest_odo_idx(odo_times, te)
+                            iq = _nearest_odo_idx(odo_times, tl)
                             d_odo_check = float(np.linalg.norm(odo_pos[iq] - odo_pos[ip]))
                             if d_odo_check > 0.40:
                                 continue
@@ -1925,11 +1962,48 @@ def _extract_lidar_matched_timestamps(session_dir: str) -> dict[int, int]:
     }
 
 
+def _extract_odometry_frame_timestamps(session_dir: str) -> dict[int, int]:
+    """Read odometry CSV and extract a map of frame -> device_timestamp_ns."""
+    odo_path = os.path.join(session_dir, "processed_odometry.csv")
+    if not os.path.isfile(odo_path):
+        odo_path = os.path.join(session_dir, "odometry.csv")
+    if not os.path.isfile(odo_path):
+        return {}
+    try:
+        df = pd.read_csv(odo_path)
+    except Exception:
+        return {}
+    if "frame" not in df.columns:
+        return {}
+    ts_col = None
+    for cand in ("device_timestamp_ns", "timestamp_nanos", "timestamp"):
+        if cand in df.columns:
+            ts_col = cand
+            break
+    if ts_col is None:
+        return {}
+    valid_df = df.dropna(subset=["frame", ts_col]).copy()
+    valid_df["frame"] = pd.to_numeric(valid_df["frame"], errors="coerce")
+    valid_df[ts_col] = pd.to_numeric(valid_df[ts_col], errors="coerce")
+    valid_df = valid_df.dropna(subset=["frame", ts_col])
+    valid_df = valid_df[valid_df["frame"] >= 0]
+    if valid_df.empty:
+        return {}
+    matched = valid_df.drop_duplicates(subset=["frame"], keep="first")
+    out: dict[int, int] = {}
+    for _, row in matched.iterrows():
+        f_idx = int(round(float(row["frame"])))
+        raw_t = float(row[ts_col])
+        ts_ns = int(round(raw_t)) if raw_t > 1e11 else int(round(raw_t * 1e9))
+        out[f_idx] = ts_ns
+    return out
+
+
 def list_session_rgb_frames(session_dir: str) -> list[tuple[int, int, str]]:
     """List and pair RGB frames with device timestamps.
 
     For six-digit filenames ({NNNNNN}.jpg) or frame_{N}.jpg where N < 1e11:
-      Pairs with lidar device_timestamp_ns via matched_frame. Drops frames without a match.
+      Pairs with lidar device_timestamp_ns via matched_frame, falling back to odometry. Drops frames without a match.
     For timestamp filenames frame_{timestamp_ns}.jpg where timestamp_ns >= 1e11:
       device_timestamp_ns = timestamp_ns, and frame is the sequential index after sorting.
 
@@ -1941,6 +2015,7 @@ def list_session_rgb_frames(session_dir: str) -> list[tuple[int, int, str]]:
         return []
 
     lidar_map: dict[int, int] | None = None
+    odo_map: dict[int, int] | None = None
     candidates: list[tuple[int | None, int, str]] = []
 
     for fname in sorted(os.listdir(rgb_dir)):
@@ -1972,10 +2047,16 @@ def list_session_rgb_frames(session_dir: str) -> list[tuple[int, int, str]]:
         if not is_timestamp_named:
             if lidar_map is None:
                 lidar_map = _extract_lidar_matched_timestamps(session_dir)
-            if target_val not in lidar_map:
-                continue
-            device_ts = lidar_map[target_val]
-            frame_id = target_val
+            if target_val in lidar_map:
+                device_ts = lidar_map[target_val]
+                frame_id = target_val
+            else:
+                if odo_map is None:
+                    odo_map = _extract_odometry_frame_timestamps(session_dir)
+                if target_val not in odo_map:
+                    continue
+                device_ts = odo_map[target_val]
+                frame_id = target_val
 
         filepath = os.path.join(rgb_dir, fname)
         candidates.append((frame_id, device_ts, filepath))

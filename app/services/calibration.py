@@ -170,6 +170,9 @@ T_GL_CV = np.array(
 )
 
 
+VL53L8CX_VALID_STATUSES: tuple[int, ...] = (5, 6, 9)
+
+
 def _display_to_camera_sensor_rotation(rot_deg: int | float | str | None) -> np.ndarray:
     """Return 3x3 rotation R_disp_cam from Camera Sensor frame to Portrait Display frame.
 
@@ -191,6 +194,44 @@ def _display_to_camera_sensor_rotation(rot_deg: int | float | str | None) -> np.
         return np.array([[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
     if theta == 270:
         return np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return np.eye(3, dtype=np.float64)
+
+
+display_to_camera_sensor_rotation = _display_to_camera_sensor_rotation
+
+
+def resolve_sensor_to_vio_rotation(
+    rot_deg: int | float | str | None,
+    img_w: int | None = None,
+    img_h: int | None = None,
+    R_wc_all: np.ndarray | None = None,
+    g_world: np.ndarray | None = None,
+) -> np.ndarray:
+    """Deterministically resolve the 3x3 rotation R_dc from Camera Sensor frame to VIO Pose frame."""
+    r_dc_cand = _display_to_camera_sensor_rotation(rot_deg)
+    if np.allclose(r_dc_cand, np.eye(3)):
+        return np.eye(3, dtype=np.float64)
+    if img_w is not None and img_h is not None and int(img_w) <= int(img_h):
+        return np.eye(3, dtype=np.float64)
+    if R_wc_all is None:
+        return r_dc_cand
+    R_arr = np.asarray(R_wc_all, dtype=np.float64)
+    if R_arr.ndim == 2 and R_arr.shape == (3, 3):
+        R_arr = R_arr[None, :, :]
+    if R_arr.ndim != 3 or R_arr.shape[0] == 0 or R_arr.shape[1:] != (3, 3):
+        return r_dc_cand
+    g_vec = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+    if g_world is not None:
+        g_in = np.asarray(g_world, dtype=np.float64).reshape(-1)
+        if g_in.size >= 3 and np.all(np.isfinite(g_in[:3])) and float(np.linalg.norm(g_in[:3])) > 1e-6:
+            g_vec = g_in[:3] / float(np.linalg.norm(g_in[:3]))
+    g_cam = np.einsum("nij,i->nj", R_arr, g_vec)
+    non_steep = np.abs(g_cam[:, 2]) < 0.85
+    g_sub = g_cam[non_steep] if int(np.count_nonzero(non_steep)) >= 5 else g_cam
+    med_x = float(np.median(np.abs(g_sub[:, 0])))
+    med_y = float(np.median(np.abs(g_sub[:, 1])))
+    if med_y > med_x and med_y >= 0.25:
+        return r_dc_cand
     return np.eye(3, dtype=np.float64)
 
 
@@ -263,10 +304,15 @@ def load_T_bc(session_dir: str) -> np.ndarray:
         meaning = str(meta.get("T_imu_camera_meaning") or meaning)
     schema13 = meaning == "phone_imu_android_device_screen_to_arcore_sensor_image"
     if schema13 and np.allclose(T_raw[:3, :3], T_GL_CV[:3, :3], atol=1e-3):
-        return T_raw.copy()
-    if schema13:
-        return T_raw @ T_GL_CV
-    return T_raw.copy()
+        T_out = T_raw.copy()
+    elif schema13:
+        T_out = (T_raw @ T_GL_CV).copy()
+    else:
+        T_out = T_raw.copy()
+    if rot_deg is not None:
+        R_dc = _display_to_camera_sensor_rotation(rot_deg)
+        T_out[:3, :3] = T_out[:3, :3] @ R_dc
+    return T_out
 
 
 
@@ -676,7 +722,7 @@ def project_lidar_frame_to_sparse_tof_with_status(
     fx, fy = float(Kin[0, 0]), float(Kin[1, 1])
     cx, cy = float(Kin[0, 2]), float(Kin[1, 2])
     s_int = np.where(np.isfinite(s[:n]), np.rint(s[:n]).astype(np.int32), 0)
-    valid = np.isfinite(d[:n]) & (d[:n] > 0.0) & np.isin(s_int, [5, 9])
+    valid = np.isfinite(d[:n]) & (d[:n] > 0.0) & np.isin(s_int, VL53L8CX_VALID_STATUSES)
     if not np.any(valid):
         return np.zeros((h, w), dtype=np.float32), np.zeros((h, w), dtype=np.int32)
     pts = (d[:n, None] * r[:n]) @ R.T + t
@@ -1598,6 +1644,19 @@ class MultiKeyframePlaneCalibration:
         pose_records.sort(key=lambda item: item[0])
         pose_ts_arr = np.array([item[0] for item in pose_records], dtype=np.int64) if pose_records else np.zeros(0, dtype=np.int64)
 
+        R_wc_all_mkf = np.array([item[1][:3, :3] for item in pose_records], dtype=np.float64) if pose_records else None
+        w_est = int(round(2.0 * float(K[0, 2]))) if K is not None and K.shape == (3, 3) and K[0, 2] > 10 else None
+        h_est = int(round(2.0 * float(K[1, 2]))) if K is not None and K.shape == (3, 3) and K[1, 2] > 10 else None
+        session_R_dc = resolve_sensor_to_vio_rotation(
+            self.rot_deg, img_w=w_est, img_h=h_est, R_wc_all=R_wc_all_mkf, g_world=g_world
+        )
+        if not np.allclose(session_R_dc, np.eye(3)):
+            for idx_rec in range(len(pose_records)):
+                ts_r, T_r, frm_r = pose_records[idx_rec]
+                T_r_new = T_r.copy()
+                T_r_new[:3, :3] = T_r[:3, :3] @ session_R_dc
+                pose_records[idx_rec] = (ts_r, T_r_new, frm_r)
+
         all_X = []
         all_n = []
         all_d = []
@@ -1626,6 +1685,9 @@ class MultiKeyframePlaneCalibration:
                 continue
 
             T_wc_k = self._pose_matrix_from_dict(kf)
+            if T_wc_k is not None and not np.allclose(session_R_dc, np.eye(3)):
+                T_wc_k = T_wc_k.copy()
+                T_wc_k[:3, :3] = T_wc_k[:3, :3] @ session_R_dc
             window_frames: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = [
                 (np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64), X_k, dist_k, rdir_k)
             ]
@@ -1673,7 +1735,7 @@ class MultiKeyframePlaneCalibration:
                     )
                     g_cam = None
                     if g_world is not None and all(k in kf for k in ("qx", "qy", "qz", "qw")):
-                        R_wc = Rotation.from_quat([kf["qx"], kf["qy"], kf["qz"], kf["qw"]]).as_matrix()
+                        R_wc = Rotation.from_quat([kf["qx"], kf["qy"], kf["qz"], kf["qw"]]).as_matrix() @ session_R_dc
                         g_cam = R_wc.T @ np.asarray(g_world, dtype=float)
                     dense = depth_service.run_depthor_plus(
                         rgb_img, sparse_tof, K, g_cam=g_cam, z_max_ghost=z_max_ghost
@@ -2038,9 +2100,23 @@ def refine_lidar_camera_extrinsics_em(
             try:
                 g_cam = None
                 if g_world is not None and all(k in best_kf for k in ("qx", "qy", "qz", "qw")):
-                    R_dw = Rotation.from_quat(
-                        [best_kf["qx"], best_kf["qy"], best_kf["qz"], best_kf["qw"]]
-                    ).as_matrix()
+                    R_wc_all_em = None
+                    if pose_df is not None and all(c in pose_df.columns for c in ("qx", "qy", "qz", "qw")) and len(pose_df) > 0:
+                        try:
+                            R_wc_all_em = Rotation.from_quat(
+                                pose_df[["qx", "qy", "qz", "qw"]].to_numpy(dtype=np.float64)
+                            ).as_matrix()
+                        except Exception:
+                            R_wc_all_em = None
+                    R_dc_em = resolve_sensor_to_vio_rotation(
+                        rot_deg, img_w=w, img_h=h, R_wc_all=R_wc_all_em, g_world=g_world
+                    )
+                    R_dw = (
+                        Rotation.from_quat(
+                            [best_kf["qx"], best_kf["qy"], best_kf["qz"], best_kf["qw"]]
+                        ).as_matrix()
+                        @ R_dc_em
+                    )
                     g_cam = R_dw.T @ np.asarray(g_world, dtype=float)
                 dense = depth_service.run_depthor_plus(
                     rgb_img, sparse_tof, K, g_cam=g_cam, z_max_ghost=z_max_ghost

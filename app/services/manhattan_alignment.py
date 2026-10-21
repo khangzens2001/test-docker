@@ -46,7 +46,8 @@ def estimate_vggt_gravity_up(session_dir: str | None) -> np.ndarray | None:
         return None
     try:
         with open(cam_path, "r", encoding="utf-8") as f:
-            cams = json.load(f).get("cameras", [])
+            cam_doc = json.load(f)
+        cams = cam_doc.get("cameras", [])
         with open(manifest_path, "r", encoding="utf-8") as f:
             frames = json.load(f).get("frames", [])
         if not cams or not frames:
@@ -98,36 +99,69 @@ def estimate_vggt_gravity_up(session_dir: str | None) -> np.ndarray | None:
 
         imu_ts = np.asarray(imu_ts_list, dtype=np.int64)
         imu_acc = np.asarray(imu_acc_list, dtype=float)
-        r_cam_imu = np.diag([1.0, -1.0, -1.0])
+        if cam_doc.get("image_orientation") == "upright":
+            r_candidates = (np.diag([1.0, -1.0, -1.0]),)
+        else:
+            r_candidates = (
+                np.diag([1.0, -1.0, -1.0]),
+                np.array([[0.0, -1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, -1.0]], dtype=float),
+            )
 
-        up_world_samples: list[np.ndarray] = []
-        for cam in cams:
-            fn = str(cam.get("vggt_filename", ""))
-            sidx = fn_to_src.get(fn)
-            if sidx is None or sidx not in src_to_ts:
-                continue
-            ts = src_to_ts[sidx]
-            idx = int(np.argmin(np.abs(imu_ts - ts)))
-            g_imu = imu_acc[idx]
-            g_norm = float(np.linalg.norm(g_imu))
-            if not (8.0 <= g_norm <= 11.5):
-                continue
-            g_unit = g_imu / g_norm
-            ext = np.asarray(cam["extrinsic_3x4"], dtype=float).reshape(3, 4)
-            r_cw = ext[:, :3]
-            up_world = r_cw.T @ (r_cam_imu @ g_unit)
-            u_norm = float(np.linalg.norm(up_world))
-            if u_norm > 1e-6:
-                up_world_samples.append(up_world / u_norm)
+        best_up: np.ndarray | None = None
+        best_coherence = -1.0
+        for r_cam_imu in r_candidates:
+            up_world_samples: list[np.ndarray] = []
+            for cam in cams:
+                fn = str(cam.get("vggt_filename", ""))
+                sidx = fn_to_src.get(fn)
+                if sidx is None or sidx not in src_to_ts:
+                    continue
+                ts = src_to_ts[sidx]
+                idx = int(np.argmin(np.abs(imu_ts - ts)))
+                g_imu = imu_acc[idx]
+                g_norm = float(np.linalg.norm(g_imu))
+                if not (8.0 <= g_norm <= 11.5):
+                    continue
+                g_unit = g_imu / g_norm
+                ext = np.asarray(cam["extrinsic_3x4"], dtype=float).reshape(3, 4)
+                r_cw = ext[:, :3]
+                up_world = r_cw.T @ (r_cam_imu @ g_unit)
+                u_norm = float(np.linalg.norm(up_world))
+                if u_norm > 1e-6:
+                    up_world_samples.append(up_world / u_norm)
 
-        if len(up_world_samples) < 3:
-            return None
-        up_arr = np.asarray(up_world_samples, dtype=float)
-        med_up = np.median(up_arr, axis=0)
-        med_norm = float(np.linalg.norm(med_up))
-        if med_norm < 1e-6:
-            return None
-        return med_up / med_norm
+            if len(up_world_samples) < 3:
+                continue
+            up_arr = np.asarray(up_world_samples, dtype=float)
+            med_up = np.median(up_arr, axis=0)
+            med_norm = float(np.linalg.norm(med_up))
+            if med_norm < 1e-6:
+                continue
+            mean_norm = float(np.linalg.norm(np.mean(up_arr, axis=0)))
+            coherence = 0.5 * (med_norm + mean_norm)
+            if coherence > best_coherence + 0.03:
+                best_coherence = coherence
+                best_up = med_up / med_norm
+
+        npz_path = os.path.join(session_dir, "vggt", "project_point_cloud.npz")
+        if best_up is not None and os.path.isfile(npz_path):
+            try:
+                with np.load(npz_path) as npz_data:
+                    pts_npz = (
+                        np.asarray(npz_data["points"], dtype=float)
+                        if "points" in npz_data
+                        else np.empty((0, 3))
+                    )
+                if len(pts_npz) >= 500:
+                    _, refined_up, n_inl, _, _, _ = detect_floor_normal(
+                        pts_npz, reference_up=best_up, max_tilt_deg=42.0
+                    )
+                    if n_inl >= 200 and float(np.linalg.norm(refined_up)) > 1e-6:
+                        best_up = refined_up / float(np.linalg.norm(refined_up))
+            except Exception:
+                pass
+
+        return best_up
     except Exception:
         logger.debug("estimate_vggt_gravity_up failed for %s", session_dir, exc_info=True)
         return None
@@ -273,14 +307,15 @@ def detect_floor_normal(
             for wn, ww in zip(wall_normals, wall_weights):
                 W_mat += ww * np.outer(wn, wn)
             eigvals, eigvecs = np.linalg.eigh(W_mat)
-            ortho_up = eigvecs[:, 0]
-            if np.dot(ortho_up, ref_vec) < 0:
-                ortho_up = -ortho_up
-            ortho_up /= np.linalg.norm(ortho_up) + 1e-9
-            dot_val = float(np.clip(np.dot(ortho_up, ref_vec), -1.0, 1.0))
-            ortho_tilt = float(np.degrees(np.arccos(dot_val)))
-            if ortho_tilt <= 45.0:
-                chosen = (ortho_up, ortho_tilt, int(sum(wall_weights)))
+            if eigvals[1] > 0.10 * max(eigvals[2], 1e-9):
+                ortho_up = eigvecs[:, 0]
+                if np.dot(ortho_up, ref_vec) < 0:
+                    ortho_up = -ortho_up
+                ortho_up /= np.linalg.norm(ortho_up) + 1e-9
+                dot_val = float(np.clip(np.dot(ortho_up, ref_vec), -1.0, 1.0))
+                ortho_tilt = float(np.degrees(np.arccos(dot_val)))
+                if ortho_tilt <= 45.0:
+                    chosen = (ortho_up, ortho_tilt, int(sum(wall_weights)))
         if chosen is None:
             chosen = best_fallback_cand
 
@@ -458,7 +493,7 @@ def detect_manhattan_yaw(points: np.ndarray, up_axis: int = 2, max_sample: int =
         if len(slice_xy) >= 200:
             from app.services.occupancy_layout import estimate_manhattan_angle_bbox_sharpness
             sharp_info = estimate_manhattan_angle_bbox_sharpness(slice_xy)
-            yaw_sharp = -float(sharp_info.get("angle_deg", 0.0))
+            yaw_sharp = float(sharp_info.get("angle_deg", 0.0))
             if abs(yaw_sharp - yaw_norm) > 2.0:
                 def _bbox_area_at(ang_deg: float) -> float:
                     th = np.deg2rad(ang_deg)
@@ -509,17 +544,30 @@ def align_point_cloud_to_manhattan(
     target = np.array([0.0, 0.0, 1.0])
     if imu_up is not None:
         from app.services.occupancy_layout import estimate_manhattan_angle_bbox_sharpness
-        normal = imu_up / (np.linalg.norm(imu_up) + 1e-9)
+        _, normal_3d, inl_3d, _, _, _ = detect_floor_normal(
+            points, reference_up=imu_up, max_tilt_deg=42.0
+        )
+        if inl_3d >= 200 and float(np.linalg.norm(normal_3d)) > 1e-6:
+            normal = normal_3d / (np.linalg.norm(normal_3d) + 1e-9)
+            inliers = int(inl_3d)
+            max_sec_tilt = 2.0
+        else:
+            normal = imu_up / (np.linalg.norm(imu_up) + 1e-9)
+            inliers = len(points)
+            max_sec_tilt = 20.0
         up_axis, floor_tilt = angle_to_axis(normal)
-        inliers = len(points)
         level_rotation = rotation_from_vectors(normal, target)
         leveled = (points - center) @ level_rotation.T + center
+        yaw_deg = detect_manhattan_yaw(leveled, up_axis=2)
+        yaw_rotation = yaw_rotation_matrix(2, yaw_deg)
+        aligned = (leveled - center) @ yaw_rotation.T + center
         for ax in (0, 1):
-            info_ax = estimate_manhattan_angle_bbox_sharpness(leveled[:, [ax, 2]])
+            info_ax = estimate_manhattan_angle_bbox_sharpness(aligned[:, [ax, 2]])
             ang_a = float(info_ax.get("angle_deg", 0.0))
             if abs(ang_a) >= 45.0:
                 ang_a = ang_a - 90.0 if ang_a > 0 else ang_a + 90.0
-            if abs(ang_a) <= 15.0 and float(info_ax.get("bbox_area_improvement", 0.0)) >= 0.02:
+            impr_a = float(info_ax.get("bbox_area_improvement", 0.0))
+            if abs(ang_a) <= max_sec_tilt and impr_a >= 0.02:
                 rad = np.radians(ang_a)
                 ca, sa = float(np.cos(rad)), float(np.sin(rad))
                 R_a = (
@@ -527,18 +575,17 @@ def align_point_cloud_to_manhattan(
                     if ax == 0
                     else np.array([[1.0, 0.0, 0.0], [0.0, ca, -sa], [0.0, sa, ca]], dtype=float)
                 )
-                leveled = (leveled - center) @ R_a.T + center
-                level_rotation = R_a @ level_rotation
+                aligned = (aligned - center) @ R_a.T + center
+                yaw_rotation = R_a @ yaw_rotation
     else:
         up_axis, normal, inliers, candidates, floor_tilt, threshold = detect_floor_normal(
-            points, reference_up=reference_up, max_tilt_deg=15.0
+            points, reference_up=reference_up, max_tilt_deg=42.0
         )
         level_rotation = rotation_from_vectors(normal, target)
         leveled = (points - center) @ level_rotation.T + center
-
-    yaw_deg = detect_manhattan_yaw(leveled, up_axis=2)
-    yaw_rotation = yaw_rotation_matrix(2, yaw_deg)
-    aligned = (leveled - center) @ yaw_rotation.T + center
+        yaw_deg = detect_manhattan_yaw(leveled, up_axis=2)
+        yaw_rotation = yaw_rotation_matrix(2, yaw_deg)
+        aligned = (leveled - center) @ yaw_rotation.T + center
 
     # Shift floor plane to Z = 0.0
     floor_z = float(np.percentile(aligned[:, 2], 1.5))

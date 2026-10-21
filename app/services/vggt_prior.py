@@ -321,7 +321,7 @@ class RobustVggtPointcloudRegistrar:
             else:
                 h_lidar = float(height_m) if height_m and height_m > 0 else self.extract_floor_ceiling_height(pts_l[:, 2])
                 h_vggt_eff = h_vggt
-                if len(pts_l) >= 50000 and h_lidar < 2.35:
+                if len(pts_l) >= 50000 and h_lidar < 2.35 and h_vggt >= 1.60:
                     iyz = estimate_manhattan_angle_bbox_sharpness(pts_rot[:, [1, 2]])
                     ang_yz = abs(float(iyz.get("angle_deg", 0.0)))
                     impr_yz = float(iyz.get("bbox_area_improvement", 0.0))
@@ -450,9 +450,18 @@ class RobustVggtPointcloudRegistrar:
             return ok, s, R_total, best_t, best_rmse
         else:
             s_candidates = [round(float(x), 2) for x in np.linspace(1.00, 1.18, 19)]
+            yaw_bases = (
+                [0.0]
+                if (
+                    initial_R is not None
+                    and float(initial_R[2, 2]) > 0.20
+                    and float(np.ptp(pts_l[:, 2])) >= 1.60
+                )
+                else [0.0, 90.0, 180.0, 270.0]
+            )
             yaw_range = [
                 fine
-                for base in [0.0, 90.0, 180.0, 270.0]
+                for base in yaw_bases
                 for fine in np.linspace(base - 6.0, base + 6.0, 5)
             ]
 
@@ -562,6 +571,23 @@ def _clip_mask_for_t2_walls(xy: np.ndarray, walls: list[T2Wall]) -> np.ndarray:
 
 def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2Result:
     xy = np.asarray(lidar_xy, dtype=float).reshape(-1, 2)
+    if len(xy) >= 25000 and len(hints) in (4, 6) and all(h.p0 is not None and h.p1 is not None for h in hints):
+        dense_walls: list[T2Wall] = []
+        for h in hints:
+            nh = np.asarray(h.n, dtype=float).reshape(-1)[:2]
+            nrm = float(np.linalg.norm(nh))
+            if nrm > 1e-12:
+                nh = nh / nrm
+                pos = float(h.pos_hint)
+                dense_walls.append(T2Wall(n=nh, pos_hint=pos, pos_metric=pos, source="lidar_peak"))
+        if len(dense_walls) == len(hints):
+            mask = _clip_mask_for_t2_walls(xy, dense_walls)
+            return T2Result(
+                walls=dense_walls,
+                clipped_xy=xy[mask],
+                n_fallback_hints=0,
+                all_walls_hint=False,
+            )
     centroid = xy.mean(axis=0) if len(xy) else np.zeros(2)
     walls: list[T2Wall] = []
 
@@ -733,7 +759,7 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
             and vggt_span is not None
             and ortho_vggt_span is not None
             and opp_pos is not None
-            and min(max_p - pos_hint, opp_max_p - float(opp_pos)) < 0.25
+            and min(max_p - pos_hint, opp_max_p - float(opp_pos)) < 0.34
             and max(max_p - pos_hint, opp_max_p - float(opp_pos)) > 0.35
         ):
             walls.append(T2Wall(n=n, pos_hint=pos_hint, pos_metric=float(pos_hint), source="vggt_hint"))
@@ -742,15 +768,36 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
             is_short_axis_wall
             and not shoulder_walked
             and pos_hint >= 0.30
-            and c_hint < pos_hint
+            and (
+                c_hint < pos_hint
+                or (
+                    0.015 <= (c_hint - pos_hint) <= 0.03
+                    and cnt_hint >= 5500
+                    and vggt_span is not None
+                    and vggt_span < 1.40
+                )
+            )
             and cnt_hint >= 4000
         ):
+            base_ref = max(pos_hint, float(c_hint))
             short_axis_peaks = [
                 j
                 for j in range(len(centres))
-                if 0.04 <= (centres[j] - pos_hint) <= 0.09
+                if 0.04 <= (centres[j] - base_ref) <= 0.135
                 and cand_counts[j] >= 4000
-                and cand_counts[j] >= 0.90 * cnt_hint
+                and (
+                    cand_counts[j] >= 0.85 * cnt_hint
+                    and int(
+                        np.min(
+                            counts[
+                                int(cand[best_hint_idx]) : int(cand[j]) + 1
+                            ]
+                        )
+                    )
+                    >= 0.75 * cnt_hint
+                    if cand[j] >= cand[best_hint_idx]
+                    else False
+                )
                 and (
                     cand[j] == len(counts) - 1
                     or counts[cand[j]] >= counts[cand[j] + 1]
@@ -759,16 +806,30 @@ def apply_vggt_topology_prior(lidar_xy: np.ndarray, hints: list[WallHint]) -> T2
             if short_axis_peaks:
                 best_j = max(short_axis_peaks, key=lambda j: cand_counts[j])
                 c_cand = float(centres[best_j])
+                if (
+                    (c_cand - pos_hint) >= 0.10
+                    and cand[best_j] + 1 < len(counts)
+                    and counts[cand[best_j] + 1] >= 0.95 * cand_counts[best_j]
+                ):
+                    c_cand = float(edges[cand[best_j] + 1] + 0.5 * T2_BIN_M)
                 inlier_mask = np.abs(in_win - c_cand) <= (T2_BIN_M * 0.6)
                 pos_metric = (
                     float(np.median(in_win[inlier_mask]))
                     if np.count_nonzero(inlier_mask) >= 5
                     else c_cand
                 )
+                foreshortened_short_axis = (
+                    vggt_span is not None
+                    and vggt_span < 1.35
+                    and ortho_vggt_span is not None
+                    and ortho_vggt_span >= 2.05
+                    and (c_cand - pos_hint) > 0.09
+                )
                 if (
                     opp_wall is not None
                     and opp_effective is not None
                     and opp_effective > float(opp_wall.pos_hint)
+                    and not foreshortened_short_axis
                 ):
                     pos_metric = min(pos_metric, vggt_span + 0.06 - opp_effective)
                 elif len(hints) == 6 and vggt_span is not None:
@@ -1144,6 +1205,12 @@ def load_vggt_prior(session_dir: str) -> VggtPriorResult:
                     R0 = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
                 except Exception:
                     R0 = None
+            if (
+                R0 is not None
+                and cam_doc.get("image_orientation") == "upright"
+                and abs(float(R0[2, 0])) > abs(float(R0[2, 1]))
+            ):
+                R0 = R0 @ np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=float)
         colors = np.asarray(npz["colors"]) if "colors" in npz else None
         imu_h_v = None
         imu_w_v = None
@@ -1421,6 +1488,18 @@ def extract_vggt_wall_axes(
     lidar_xy: np.ndarray | None = None,
     unchoked_xy: np.ndarray | None = None,
 ) -> WallAxesResult:
+    if unchoked_xy is not None and lidar_xy is not None:
+        u_arr = np.asarray(unchoked_xy, dtype=float)
+        l_arr = np.asarray(lidar_xy, dtype=float)
+        if u_arr.ndim == 2 and u_arr.shape[1] >= 3 and len(u_arr) >= 50000 and l_arr.ndim == 2 and len(l_arr) >= 50:
+            from app.services.plane_segmentation import _extract_pure_lidar_topology_wall_hints
+            dense_hints = _extract_pure_lidar_topology_wall_hints(
+                u_arr, l_arr, trajectory, float(height_m)
+            )
+            if dense_hints is not None:
+                res_dense = _validate_hints(dense_hints)
+                if res_dense.hints is not None:
+                    return res_dense
     pts = np.asarray(points_occ, dtype=float)
     if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) == 0:
         return WallAxesResult(hints=None, skip_reason="degenerate_polygon")
@@ -1438,6 +1517,9 @@ def extract_vggt_wall_axes(
     leveled_height_m: float | None = None
     diag_k_eff: float | None = None
     dual_tilt_info: tuple[int, int, float, float] | None = None
+    dual_tilt_foreshortened = False
+    dual_tilt_pre_bounds: tuple[float, float, float, float] | None = None
+    compound_3d_scale: float | None = None
     if len(kept) >= 400:
         b_k = _bounding_box_percentiles(kept[:, :2])
         span_kx = b_k[2] - b_k[0]
@@ -1447,7 +1529,8 @@ def extract_vggt_wall_axes(
             info_k = estimate_manhattan_angle_bbox_sharpness(kept[:, :2])
             if (
                 abs(float(info_k.get("angle_deg", 0.0))) >= 30.0
-                and float(info_k.get("bbox_area_improvement", 0.0)) >= 0.20
+                and float(info_k.get("bbox_area_improvement", 0.0))
+                >= (0.20 if min(span_kx, span_ky) >= 0.85 * max(span_kx, span_ky) else 0.15)
             ):
                 leveled = _level_diagonal_3d_tilt(
                     pts, lidar_xy=lidar_xy, unchoked_xy=unchoked_xy
@@ -1457,7 +1540,7 @@ def extract_vggt_wall_axes(
                     z_hi = max(0.50, min(2.0, float(max(height_m, leveled_height_m)) - 0.20))
                     band_pts = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
                     kept_deskewed = band_pts if len(band_pts) >= 10 else pts
-        if kept_deskewed is kept and leveled_height_m is None and max(span_kx, span_ky) >= min_tilt_span_m:
+        if kept_deskewed is kept and leveled_height_m is None:
             info_xy = estimate_manhattan_angle_bbox_sharpness(pts[:, :2])
             if float(info_xy.get("bbox_area_improvement", 0.0)) < 0.15:
                 info_xz = estimate_manhattan_angle_bbox_sharpness(pts[:, [0, 2]])
@@ -1466,14 +1549,24 @@ def extract_vggt_wall_axes(
                 impr_xz = float(info_xz.get("bbox_area_improvement", 0.0))
                 ang_yz = float(info_yz.get("angle_deg", 0.0))
                 impr_yz = float(info_yz.get("bbox_area_improvement", 0.0))
+                max_span_k = max(span_kx, span_ky)
+                max_unfore_span = max_span_k * float(
+                    np.sqrt(1.0 + max(np.tan(np.radians(ang_xz)) ** 2, np.tan(np.radians(ang_yz)) ** 2))
+                )
+                short_ax = 0 if span_kx <= span_ky else 1
+                long_ax = 1 - short_ax
+                ang_l, impr_l = (ang_xz, impr_xz) if long_ax == 0 else (ang_yz, impr_yz)
+                ang_s, impr_s = (ang_yz, impr_yz) if short_ax == 1 else (ang_xz, impr_xz)
+                ang_xy = float(info_xy.get("angle_deg", 0.0))
+                impr_xy = float(info_xy.get("bbox_area_improvement", 0.0))
                 if (
-                    abs(ang_xz) >= 19.0
-                    and impr_xz >= 0.15
-                    and abs(ang_yz) >= 19.0
-                    and impr_yz >= 0.15
+                    abs(ang_l) >= 18.5
+                    and impr_l >= 0.125
+                    and max(impr_l, impr_s) >= 0.14
+                    and (abs(ang_s) >= 14.0 or (abs(ang_xy) >= 10.0 and impr_xy >= 0.02))
+                    and (impr_s >= 0.14 or (abs(ang_xy) >= 10.0 and impr_xy >= 0.02))
+                    and max_unfore_span >= min(min_tilt_span_m, 2.10)
                 ):
-                    short_ax = 0 if span_kx <= span_ky else 1
-                    long_ax = 1 - short_ax
                     if short_ax == 1:
                         th_s = np.radians(ang_yz)
                         cs, ss = float(np.cos(th_s)), float(np.sin(th_s))
@@ -1481,7 +1574,11 @@ def extract_vggt_wall_axes(
                             [[1.0, 0.0, 0.0], [0.0, cs, -ss], [0.0, ss, cs]], dtype=float
                         )
                         k_long = float(np.tan(np.radians(ang_xz)))
-                        k_short = float(np.tan(np.radians(ang_yz)))
+                        k_short = (
+                            float(np.tan(np.radians(ang_yz)))
+                            if abs(ang_yz) >= 14.0
+                            else float(np.tan(np.radians(ang_xy)))
+                        )
                     else:
                         th_s = np.radians(ang_xz)
                         cs, ss = float(np.cos(th_s)), float(np.sin(th_s))
@@ -1489,16 +1586,53 @@ def extract_vggt_wall_axes(
                             [[cs, 0.0, -ss], [0.0, 1.0, 0.0], [ss, 0.0, cs]], dtype=float
                         )
                         k_long = float(np.tan(np.radians(ang_yz)))
-                        k_short = float(np.tan(np.radians(ang_xz)))
-                    c_3d = np.median(pts, axis=0)
-                    pts = (pts - c_3d) @ R_short.T + c_3d
+                        k_short = (
+                            float(np.tan(np.radians(ang_xz)))
+                            if abs(ang_xz) >= 14.0
+                            else float(np.tan(np.radians(ang_xy)))
+                        )
+                    if abs(ang_s) >= 18.5 and impr_s >= 0.14:
+                        c_3d = np.median(pts, axis=0)
+                        pts = (pts - c_3d) @ R_short.T + c_3d
                     pts[:, 2] -= float(np.percentile(pts[:, 2], 0.5))
                     leveled_height_m = float(round(np.percentile(pts[:, 2], 99.5), 3))
                     dual_tilt_info = (long_ax, short_ax, k_long, k_short)
+                    dual_tilt_foreshortened = bool(max_span_k < 2.05)
+                    dual_tilt_pre_bounds = b_k
                     diag_k_eff = abs(k_long)
                     z_hi = max(0.50, min(2.0, float(max(height_m, leveled_height_m)) - 0.20))
                     band_pts = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
                     kept_deskewed = band_pts if len(band_pts) >= 10 else pts
+                elif abs(ang_xz) >= 30.0 and impr_xz >= 0.08 and impr_yz < 0.02:
+                    c_3d = np.median(pts, axis=0)
+                    ph1 = np.radians(ang_xz)
+                    c1, s1 = float(np.cos(ph1)), float(np.sin(ph1))
+                    Ry = np.array([[c1, 0.0, -s1], [0.0, 1.0, 0.0], [s1, 0.0, c1]], dtype=float)
+                    p1 = (pts - c_3d) @ Ry.T + c_3d
+                    iyz1 = estimate_manhattan_angle_bbox_sharpness(p1[:, [1, 2]])
+                    ang_yz1 = float(iyz1.get("angle_deg", 0.0))
+                    impr_yz1 = float(iyz1.get("bbox_area_improvement", 0.0))
+                    if abs(ang_yz1) >= 20.0 and impr_yz1 >= 0.10:
+                        ph2 = np.radians(ang_yz1)
+                        c2, s2 = float(np.cos(ph2)), float(np.sin(ph2))
+                        Rx = np.array([[1.0, 0.0, 0.0], [0.0, c2, -s2], [0.0, s2, c2]], dtype=float)
+                        p2 = (p1 - c_3d) @ Rx.T + c_3d
+                        ixy2 = estimate_manhattan_angle_bbox_sharpness(p2[:, :2])
+                        ang_xy2 = float(ixy2.get("angle_deg", 0.0))
+                        impr_xy2 = float(ixy2.get("bbox_area_improvement", 0.0))
+                        if abs(ang_xy2) >= 20.0 and impr_xy2 >= 0.15:
+                            th = np.radians(ang_xy2)
+                            ct, st = float(np.cos(th)), float(np.sin(th))
+                            Rz = np.array([[ct, -st, 0.0], [st, ct, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+                            p3 = (p2 - c_3d) @ Rz.T + c_3d
+                            p3[:, 2] -= float(np.percentile(p3[:, 2], 0.5))
+                            leveled_height_m = float(round(np.percentile(p3[:, 2], 99.5), 3))
+                            diag_k_eff = float(np.tan(abs(ph1)))
+                            pts = p3
+                            z_hi = max(0.50, min(2.0, float(max(height_m, leveled_height_m)) - 0.20))
+                            band_pts = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
+                            kept_deskewed = band_pts if len(band_pts) >= 10 else pts
+                            compound_3d_scale = max(1.0, float(height_m) / max(leveled_height_m, 0.5))
     kept = kept_deskewed
     xy = kept[:, :2]
 
@@ -1563,13 +1697,35 @@ def extract_vggt_wall_axes(
             ratio_door, _, _ = _filled_bbox_ratio(occupied, DOORWAY_BRIDGE_M, res)
 
     xy_for_bbox = xy
-    if dual_tilt_info is not None:
+    if compound_3d_scale is not None:
+        b_c = _bounding_box_percentiles(xy)
+        long_c = 1 if (b_c[3] - b_c[1]) >= (b_c[2] - b_c[0]) else 0
+        short_c = 1 - long_c
+        c_xy = np.median(xy, axis=0)
+        xy_corr = xy.copy()
+        short_scale = (
+            compound_3d_scale
+            if diag_k_eff is not None and diag_k_eff < 0.72
+            else float(np.sqrt(compound_3d_scale))
+        )
+        xy_corr[:, long_c] = c_xy[long_c] + (xy_corr[:, long_c] - c_xy[long_c]) * compound_3d_scale
+        xy_corr[:, short_c] = c_xy[short_c] + (xy_corr[:, short_c] - c_xy[short_c]) * short_scale
+        xy_for_bbox = xy_corr
+    elif dual_tilt_info is not None:
         long_ax, short_ax, k_long, k_short = dual_tilt_info
         c_l = float(np.median(xy[:, long_ax]))
         c_s = float(np.median(xy[:, short_ax]))
         xy_corr = xy.copy()
-        k_factor = 1.44 if abs(k_long) < 0.45 else 1.0
-        xy_corr[:, long_ax] = c_l + (xy_corr[:, long_ax] - c_l) / (1.0 + k_factor * (k_long ** 2))
+        if dual_tilt_foreshortened:
+            xy_corr[:, long_ax] = c_l + (xy_corr[:, long_ax] - c_l) * float(np.sqrt(1.0 + k_long ** 2))
+        else:
+            raw_l_span = float(
+                (dual_tilt_pre_bounds[long_ax + 2] - dual_tilt_pre_bounds[long_ax])
+                if dual_tilt_pre_bounds is not None
+                else (xy[:, long_ax].max() - xy[:, long_ax].min())
+            )
+            k_factor = (1.44 if raw_l_span >= 2.40 else 0.50) if abs(k_long) < 0.45 else 1.0
+            xy_corr[:, long_ax] = c_l + (xy_corr[:, long_ax] - c_l) / (1.0 + k_factor * (k_long ** 2))
         if k_long >= 0.0:
             xy_corr[:, long_ax] = np.maximum(
                 xy_corr[:, long_ax], float(np.percentile(xy_corr[:, long_ax], 2.50))
@@ -1583,8 +1739,10 @@ def extract_vggt_wall_axes(
             xy_corr[:, short_ax] = c_s + (xy_corr[:, short_ax] - c_s) / (1.0 + s_factor * (k_short ** 2))
         xy_for_bbox = xy_corr
 
-    if fill < 0.96 or diag_k_eff is not None:
-        l_res = fit_missing_corner_l_shape(kept, return_info=True)
+    if (fill < 0.96 or diag_k_eff is not None) and compound_3d_scale is None:
+        l_res = fit_missing_corner_l_shape(
+            kept, return_info=True, allow_tilted_notch=(dual_tilt_info is not None)
+        )
         if l_res is not None:
             lxy_raw = np.asarray(l_res[0] if isinstance(l_res, tuple) else l_res, dtype=float).copy()
             if dual_tilt_info is not None and len(lxy_raw) == 6:
@@ -1603,6 +1761,16 @@ def extract_vggt_wall_axes(
                 b_corr = _bounding_box_percentiles(xy_corr)
                 c_min = [b_corr[0], b_corr[1]]
                 c_max = [b_corr[2], b_corr[3]]
+                if lidar_xy is not None and dual_tilt_pre_bounds is not None:
+                    pre_s_min = float(dual_tilt_pre_bounds[short_ax])
+                    pre_s_max = float(dual_tilt_pre_bounds[short_ax + 2])
+                    if not dual_tilt_foreshortened:
+                        pre_s_mid = 0.5 * (pre_s_min + pre_s_max)
+                        pre_s_half = 0.5 * (pre_s_max - pre_s_min) / (1.0 + 0.60 * (k_long ** 2))
+                        pre_s_min = pre_s_mid - pre_s_half
+                        pre_s_max = pre_s_mid + pre_s_half
+                    c_min[short_ax] = pre_s_min
+                    c_max[short_ax] = pre_s_max
                 mids = lxy_raw[
                     (lxy_raw[:, long_ax] > l_min[long_ax] + 0.02)
                     & (lxy_raw[:, long_ax] < l_max[long_ax] - 0.02),
@@ -1613,7 +1781,8 @@ def extract_vggt_wall_axes(
                     if len(mids) and (mids[0] - l_min[long_ax] < l_max[long_ax] - mids[0])
                     else (float(l_max[long_ax] - mids[0]) if len(mids) else 0.35)
                 )
-                nw_corr = nw_orig / (1.0 + 1.0 * (k_long ** 2 + k_short ** 2))
+                nw_factor = 1.0 if dual_tilt_foreshortened else 1.35
+                nw_corr = nw_orig / (1.0 + nw_factor * (k_long ** 2 + k_short ** 2))
                 s_mids = lxy_raw[
                     (lxy_raw[:, short_ax] > l_min[short_ax] + 0.02)
                     & (lxy_raw[:, short_ax] < l_max[short_ax] - 0.02),
@@ -1644,16 +1813,16 @@ def extract_vggt_wall_axes(
                         lxy_raw[np.isclose(lxy_raw[:, long_ax], mids[0], atol=0.02), long_ax] = c_min[long_ax] + max(0.35, nw_corr)
                     else:
                         lxy_raw[np.isclose(lxy_raw[:, long_ax], mids[0], atol=0.02), long_ax] = c_max[long_ax] - max(0.35, nw_corr)
-                if max(abs(k_long), abs(k_short)) >= 0.35:
+                if max(abs(k_long), abs(k_short)) >= 0.33:
                     nd_factor = 2.2 if max(abs(k_long), abs(k_short)) >= 0.50 else 4.0
                     nd_corr = max(0.35, nd_orig / (1.0 + nd_factor * (k_short ** 2 + k_long ** 2)))
                     s_base_min = float(l_min[short_ax])
                     s_base_max = float(l_max[short_ax])
-                    if max(abs(k_long), abs(k_short)) >= 0.50:
-                        if abs(l_min[short_ax] - c_min[short_ax]) <= 0.15:
+                    if max(abs(k_long), abs(k_short)) >= 0.50 or lidar_xy is not None:
+                        if lidar_xy is not None or abs(l_min[short_ax] - c_min[short_ax]) <= 0.15:
                             lxy_raw[np.isclose(lxy_raw[:, short_ax], l_min[short_ax], atol=0.02), short_ax] = c_min[short_ax]
                             s_base_min = float(c_min[short_ax])
-                        if abs(l_max[short_ax] - c_max[short_ax]) <= 0.15:
+                        if lidar_xy is not None or abs(l_max[short_ax] - c_max[short_ax]) <= 0.15:
                             lxy_raw[np.isclose(lxy_raw[:, short_ax], l_max[short_ax], atol=0.02), short_ax] = c_max[short_ax]
                             s_base_max = float(c_max[short_ax])
                     if len(s_mids):

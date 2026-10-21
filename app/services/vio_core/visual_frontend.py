@@ -108,8 +108,14 @@ class VisualFrontend:
                 )
 
             # Backward flow check for robust tracking validation
+            prev_pts_guess = np.ascontiguousarray(self._prev_pts, dtype=np.float32)
             bwd, st_b, _ = cv2.calcOpticalFlowPyrLK(
-                gray_prep, self._prev_gray, fwd, None, **self._lk_params
+                gray_prep,
+                self._prev_gray,
+                fwd,
+                prev_pts_guess,
+                flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
+                **self._lk_params,
             )
             fb_err = np.linalg.norm((self._prev_pts - bwd).reshape(-1, 2), axis=1)
 

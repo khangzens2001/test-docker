@@ -566,6 +566,15 @@ def run_multisensor_pipeline(session_dir: str, batch_id: str, job_id: str, out_d
     if not result.success:
         raise RuntimeError(f"Multi-sensor pipeline execution failed: {result.error_message}")
 
+    if os.path.abspath(session_dir) != os.path.abspath(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+        for fname in os.listdir(session_dir):
+            if fname.endswith((".ply", ".glb", ".json", ".png", ".pdf", ".dxf")):
+                src_f = os.path.join(session_dir, fname)
+                dst_f = os.path.join(out_dir, fname)
+                if os.path.isfile(src_f):
+                    shutil.copy2(src_f, dst_f)
+
     object_prefix = f"{safe_object_part(batch_id)}/{job_id}"
 
     clean_ply_candidates = [

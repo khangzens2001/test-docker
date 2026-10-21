@@ -116,15 +116,30 @@ def keep_largest_occupancy_component(
     opened = cv2.morphologyEx(
         grid, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     )
+    used_close_fallback = False
     if np.sum(opened) < 0.25 * np.sum(grid):
         opened = cv2.morphologyEx(
             grid, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         )
+        used_close_fallback = True
     nlab, labels, stats, _ = cv2.connectedComponentsWithStats(opened, 8)
     if nlab <= 1:
         return np.zeros((0, 3), dtype=float)
     areas = stats[1:, cv2.CC_STAT_AREA]
     max_area = float(np.max(areas))
+    if (
+        not used_close_fallback
+        and np.sum(opened) < 0.48 * np.sum(grid)
+        and max_area < 0.18 * float(np.sum(opened))
+    ):
+        opened = cv2.morphologyEx(
+            grid, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        )
+        nlab, labels, stats, _ = cv2.connectedComponentsWithStats(opened, 8)
+        if nlab <= 1:
+            return np.zeros((0, 3), dtype=float)
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        max_area = float(np.max(areas))
     valid_labels = [i + 1 for i, a in enumerate(areas) if a >= 0.15 * max_area or a >= 200]
     if trajectory is not None:
         t_arr = np.asarray(trajectory, dtype=float)
@@ -661,12 +676,17 @@ def estimate_manhattan_angle_bbox_sharpness(
 
     # Stage 1: Coarse search [-45°, +45°] with 1.0° step (91 angles)
     coarse_angles = np.arange(-45.0, 45.0001, 1.0)
-    if n_pts > 4000:
+    is_wide_cloud = max(float(ptp[0]), float(ptp[1])) >= 3.00
+    if n_pts > 4000 and not is_wide_cloud:
         x0_c = np.ascontiguousarray(x0[:, ::2])
         y0_c = np.ascontiguousarray(y0[:, ::2])
     else:
         x0_c, y0_c = x0, y0
-    coarse_scores, _, _, _, _ = _eval_angles_batch(coarse_angles, x0_c, y0_c)
+    coarse_scores, _, coarse_sharp, _, _ = _eval_angles_batch(coarse_angles, x0_c, y0_c)
+    if is_wide_cloud:
+        valid_c = np.abs(coarse_angles) <= 40.0
+        if np.any(valid_c):
+            coarse_scores = np.where(valid_c, coarse_scores, -1e9)
     best_coarse_idx = int(np.argmax(coarse_scores))
     theta_coarse = float(coarse_angles[best_coarse_idx])
 
@@ -712,7 +732,10 @@ def estimate_manhattan_angle_bbox_sharpness(
         # Sharpness Gate: if large rotation (|best_angle| >= 10.0°) degrades projection sharpness
         # compared to 0.0° unrotated baseline, the score is dominated by a diagonal bounding box
         # shrinkage artifact rather than true wall alignment. Reject and revert to 0.0°.
-        if abs(best_angle) >= 10.0 and final_sharp < base_sharpness:
+        sharp_gate_mult = 0.985 if is_wide_cloud else 1.0
+        if (abs(best_angle) >= 10.0 and final_sharp < sharp_gate_mult * base_sharpness) or (
+            final_area > base_area and final_sharp <= base_sharpness
+        ):
             best_angle = 0.0
             final_score = base_score
             final_area = base_area
@@ -1141,7 +1164,15 @@ def choke_doorway_tails(
                     return pts_clip, info_clip
                 return pts, info
             reduction = max(pre[0] - post[0], pre[1] - post[1])
-            if reduction >= MIN_CHOKE_BBOX_REDUCTION_M:
+            if neck is None and nlab > 1 and max(pre) >= 3.10 and min(pre) <= 2.85:
+                min_red = 0.12
+            elif neck is None and max(pre) <= 2.55 and cavity_area_m2 < 3.30 and discarded_cavity_ratio > 0.08:
+                min_red = 0.60
+            elif neck is None and max(pre) < 2.70 and discarded_cavity_ratio > 0.08:
+                min_red = 0.28
+            else:
+                min_red = MIN_CHOKE_BBOX_REDUCTION_M
+            if reduction >= min_red:
                 if trajectory is not None:
                     traj_arr = np.asarray(trajectory, dtype=float)
                     if traj_arr.ndim == 2 and len(traj_arr) > 0 and traj_arr.shape[1] >= 2:
@@ -1691,7 +1722,7 @@ def fit_orthogonal_ngon(points_xy: np.ndarray) -> np.ndarray | None:
 
 
 def fit_missing_corner_l_shape(
-    points_xy: np.ndarray, *, return_info: bool = False
+    points_xy: np.ndarray, *, return_info: bool = False, allow_tilted_notch: bool = False
 ) -> np.ndarray | tuple[np.ndarray, float] | None:
     pts_arr = np.asarray(points_xy, dtype=float)
     if pts_arr.ndim != 2 or pts_arr.shape[1] < 2 or len(pts_arr) < 6:
@@ -1756,7 +1787,12 @@ def fit_missing_corner_l_shape(
     _line_cache = {}
 
     notch_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (NOTCH_OPEN_PX, NOTCH_OPEN_PX))
-    support_open = cv2.morphologyEx(support, cv2.MORPH_OPEN, notch_kernel)
+    support_for_open = (
+        cv2.morphologyEx(support, cv2.MORPH_CLOSE, notch_kernel)
+        if 35000 <= len(pts_arr) < 140000
+        else support
+    )
+    support_open = cv2.morphologyEx(support_for_open, cv2.MORPH_OPEN, notch_kernel)
     integral_open = cv2.integral((support_open > 0).astype(np.uint8))
     integral_dilated = cv2.integral((dilated > 0).astype(np.uint8))
     integral_support = cv2.integral((support > 0).astype(np.uint8))
@@ -1997,41 +2033,66 @@ def fit_missing_corner_l_shape(
                             & (p2d[:, 1] >= my0_m - 0.05)
                             & (p2d[:, 1] <= my1_m + 0.05)
                         ]
-                        if len(sub_h) < 30 or len(sub_v) < 30:
-                            continue
-                        z_h = sub_h[:, 2]
-                        z_v = sub_v[:, 2]
-                        if (
-                            float(np.percentile(z_h, 90)) < 1.35
-                            or float(np.percentile(z_v, 90)) < 1.35
-                            or float(np.percentile(z_h, 90) - np.percentile(z_h, 10)) < 0.50
-                            or float(np.percentile(z_v, 90) - np.percentile(z_v, 10)) < 0.50
-                        ):
-                            continue
-                        xh_raw = sub_h[:, 0]
-                        yv_raw = sub_v[:, 1]
-                        nw_m = mx1_m - mx0_m
-                        nh_m = my1_m - my0_m
-                        if (
-                            float(np.percentile(xh_raw, 90) - np.percentile(xh_raw, 10)) < 0.38 * nw_m
-                            or float(np.percentile(yv_raw, 90) - np.percentile(yv_raw, 10)) < 0.38 * nh_m
-                        ):
-                            continue
-                        xh = (
-                            xh_raw - np.polyval(np.polyfit(z_h, xh_raw, 1), z_h)
-                            if float(np.std(z_h)) >= 0.05
-                            else xh_raw
-                        )
-                        yv = (
-                            yv_raw - np.polyval(np.polyfit(z_v, yv_raw, 1), z_v)
-                            if float(np.std(z_v)) >= 0.05
-                            else yv_raw
-                        )
-                        r_h = float(np.percentile(xh, 90) - np.percentile(xh, 10)) / max(nw_m, 1e-6)
-                        r_v = float(np.percentile(yv, 90) - np.percentile(yv, 10)) / max(nh_m, 1e-6)
-                        r_short = r_h if nw_m <= nh_m else r_v
-                        if r_short < 0.35 or max(r_h, r_v) < 0.50:
-                            continue
+                        narrow_ok = False
+                        if len(sub_h) >= 30 and len(sub_v) >= 30:
+                            z_h = sub_h[:, 2]
+                            z_v = sub_v[:, 2]
+                            if (
+                                float(np.percentile(z_h, 90)) >= 1.35
+                                and float(np.percentile(z_v, 90)) >= 1.35
+                                and float(np.percentile(z_h, 90) - np.percentile(z_h, 10)) >= 0.50
+                                and float(np.percentile(z_v, 90) - np.percentile(z_v, 10)) >= 0.50
+                            ):
+                                xh_raw = sub_h[:, 0]
+                                yv_raw = sub_v[:, 1]
+                                nw_m = mx1_m - mx0_m
+                                nh_m = my1_m - my0_m
+                                if (
+                                    float(np.percentile(xh_raw, 90) - np.percentile(xh_raw, 10)) >= 0.38 * nw_m
+                                    and float(np.percentile(yv_raw, 90) - np.percentile(yv_raw, 10)) >= 0.38 * nh_m
+                                ):
+                                    xh = (
+                                        xh_raw - np.polyval(np.polyfit(z_h, xh_raw, 1), z_h)
+                                        if float(np.std(z_h)) >= 0.05
+                                        else xh_raw
+                                    )
+                                    yv = (
+                                        yv_raw - np.polyval(np.polyfit(z_v, yv_raw, 1), z_v)
+                                        if float(np.std(z_v)) >= 0.05
+                                        else yv_raw
+                                    )
+                                    r_h = float(np.percentile(xh, 90) - np.percentile(xh, 10)) / max(nw_m, 1e-6)
+                                    r_v = float(np.percentile(yv, 90) - np.percentile(yv, 10)) / max(nh_m, 1e-6)
+                                    r_short = r_h if nw_m <= nh_m else r_v
+                                    if r_short >= 0.35 and max(r_h, r_v) >= 0.50:
+                                        narrow_ok = True
+                        if not narrow_ok:
+                            if not allow_tilted_notch:
+                                continue
+                            sub_h_tilt = pts_arr[
+                                (np.abs(p2d[:, 1] - y_mid_m) <= 0.35)
+                                & (p2d[:, 0] >= mx0_m - 0.15)
+                                & (p2d[:, 0] <= mx1_m + 0.15)
+                            ]
+                            sub_v_tilt = pts_arr[
+                                (np.abs(p2d[:, 0] - x_mid_m) <= 0.35)
+                                & (p2d[:, 1] >= my0_m - 0.15)
+                                & (p2d[:, 1] <= my1_m + 0.15)
+                            ]
+                            if len(sub_h_tilt) < 30 or len(sub_v_tilt) < 30:
+                                continue
+                            zh_t = sub_h_tilt[:, 2]
+                            zv_t = sub_v_tilt[:, 2]
+                            zh90_t = float(np.percentile(zh_t, 90))
+                            zv90_t = float(np.percentile(zv_t, 90))
+                            zh_span_t = float(zh90_t - np.percentile(zh_t, 10))
+                            zv_span_t = float(zv90_t - np.percentile(zv_t, 10))
+                            if (
+                                max(zh90_t, zv90_t) < 1.55
+                                or min(zh90_t, zv90_t) < 0.45
+                                or max(zh_span_t, zv_span_t) < 0.90
+                            ):
+                                continue
 
                     best = (score, poly, edge_support)
 
