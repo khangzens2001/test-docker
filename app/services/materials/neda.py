@@ -152,6 +152,20 @@ def _estimate_battens_single(
                 intersection, orientation, batten_width_mm
             )
             if segments:
+                # Deduct corner intersections on secondary axis to prevent double-counting
+                is_secondary = (
+                    (orientation == "vertical" and abs(edge_vec[0]) > abs(edge_vec[1]))
+                    or (orientation == "horizontal" and abs(edge_vec[1]) > abs(edge_vec[0]))
+                )
+                if is_secondary:
+                    corner_deduct = 2.0 * batten_width_mm
+                    s_len = max(0.0, s_len - corner_deduct)
+                    if len(segments) == 1:
+                        segments[0]["length"] = max(0.0, float(segments[0].get("length", 0.0)) - corner_deduct)
+                    else:
+                        segments[0]["length"] = max(0.0, float(segments[0].get("length", 0.0)) - batten_width_mm)
+                        segments[-1]["length"] = max(0.0, float(segments[-1].get("length", 0.0)) - batten_width_mm)
+
                 if orientation == "vertical":
                     pos = float((p1[0] + p2[0]) / 2.0)
                 else:

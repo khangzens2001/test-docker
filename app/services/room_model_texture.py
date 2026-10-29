@@ -136,6 +136,45 @@ def export_room_model_texture_glb(
             p_w = (R_grav.T @ p_g.T).T
             return p_w
 
+        def world_to_layout(pts_world: np.ndarray) -> np.ndarray:
+            p_w = np.asarray(pts_world, dtype=float)
+            p_g = (R_grav @ p_w.T).T
+            p_l = (R_level @ p_g.T).T + t_level
+            p_lay = np.empty_like(p_l)
+            p_lay[:, :2] = (R_ff @ p_l[:, :2].T).T + t_ff
+            p_lay[:, 2] = p_l[:, 2]
+            return p_lay
+
+        def _check_occlusion(C_xy: np.ndarray, P_xy: np.ndarray, wall_idx: int, xy_poly: np.ndarray) -> np.ndarray:
+            n_w = len(xy_poly)
+            if n_w < 4 or len(P_xy) == 0:
+                return np.zeros(len(P_xy), dtype=bool)
+            occluded = np.zeros(len(P_xy), dtype=bool)
+            d = P_xy - C_xy[None, :]
+            for j in range(n_w):
+                if j == wall_idx:
+                    continue
+                A_j = xy_poly[j]
+                B_j = xy_poly[(j + 1) % n_w]
+                s = B_j - A_j
+                delta = A_j - C_xy
+                det = d[:, 0] * s[1] - d[:, 1] * s[0]
+                non_par = np.abs(det) > 1e-7
+                if not np.any(non_par):
+                    continue
+                t = np.zeros(len(P_xy), dtype=float)
+                u = np.zeros(len(P_xy), dtype=float)
+                t[non_par] = (delta[0] * s[1] - delta[1] * s[0]) / det[non_par]
+                u[non_par] = (delta[0] * d[non_par, 1] - delta[1] * d[non_par, 0]) / det[non_par]
+                is_adj = (j == (wall_idx - 1) % n_w) or (j == (wall_idx + 1) % n_w)
+                u_min = 0.03 if is_adj else 0.001
+                u_max = 0.97 if is_adj else 0.999
+                hit = non_par & (t > 0.02) & (t < 0.98) & (u >= u_min) & (u <= u_max)
+                occluded |= hit
+                if np.all(occluded):
+                    break
+            return occluded
+
         manifest_data = None
         manifest_path = os.path.join(session_dir, "manifest.json")
         if os.path.isfile(manifest_path):
@@ -146,16 +185,40 @@ def export_room_model_texture_glb(
             except Exception:
                 manifest_data = None
         _, _, rot_deg = extract_lidar_display_metadata(manifest_data)
-        R_dc = (
-            _display_to_camera_sensor_rotation(rot_deg)
-            if pose_df.attrs.get("pose_source") == "server_vio"
-            else np.eye(3)
-        )
+
+        calib_w = None
+        calib_h = None
+        if manifest_data:
+            calib_w = (
+                manifest_data.get("calibration_width")
+                or manifest_data.get("calibration_image_width")
+                or manifest_data.get("rgb_width")
+                or (manifest_data.get("streams", {}).get("rgb", {}).get("width") if isinstance(manifest_data.get("streams"), dict) else None)
+            )
+            calib_h = (
+                manifest_data.get("calibration_height")
+                or manifest_data.get("calibration_image_height")
+                or manifest_data.get("rgb_height")
+                or (manifest_data.get("streams", {}).get("rgb", {}).get("height") if isinstance(manifest_data.get("streams"), dict) else None)
+            )
+        if calib_w is None or calib_h is None:
+            calib_w = 2.0 * float(K[0, 2]) if K[0, 2] > 10 else None
+            calib_h = 2.0 * float(K[1, 2]) if K[1, 2] > 10 else None
+
+        convention = pose_df.attrs.get("camera_frame_convention")
+        if convention == "sensor_opencv" or pose_df.attrs.get("pose_source") == "server_vio":
+            R_dc = np.eye(3)
+        else:
+            R_dc = (
+                _display_to_camera_sensor_rotation(rot_deg)
+                if rot_deg is not None
+                else np.eye(3)
+            )
 
         # Gather all valid camera poses
         all_keyframes = []
         for idx, row in pose_df.iterrows():
-            fn = int(row["frame"])
+            fn = int(row["frame"]) if "frame" in row else int(row.get("frame_index", idx))
             rgb_file = os.path.join(session_dir, "rgb", f"{fn:06d}.jpg")
             if not os.path.isfile(rgb_file):
                 rgb_file = resolve_keyframe_rgb_path(session_dir, {"frame": fn}) or ""
@@ -244,6 +307,17 @@ def export_room_model_texture_glb(
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
                 im_h, im_w = img_rgb.shape[:2]
 
+                # Scale camera intrinsics if calibration resolution differs from loaded image resolution
+                K_use = K.copy()
+                if calib_w is not None and calib_h is not None and calib_w > 0 and calib_h > 0:
+                    if abs(float(calib_w) - float(im_w)) > 2.0 or abs(float(calib_h) - float(im_h)) > 2.0:
+                        sx = float(im_w) / float(calib_w)
+                        sy = float(im_h) / float(calib_h)
+                        K_use[0, 0] *= sx
+                        K_use[0, 2] *= sx
+                        K_use[1, 1] *= sy
+                        K_use[1, 2] *= sy
+
                 D = cam["t"] - pts_w
                 dist = np.linalg.norm(D, axis=1)
                 cos_a = np.sum(D * N_w, axis=1) / (dist + 1e-6)
@@ -258,8 +332,8 @@ def export_room_model_texture_glb(
 
                 idx_pts = np.where(valid_a)[0][in_front]
                 p_c = p_cam[in_front]
-                u = K[0, 0] * p_c[:, 0] / p_c[:, 2] + K[0, 2]
-                v = K[1, 1] * p_c[:, 1] / p_c[:, 2] + K[1, 2]
+                u = K_use[0, 0] * p_c[:, 0] / p_c[:, 2] + K_use[0, 2]
+                v = K_use[1, 1] * p_c[:, 1] / p_c[:, 2] + K_use[1, 2]
 
                 in_bounds = (u >= 8) & (u < im_w - 8) & (v >= 8) & (v < im_h - 8)
                 if not np.any(in_bounds):
@@ -268,6 +342,18 @@ def export_room_model_texture_glb(
                 idx_f = idx_pts[in_bounds]
                 u_f = u[in_bounds]
                 v_f = v[in_bounds]
+
+                # Wall occlusion culling against other room walls
+                cam_lay_xy = world_to_layout(cam["t"].reshape(1, 3))[0, :2]
+                pts_lay_f = pts_layout[idx_f, :2]
+                occluded = _check_occlusion(cam_lay_xy, pts_lay_f, i, xy)
+                if np.any(occluded):
+                    vis = ~occluded
+                    if not np.any(vis):
+                        continue
+                    idx_f = idx_f[vis]
+                    u_f = u_f[vis]
+                    v_f = v_f[vis]
 
                 # Soft border feathering: smoothstep over 50 pixels from boundary
                 d_u = np.minimum(u_f, float(im_w - 1) - u_f)
@@ -368,6 +454,17 @@ def export_room_model_texture_glb(
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
             im_h, im_w = img_rgb.shape[:2]
 
+            # Scale camera intrinsics if calibration resolution differs from loaded image resolution
+            K_use = K.copy()
+            if calib_w is not None and calib_h is not None and calib_w > 0 and calib_h > 0:
+                if abs(float(calib_w) - float(im_w)) > 2.0 or abs(float(calib_h) - float(im_h)) > 2.0:
+                    sx = float(im_w) / float(calib_w)
+                    sy = float(im_h) / float(calib_h)
+                    K_use[0, 0] *= sx
+                    K_use[0, 2] *= sx
+                    K_use[1, 1] *= sy
+                    K_use[1, 2] *= sy
+
             D = cam["t"] - pts_w
             dist = np.linalg.norm(D, axis=1)
             cos_a = np.sum(D * N_w, axis=1) / (dist + 1e-6)
@@ -382,8 +479,8 @@ def export_room_model_texture_glb(
 
             idx_pts = np.where(valid_a)[0][in_front]
             p_c = p_cam[in_front]
-            u = K[0, 0] * p_c[:, 0] / p_c[:, 2] + K[0, 2]
-            v = K[1, 1] * p_c[:, 1] / p_c[:, 2] + K[1, 2]
+            u = K_use[0, 0] * p_c[:, 0] / p_c[:, 2] + K_use[0, 2]
+            v = K_use[1, 1] * p_c[:, 1] / p_c[:, 2] + K_use[1, 2]
 
             in_bounds = (u >= 8) & (u < im_w - 8) & (v >= 8) & (v < im_h - 8)
             if not np.any(in_bounds):

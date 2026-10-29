@@ -17,6 +17,7 @@ from shapely.geometry import (
 )
 from shapely.ops import split as shapely_split
 
+from app.services.manhattan_alignment import detect_manhattan_yaw, yaw_rotation_matrix
 from app.services.occupancy_layout import (
     BBOX_FILL_RATIO_THRESHOLD,
     DOORWAY_BRIDGE_M,
@@ -24,6 +25,8 @@ from app.services.occupancy_layout import (
     MAX_NGON_VERTICES,
     MIN_NGON_VERTICES,
     OPEN_CORRIDOR_MIN_WIDTH_M,
+    _odd_px,
+    _raster_u8,
     apply_hough_yaw,
     choke_doorway_tails,
     classify_heading,
@@ -760,6 +763,13 @@ def rotation_to_plus_z(normal: np.ndarray) -> np.ndarray:
     return np.eye(3) + np.sin(angle) * k + (1.0 - np.cos(angle)) * (k @ k)
 
 
+def _refine_ceiling_z_continuous(z_arr: np.ndarray, z_init: float, scale: float = 1.0) -> float:
+    win = z_arr[(z_arr >= z_init - 0.045 * scale) & (z_arr <= z_init + 0.045 * scale)]
+    if len(win) >= 5:
+        return float(round(_irls_huber_1d_lidar(win, z_init, delta=0.015 * scale), VERTEX_DECIMALS))
+    return float(round(z_init, VERTEX_DECIMALS))
+
+
 def estimate_ceiling_height(z_out: np.ndarray, default_h: float = DEFAULT_HEIGHT_M) -> float:
     if len(z_out) == 0:
         return default_h
@@ -771,10 +781,12 @@ def estimate_ceiling_height(z_out: np.ndarray, default_h: float = DEFAULT_HEIGHT
     z_top = float(np.percentile(z_out, 99.8))
     if z_max <= 3.50:
         z_top = max(z_top, float(np.percentile(z_out, 99.98)), z_max)
-    elif z_top > 6.0:
-        z_top = 6.0
+    elif z_top > 5.0:
+        z_top = 5.0
 
-    bin_w = 0.03
+    z_p98 = float(np.percentile(z_out, 98.0))
+    s_z = max(0.25, min(2.0, z_p98 / 2.408))
+    bin_w = 0.03 * s_z
     min_search_z = max(0.0, z_min)
     bins = np.arange(min_search_z, z_top + bin_w, bin_w)
     if len(bins) < 5:
@@ -788,15 +800,21 @@ def estimate_ceiling_height(z_out: np.ndarray, default_h: float = DEFAULT_HEIGHT
     if max_c <= 0.0:
         return float(round(z_top, VERTEX_DECIMALS))
 
-    mid_mask = (centers >= CEILING_WALL_BAND_LO_M) & (centers <= CEILING_WALL_BAND_HI_M)
+    wall_band_lo = CEILING_WALL_BAND_LO_M * s_z
+    wall_band_hi = CEILING_WALL_BAND_HI_M * s_z
+    rec_win = CEILING_RECOVERY_WINDOW_M * s_z
+    near_cliff = CEILING_PEAK_NEAR_CLIFF_M * s_z
+
+    mid_mask = (centers >= wall_band_lo) & (centers <= wall_band_hi)
     rho_wall = float(np.median(smoothed[mid_mask])) if np.any(mid_mask) else 0.0
 
+    peak_min = min(0.4 * max_c, max(0.25 * max_c, 2.5 * rho_wall)) if rho_wall > 0.0 else 0.4 * max_c
     peaks = [
         i
         for i in range(1, len(smoothed) - 1)
         if smoothed[i] >= smoothed[i - 1]
         and smoothed[i] >= smoothed[i + 1]
-        and smoothed[i] >= 0.4 * max_c
+        and smoothed[i] >= peak_min
     ]
 
     cliff_z = None
@@ -805,15 +823,18 @@ def estimate_ceiling_height(z_out: np.ndarray, default_h: float = DEFAULT_HEIGHT
         recover_thresh = CEILING_RECOVERY_FRAC * rho_wall
         seen_wall = False
         for i, (cz, rho) in enumerate(zip(centers, smoothed)):
-            if cz < CEILING_WALL_BAND_HI_M:
+            if cz < wall_band_hi:
                 continue
             if rho >= 0.85 * rho_wall:
                 seen_wall = True
             if not (seen_wall and rho < thresh):
                 continue
+            lookahead = smoothed[i : min(len(smoothed), i + 4)]
+            if len(lookahead) >= 2 and float(np.min(lookahead)) > 0.08 * rho_wall:
+                continue
             recovered = False
             for cz2, rho2 in zip(centers[i + 1 :], smoothed[i + 1 :]):
-                if cz2 > cz + CEILING_RECOVERY_WINDOW_M:
+                if cz2 > cz + rec_win:
                     break
                 if rho2 >= recover_thresh:
                     recovered = True
@@ -827,21 +848,21 @@ def estimate_ceiling_height(z_out: np.ndarray, default_h: float = DEFAULT_HEIGHT
         near = [
             float(centers[i])
             for i in peaks
-            if abs(float(centers[i]) - cliff_z) <= CEILING_PEAK_NEAR_CLIFF_M
-            and float(centers[i]) <= cliff_z + 0.06
+            if abs(float(centers[i]) - cliff_z) <= near_cliff
+            and float(centers[i]) <= cliff_z + 0.06 * s_z
         ]
         if near:
-            return float(round(max(near), VERTEX_DECIMALS))
-        return float(round(cliff_z, VERTEX_DECIMALS))
+            return _refine_ceiling_z_continuous(z_out, max(near), scale=s_z)
+        return _refine_ceiling_z_continuous(z_out, cliff_z, scale=s_z)
 
-    valid_peaks = [i for i in peaks if centers[i] >= CEILING_WALL_BAND_HI_M]
+    valid_peaks = [i for i in peaks if centers[i] >= wall_band_hi]
     if valid_peaks:
         i = valid_peaks[-1]
-        return float(round(float(centers[i]), VERTEX_DECIMALS))
+        return _refine_ceiling_z_continuous(z_out, float(centers[i]), scale=s_z)
     z_p90 = float(np.percentile(z_out, CEILING_BULK_PERCENTILE))
-    if z_p90 >= CEILING_WALL_BAND_HI_M:
+    if z_p90 >= wall_band_hi:
         return float(round(z_p90, VERTEX_DECIMALS))
-    if z_top >= CEILING_WALL_BAND_HI_M:
+    if z_top >= wall_band_hi:
         return float(round(z_top, VERTEX_DECIMALS))
     return default_h
 
@@ -858,6 +879,7 @@ def _extract_ceiling_height_from_dtof(
     try:
         from scipy.spatial.transform import Rotation
         from app.services.calibration import (
+            probe_session_image_size,
             remap_lidar_zones_to_camera_frame,
             resolve_sensor_to_vio_rotation,
         )
@@ -878,7 +900,14 @@ def _extract_ceiling_height_from_dtof(
         return None
 
     try:
-        lidar_df = pd.read_csv(lidar_path)
+        from app.services.calibration import load_processed_lidar_for_tof
+
+        tof_pack = load_processed_lidar_for_tof(session_dir)
+    except Exception:
+        tof_pack = {}
+
+    try:
+        lidar_df = tof_pack.get("df") if isinstance(tof_pack, dict) and tof_pack.get("df") is not None else pd.read_csv(lidar_path)
         vio_df = pd.read_csv(vio_path)
         if lidar_df.empty or vio_df.empty:
             return None
@@ -902,45 +931,60 @@ def _extract_ceiling_height_from_dtof(
             if os.path.isfile(ep):
                 with open(ep, encoding="utf-8") as f:
                     cand_ext = json.load(f)
-                if "T_lidar_camera" in cand_ext or "lidar_to_camera" in cand_ext:
+                if "T_lidar_camera" in ext_data if ext_data else ("T_lidar_camera" in cand_ext or "lidar_to_camera" in cand_ext):
                     ext_data = cand_ext
                     break
-        if ext_data is None:
-            return None
 
-        if "T_lidar_camera" in ext_data:
-            T_lc = np.asarray(ext_data["T_lidar_camera"], dtype=float)
+        if isinstance(tof_pack, dict) and tof_pack.get("T_lidar_camera") is not None and tof_pack.get("rays") is not None:
+            T_lc = np.asarray(tof_pack["T_lidar_camera"], dtype=float)
             R_cl = T_lc[:3, :3].T
             t_cl = -R_cl @ T_lc[:3, 3]
-        elif "lidar_to_camera" in ext_data:
-            R_cl = np.array(ext_data["lidar_to_camera"]["rotation_row_major_3x3"], dtype=float).reshape(3, 3)
-            t_cl = np.array(ext_data["lidar_to_camera"]["translation_meters"], dtype=float)
-            if ext_data.get("source") == "bootstrap" and R_cl[0, 0] < -0.5 and R_cl[1, 1] < -0.5:
-                R_cl = np.eye(3, dtype=float)
+            rays = np.asarray(tof_pack["rays"], dtype=float)
         else:
-            return None
+            if ext_data is None:
+                return None
 
-        ray_path = os.path.join(session_dir, "processed_lidar_intrinsics.json")
-        if os.path.isfile(ray_path):
-            with open(ray_path, encoding="utf-8") as f:
-                ray_data = json.load(f)
-                rays = np.asarray(ray_data.get("rays", []), dtype=float)
-        elif "tof_rays_lidar" in ext_data:
-            rays = np.zeros((64, 3))
-            for r in ext_data["tof_rays_lidar"]:
-                rays[int(r["zone"])] = [float(r["x"]), float(r["y"]), float(r["z"])]
-        else:
-            return None
+            if "T_lidar_camera" in ext_data:
+                T_lc = np.asarray(ext_data["T_lidar_camera"], dtype=float)
+                R_cl = T_lc[:3, :3].T
+                t_cl = -R_cl @ T_lc[:3, 3]
+            elif "lidar_to_camera" in ext_data:
+                R_cl = np.array(ext_data["lidar_to_camera"]["rotation_row_major_3x3"], dtype=float).reshape(3, 3)
+                t_cl = np.array(ext_data["lidar_to_camera"]["translation_meters"], dtype=float)
+                if ext_data.get("source") == "bootstrap" and R_cl[0, 0] < -0.5 and R_cl[1, 1] < -0.5:
+                    R_cl = np.eye(3, dtype=float)
+            else:
+                return None
 
-        if rays.shape != (64, 3):
-            return None
+            ray_path = os.path.join(session_dir, "processed_lidar_intrinsics.json")
+            if os.path.isfile(ray_path):
+                with open(ray_path, encoding="utf-8") as f:
+                    ray_data = json.load(f)
+                    rays = np.asarray(ray_data.get("rays", []), dtype=float)
+            elif "tof_rays_lidar" in ext_data:
+                rays = np.zeros((64, 3))
+                for r in ext_data["tof_rays_lidar"]:
+                    rays[int(r["zone"])] = [float(r["x"]), float(r["y"]), float(r["z"])]
+            else:
+                try:
+                    from app.services.vio_core.spad_depth_fusion import compute_vl53l8cx_rays
+                    rays = compute_vl53l8cx_rays(grid_size=8, fov_deg=45.0)
+                except Exception:
+                    return None
 
-        rot_deg = 90
+        if rays is None or rays.shape != (64, 3):
+            try:
+                from app.services.vio_core.spad_depth_fusion import compute_vl53l8cx_rays
+                rays = compute_vl53l8cx_rays(grid_size=8, fov_deg=45.0)
+            except Exception:
+                return None
+
+        rot_deg = int(tof_pack.get("camera_sensor_to_display_rotation_deg", 90)) if isinstance(tof_pack, dict) else 90
         manifest_path = os.path.join(session_dir, "manifest.json")
         if os.path.isfile(manifest_path):
             try:
                 with open(manifest_path, encoding="utf-8") as f:
-                    rot_deg = int(json.load(f).get("display_rotation_degrees", 90) or 90)
+                    rot_deg = int(json.load(f).get("display_rotation_degrees", rot_deg) or rot_deg)
             except Exception:
                 rot_deg = 90
 
@@ -955,19 +999,21 @@ def _extract_ceiling_height_from_dtof(
         r_align = align_rotation(grav / np.linalg.norm(grav))
 
         if use_vio:
-            vio_ts = vio_df["device_timestamp_ns"].to_numpy()
+            vio_ts = vio_df["device_timestamp_ns"].to_numpy(dtype=np.float64)
             if "device_timestamp_ns" in lidar_df:
-                lidar_ts = lidar_df["device_timestamp_ns"].to_numpy()
+                lidar_ts = lidar_df["device_timestamp_ns"].to_numpy(dtype=np.float64)
             elif "mobile_receive_timestamp_nanos" in lidar_df:
-                lidar_ts = lidar_df["mobile_receive_timestamp_nanos"].to_numpy()
+                lidar_ts = lidar_df["mobile_receive_timestamp_nanos"].to_numpy(dtype=np.float64)
             else:
                 return None
         else:
-            vio_ts = vio_df["timestamp"].to_numpy()
+            vio_ts = vio_df["timestamp"].to_numpy(dtype=np.float64)
+            if len(vio_ts) and float(np.nanmedian(np.abs(vio_ts))) > 1e11:
+                vio_ts = vio_ts / 1e9
             if "mobile_receive_timestamp_nanos" in lidar_df:
-                lidar_ts = lidar_df["mobile_receive_timestamp_nanos"].to_numpy() / 1e9
+                lidar_ts = lidar_df["mobile_receive_timestamp_nanos"].to_numpy(dtype=np.float64) / 1e9
             elif "device_timestamp_ns" in lidar_df:
-                lidar_ts = lidar_df["device_timestamp_ns"].to_numpy() / 1e9
+                lidar_ts = lidar_df["device_timestamp_ns"].to_numpy(dtype=np.float64) / 1e9
             else:
                 return None
 
@@ -986,7 +1032,8 @@ def _extract_ceiling_height_from_dtof(
         vio_pos = vio_df[["x", "y", "z"]].to_numpy()
         vio_quat = vio_df[["qx", "qy", "qz", "qw"]].to_numpy()
         R_wc_all = Rotation.from_quat(vio_quat).as_matrix()
-        session_R_dc = resolve_sensor_to_vio_rotation(rot_deg, 640, 360, R_wc_all, grav)
+        img_w, img_h = probe_session_image_size(session_dir=session_dir, default_size=(640, 480))
+        session_R_dc = resolve_sensor_to_vio_rotation(rot_deg, img_w, img_h, R_wc_all, grav)
 
         floor_hits = []
         ceil_hits = []
@@ -1055,12 +1102,6 @@ def prepare_leveled_cloud(
         g = np.asarray(gravity, dtype=float).reshape(3)
         r_align = align_rotation(g / np.linalg.norm(g))
     work.rotate(r_align, center=(0.0, 0.0, 0.0))
-    pts_raw = np.asarray(work.points, dtype=float)
-    z_raw_span_max = (
-        float(np.max(pts_raw[:, 2]) - np.percentile(pts_raw[:, 2], 0.05))
-        if len(pts_raw) >= 50000
-        else 0.0
-    )
     if len(work.points) >= RANSAC_MIN_REMAINING:
         cleaned, _ = work.remove_statistical_outlier(
             nb_neighbors=STAT_NB_NEIGHBORS, std_ratio=STAT_STD_RATIO
@@ -1081,33 +1122,12 @@ def prepare_leveled_cloud(
         return work, DEFAULT_HEIGHT_M, level_frame
 
     z = pts[:, 2]
-    is_dense_full_mesh = len(pts) >= 50000
-    z_raw_ptp = (
-        float(np.max(pts_raw[:, 2]) - np.min(pts_raw[:, 2]))
-        if (
-            is_dense_full_mesh
-            and len(pts_raw) >= 50000
-            and float(np.min(pts_raw[:, 2])) <= -1.50
-            and float(np.min(z)) <= -1.40
-            and int(np.count_nonzero(z <= float(np.min(z)) + 0.25)) >= int(0.015 * len(z))
-            and (float(np.percentile(z, 5.0)) - float(np.min(pts_raw[:, 2]))) <= 0.45
-        )
-        else 0.0
-    )
-    z_span_p988 = float(np.percentile(z, 98.8) - np.percentile(z, 1.2)) if is_dense_full_mesh else 0.0
-    z_span_p99 = float(np.percentile(z, 99.0) - np.percentile(z, 1.0)) if is_dense_full_mesh else 0.0
-    z_span_p992 = float(np.percentile(z, 99.2) - np.percentile(z, 0.8)) if is_dense_full_mesh else 0.0
-    z_span_p993 = float(np.percentile(z, 99.3) - np.percentile(z, 0.7)) if is_dense_full_mesh else 0.0
-    z_span_max = float(np.max(z) - np.percentile(z, 0.1)) if is_dense_full_mesh else 0.0
-    if is_dense_full_mesh:
-        z_p01 = float(np.percentile(z, 1.0))
-        z_p15 = float(np.percentile(z, 15.0))
-        z_hi = min(z_p15, z_p01 + 0.35)
-        band = pts[(z >= z_p01 - 0.05) & (z <= z_hi)]
-        if len(band) < 500:
-            z_hi = float(np.percentile(z, 40))
-            band = pts[z <= z_hi]
-    else:
+    s_lvl = max(1.0, min(2.0, float(np.percentile(z, 98.0) - np.percentile(z, 2.0)) / 2.05))
+    z_p01 = float(np.percentile(z, 1.0))
+    z_p25 = float(np.percentile(z, 25.0))
+    z_hi = min(z_p25, z_p01 + 0.35 * s_lvl)
+    band = pts[(z >= z_p01 - 0.05) & (z <= z_hi)]
+    if len(band) < 500:
         z_hi = float(np.percentile(z, 40))
         band = pts[z <= z_hi]
     floor_n = np.array([0.0, 0.0, 1.0])
@@ -1117,8 +1137,9 @@ def prepare_leveled_cloud(
     floor_tilt_rejected = False
     cos_floor = float(np.cos(np.radians(FLOOR_LEVELED_MAX_TILT_DEG)))
     z_floor_mode = z_floor
-    floor_mode_shift_m = 0.0
-    true_ceiling_height_m = None
+
+    r_cut_floor: float | None = None
+    xy_med_floor: np.ndarray | None = None
 
     if len(band) >= 50:
         z_lo_b = float(band[:, 2].min())
@@ -1127,26 +1148,24 @@ def prepare_leveled_cloud(
         if len(edges) >= 2:
             counts, edges = np.histogram(band[:, 2], bins=edges)
             mode_i = int(np.argmax(counts))
+            # Guard against dense curved monocular wall-floor fillets near the XY perimeter
+            # pulling the histogram mode bin above the flat interior floor.
+            xy_med = np.median(band[:, :2], axis=0)
+            r_xy = np.linalg.norm(band[:, :2] - xy_med, axis=1)
+            r_cut = min(float(np.percentile(r_xy, 55.0)), 0.72 * float(np.percentile(r_xy, 95.0)))
+            r_cut_floor = r_cut
+            xy_med_floor = xy_med
+            inner_band = band[r_xy <= r_cut]
+            if len(inner_band) >= 50:
+                inner_counts, _ = np.histogram(inner_band[:, 2], bins=edges)
+                mode_inner = int(np.argmax(inner_counts))
+                if (
+                    mode_inner < mode_i
+                    and (edges[mode_i] - edges[mode_inner]) <= 0.12 + 1e-6
+                    and counts[mode_inner] >= max(50, int(0.18 * counts[mode_i]))
+                ):
+                    mode_i = mode_inner
             z_floor_mode = float(0.5 * (edges[mode_i] + edges[mode_i + 1]))
-            max_cnt = int(counts[mode_i])
-            low_peaks = [
-                i
-                for i in range(mode_i)
-                if counts[i] >= 0.85 * max_cnt
-                and (i == 0 or counts[i] >= counts[i - 1])
-                and (i == len(counts) - 1 or counts[i] >= counts[i + 1])
-                and (z_floor_mode - 0.5 * (edges[i] + edges[i + 1])) >= 0.15
-            ]
-            if low_peaks and not is_dense_full_mesh:
-                best_low_i = min(low_peaks)
-                z_low_mode = float(0.5 * (edges[best_low_i] + edges[best_low_i + 1]))
-                floor_mode_shift_m = float(z_floor_mode - z_low_mode)
-                z_full = z - z_low_mode
-                h_full = float(estimate_ceiling_height(z_full, DEFAULT_HEIGHT_M))
-                if np.count_nonzero(z_full >= h_full) >= 1000:
-                    h_full = max(h_full, float(round(np.percentile(z_full, 99.5), VERTEX_DECIMALS)))
-                if HEIGHT_SPAN_MIN_M <= h_full <= 5.0:
-                    true_ceiling_height_m = float(h_full)
             stage1 = pts[:, 2] >= (z_floor_mode - FLOOR_PRE_RANSAC_BELOW_MODE_M)
             idx = np.flatnonzero(stage1)
             if len(idx) == 0:
@@ -1163,26 +1182,22 @@ def prepare_leveled_cloud(
             work = work.select_by_index(idx.tolist())
             pts = np.asarray(work.points, dtype=float)
             z = pts[:, 2]
-            if is_dense_full_mesh:
-                z_hi = min(float(np.percentile(z, 15.0)), z_floor_mode + 0.20)
-                band = pts[z <= z_hi]
-                if len(band) < 500:
-                    z_hi = float(np.percentile(z, 40))
-                    band = pts[z <= z_hi]
-            else:
+            z_hi = min(float(np.percentile(z, 40.0)), z_floor_mode + 0.35 * s_lvl)
+            band = pts[z <= z_hi]
+            if len(band) < 500:
                 z_hi = float(np.percentile(z, 40))
                 band = pts[z <= z_hi]
             floor_inliers = band
             z_floor = float(np.percentile(z, 5))
 
     if len(band) >= 500:
-        if len(pts) >= 10000 and (z_hi - z_floor_mode) > 0.45:
+        if (z_hi - z_floor_mode) > 0.45 * s_lvl:
             floor_n = np.array([0.0, 0.0, 1.0])
             floor_inliers = band
             detected_tilt_deg = 45.0
             floor_tilt_rejected = True
-        elif len(pts) >= 10000:
-            is_compact_band = (z_hi - z_floor_mode) <= 0.22
+        else:
+            is_compact_band = (z_hi - z_floor_mode) <= 0.22 * s_lvl
             fl_mask = np.abs(band[:, 2] - z_floor_mode) <= (0.12 if is_compact_band else 0.08)
             fl = band[fl_mask]
             if len(fl) >= 300:
@@ -1191,10 +1206,13 @@ def prepare_leveled_cloud(
                 fn = vt[-1]
                 if fn[2] < 0.0:
                     fn = -fn
-                if is_compact_band:
-                    fl8 = band[np.abs(band[:, 2] - z_floor_mode) <= 0.08]
-                    ip = fl8 if len(fl8) >= 300 else fl
-                else:
+                core_mask = np.abs(band[:, 2] - z_floor_mode) <= FLOOR_RANSAC_DIST_M
+                fl_core = band[core_mask]
+                inner_core = np.empty((0, 3), dtype=float)
+                if xy_med_floor is not None and r_cut_floor is not None:
+                    r_xy_b = np.linalg.norm(band[:, :2] - xy_med_floor, axis=1)
+                    inner_core = band[core_mask & (r_xy_b <= r_cut_floor)]
+                if not is_compact_band:
                     d_k = -float(np.dot(fn, mp))
                     inls = np.flatnonzero(np.abs(band @ fn + d_k) <= FLOOR_RANSAC_DIST_M)
                     if len(inls) >= 300:
@@ -1204,10 +1222,24 @@ def prepare_leveled_cloud(
                         fn = vt2[-1]
                         if fn[2] < 0.0:
                             fn = -fn
-                    else:
-                        ip = fl
                 tilt_k = float(np.degrees(np.arccos(np.clip(fn[2], -1.0, 1.0))))
                 if fn[2] >= cos_floor:
+                    # Anchor horizontal floor inliers and z_floor strictly on the flat core around
+                    # z_floor_mode so curved corner fillet points in [z_floor_mode + 0.02, +0.12]
+                    # cannot pull z_floor or tz upward.
+                    if len(inner_core) >= 100 and (
+                        float(np.mean(fl_core[:, 2])) - float(np.mean(inner_core[:, 2])) > 0.004
+                    ):
+                        ip = inner_core
+                    elif len(fl_core) >= 100:
+                        mp_core = np.mean(fl_core, axis=0)
+                        d_core = -float(np.dot(fn, mp_core))
+                        core_inls = np.flatnonzero(np.abs(band @ fn + d_core) <= FLOOR_RANSAC_DIST_M)
+                        ip = band[core_inls] if len(core_inls) >= 100 else fl_core
+                    else:
+                        d_k = -float(np.dot(fn, mp))
+                        inls = np.flatnonzero(np.abs(band @ fn + d_k) <= FLOOR_RANSAC_DIST_M)
+                        ip = band[inls] if len(inls) >= 100 else fl
                     detected_tilt_deg = tilt_k
                     floor_n = fn
                     floor_inliers = ip
@@ -1215,59 +1247,6 @@ def prepare_leveled_cloud(
                     floor_tilt_rejected = False
                 else:
                     detected_tilt_deg = tilt_k
-                    floor_n = np.array([0.0, 0.0, 1.0])
-                    floor_inliers = band
-                    floor_tilt_rejected = True
-            else:
-                floor_n = np.array([0.0, 0.0, 1.0])
-                floor_inliers = band
-                floor_tilt_rejected = True
-        else:
-            band_sorted = band[np.lexsort((band[:, 2], band[:, 1], band[:, 0]))]
-            cand = o3d.geometry.PointCloud()
-            cand.points = o3d.utility.Vector3dVector(band_sorted)
-            work_cand = o3d.geometry.PointCloud(cand)
-            candidates = []
-            rejected_tilts = []
-            for step in range(10):
-                if len(work_cand.points) < 500:
-                    break
-                o3d.utility.random.seed(42 + step)
-                model, inls = work_cand.segment_plane(
-                    distance_threshold=FLOOR_RANSAC_DIST_M,
-                    ransac_n=3,
-                    num_iterations=800,
-                )
-                if len(inls) < 300:
-                    break
-                cand_n = np.asarray(model[:3], dtype=float)
-                if cand_n[2] < 0.0:
-                    cand_n = -cand_n
-                tilt = float(np.degrees(np.arccos(np.clip(cand_n[2], -1.0, 1.0))))
-                rejected_tilts.append(tilt)
-                if cand_n[2] >= cos_floor:
-                    inlier_pts = np.asarray(work_cand.select_by_index(inls).points)
-                    candidates.append((cand_n, inlier_pts, float(np.mean(inlier_pts[:, 2])), len(inls), tilt))
-                work_cand = work_cand.select_by_index(inls, invert=True)
-            if rejected_tilts:
-                detected_tilt_deg = float(max(rejected_tilts))
-            if candidates:
-                valid = []
-                for c in candidates:
-                    is_elevated = (
-                        c[2] > z_floor_mode + 0.25
-                        or any(
-                            other[2] < c[2] - 0.35 and other[3] >= 0.25 * c[3] and other[3] >= 500
-                            for other in candidates
-                        )
-                    )
-                    if not is_elevated:
-                        valid.append(c)
-                if valid:
-                    best = max(valid, key=lambda c: c[3])
-                    floor_n, floor_inliers, z_floor, _, detected_tilt_deg = best
-                    floor_tilt_rejected = False
-                else:
                     floor_n = np.array([0.0, 0.0, 1.0])
                     floor_inliers = band
                     floor_tilt_rejected = True
@@ -1305,43 +1284,6 @@ def prepare_leveled_cloud(
         out.colors = o3d.utility.Vector3dVector(cols)
     z_out = pts[:, 2] if len(pts) else np.array([0.0])
     h = estimate_ceiling_height(z_out, DEFAULT_HEIGHT_M)
-    recovered_from_span = False
-    z_out_p99 = float(np.percentile(z_out, 99.0)) if len(z_out) else 0.0
-    if is_dense_full_mesh and (h == DEFAULT_HEIGHT_M or h <= CEILING_WALL_BAND_HI_M + 0.30):
-        for cand_h in (z_out_p99, z_span_p988, z_span_p99, z_span_max):
-            if CEILING_WALL_BAND_HI_M + 0.30 < cand_h <= 5.0:
-                h = float(round(cand_h, VERTEX_DECIMALS))
-                recovered_from_span = True
-                break
-    elif (
-        is_dense_full_mesh
-        and true_ceiling_height_m is None
-        and h <= CEILING_WALL_BAND_HI_M + 0.35
-        and h + 0.05 < z_out_p99 <= 5.0
-    ):
-        true_ceiling_height_m = float(round(z_out_p99, VERTEX_DECIMALS))
-    if (
-        is_dense_full_mesh
-        and recovered_from_span
-        and true_ceiling_height_m is None
-    ):
-        z_out_p993 = float(np.percentile(z_out, 99.3)) if len(z_out) else 0.0
-        span_cands = (
-            (z_out_p993, z_span_p993, z_span_p992, z_span_p99, z_raw_span_max)
-            if z_out_p99 <= CEILING_WALL_BAND_HI_M + 0.15
-            else (z_out_p993, z_span_p99, z_raw_span_max)
-        )
-        for cand_h in span_cands:
-            max_step = (
-                0.082
-                if (cand_h in (z_span_p993, z_span_p992, z_raw_span_max) and z_out_p99 <= CEILING_WALL_BAND_HI_M + 0.15)
-                else 0.04
-            )
-            if cand_h > float(h) and (cand_h - float(h)) <= max_step:
-                true_ceiling_height_m = float(round(cand_h, VERTEX_DECIMALS))
-                break
-    if is_dense_full_mesh and 2.65 <= z_raw_ptp <= 2.76:
-        true_ceiling_height_m = float(round(z_raw_ptp + 0.08, VERTEX_DECIMALS))
     if h < HEIGHT_SPAN_MIN_M or h > 5.0:
         h = DEFAULT_HEIGHT_M
     level_frame = {
@@ -1353,12 +1295,6 @@ def prepare_leveled_cloud(
         "detected_tilt_deg": float(detected_tilt_deg),
         "fallback_to_gravity_locked": bool(floor_tilt_rejected),
     }
-    if true_ceiling_height_m is not None and (
-        true_ceiling_height_m > float(h) + 0.15
-        or (is_dense_full_mesh and true_ceiling_height_m > float(h))
-    ):
-        level_frame["_floor_mode_shift_m"] = float(floor_mode_shift_m)
-        level_frame["_true_ceiling_height_m"] = float(true_ceiling_height_m)
     return out, float(h), level_frame
 
 
@@ -1510,7 +1446,8 @@ def filter_wall_aperture_leakage(
 
     # 1. Dynamic architectural height cut
     # Points higher than detected ceiling + tolerance are impossible interior hits (vent leakage)
-    valid_z = (pts[:, 2] >= -0.15) & (pts[:, 2] <= float(ceiling_height_m) + 0.10)
+    z_cap = max(float(ceiling_height_m), float(np.percentile(pts[:, 2], 99.5))) + 0.10
+    valid_z = (pts[:, 2] >= -0.15) & (pts[:, 2] <= z_cap)
     idx_clean = np.flatnonzero(valid_z)
     if len(idx_clean) < 100:
         return pcd
@@ -1606,10 +1543,10 @@ def filter_wall_aperture_leakage(
             n_ref = -n_ref
             d_ref = -d_ref
 
-        # Validate that the plane behaves as a room boundary wall (does not bisect the interior)
+        # Validate that the plane behaves as a room boundary wall (only sparse aperture leakage outside)
         dist_all = pts_clean[:, :2] @ n_ref + d_ref
-        frac_outside = float(np.count_nonzero(dist_all < -float(wall_thickness_tolerance_m))) / len(pts_clean)
-        if frac_outside > 0.30:
+        n_outside = int(np.count_nonzero(dist_all < -float(wall_thickness_tolerance_m)))
+        if n_outside > min(120, max(10, int(0.005 * len(pts_clean)))):
             pts_2d = np.delete(pts_2d, best_inls, axis=0)
             continue
 
@@ -1810,6 +1747,56 @@ def _interp_flank_crossing(
     return float(ctrs[k])
 
 
+def _irls_huber_1d_lidar(vals: np.ndarray, init_loc: float, delta: float = 0.015, max_iter: int = 8) -> float:
+    """Estimate continuous 1D wall mode location using IRLS with a Huber loss."""
+    v = np.asarray(vals, dtype=float)
+    if len(v) == 0:
+        return float(init_loc)
+    if len(v) == 1:
+        return float(v[0])
+    mu = float(init_loc)
+    for _ in range(max_iter):
+        r = np.abs(v - mu)
+        w = np.where(r <= delta, 1.0, delta / np.maximum(r, 1e-9))
+        w_sum = float(np.sum(w))
+        if w_sum <= 1e-9:
+            break
+        mu_new = float(np.sum(w * v) / w_sum)
+        if abs(mu_new - mu) <= 1e-5:
+            mu = mu_new
+            break
+        mu = mu_new
+    return float(mu)
+
+
+def _eval_continuous_kde_1d(vals: np.ndarray, grid: np.ndarray, bandwidth: float = 0.005, window_scale: float = 0.05) -> np.ndarray:
+    """Evaluate a continuous 1D mollified Parzen window KDE on `grid`, preserving physical support counts."""
+    v = np.asarray(vals, dtype=float)
+    g = np.asarray(grid, dtype=float)
+    if len(v) == 0 or len(g) == 0:
+        return np.zeros(len(g), dtype=float)
+    origin = float(g[0])
+    v_rel = v - origin
+    g_rel = g - origin
+    step_f = max(1e-4, min(0.002, 0.15 * float(bandwidth)))
+    pad = window_scale + 4.0 * bandwidth
+    lo_f = -pad
+    hi_f = float(g_rel[-1]) + pad
+    n_f = max(16, int(np.ceil((hi_f - lo_f) / step_f)))
+    edges_f = np.linspace(lo_f, hi_f, n_f + 1)
+    ctrs_f = 0.5 * (edges_f[:-1] + edges_f[1:])
+    cnts_f, _ = np.histogram(v_rel, bins=edges_f)
+    n_box = max(1, int(round(window_scale / step_f)))
+    kern_box = np.ones(n_box, dtype=float)
+    r_k = max(2, int(np.ceil(3.5 * bandwidth / step_f)))
+    kx = np.arange(-r_k, r_k + 1, dtype=float) * step_f
+    kern_g = np.exp(-0.5 * (kx / max(bandwidth, 1e-4)) ** 2)
+    kern_g /= np.maximum(np.sum(kern_g), 1e-9)
+    kern = np.convolve(kern_box, kern_g, mode="full")
+    kde_f = np.convolve(cnts_f.astype(float), kern, mode="same")
+    return np.interp(g_rel, ctrs_f, kde_f)
+
+
 def _extract_pure_lidar_topology_wall_hints(
     pts: np.ndarray,
     kept: np.ndarray,
@@ -1823,821 +1810,486 @@ def _extract_pure_lidar_topology_wall_hints(
     if kc.ndim != 2 or len(kc) < 50 or kc.shape[1] < 2:
         return None
     pts_arr = np.asarray(pts, dtype=float) if pts is not None else kc
-    is_dense_3d = pts_arr.ndim == 2 and pts_arr.shape[1] >= 3 and len(pts_arr) >= 50000
-
-    if not is_dense_3d:
-        x0 = float(np.percentile(kc[:, 0], 0.5))
-        x1 = float(np.percentile(kc[:, 0], 99.5))
-        y0 = float(np.percentile(kc[:, 1], 0.5))
-        y1 = float(np.percentile(kc[:, 1], 99.5))
-        l_cands = [(fit_missing_corner_l_shape(kc[:, :2], return_info=True), False)]
-        wb_in_box = kc
-        cnt_scale = 1.0
-    else:
+    if pts_arr.ndim == 2 and pts_arr.shape[1] >= 3 and len(pts_arr) >= 100:
         wb = slice_wall_band(pts_arr, height_m)
         if len(wb) < 100:
             wb = kc
-        cnt_scale = 1.0 if len(wb) >= 205000 else (float(len(wb)) / 230000.0)
-        bounds: list[tuple[float, float]] = []
+    else:
+        wb = kc
 
-        for ax in (0, 1):
-            v_wb = wb[:, ax]
-            v_kc = kc[:, ax]
-            if traj_leveled is not None and len(traj_leveled) > 0:
-                t_med = float(np.median(traj_leveled[:, ax]))
-                t_lo = float(np.min(traj_leveled[:, ax]))
-                t_hi = float(np.max(traj_leveled[:, ax]))
-            else:
-                t_med = float(np.median(v_kc))
-                t_lo = t_med
-                t_hi = t_med
-
-            lo_edge = np.floor(float(v_wb.min()) / 0.05) * 0.05
-            hi_edge = np.ceil(float(v_wb.max()) / 0.05) * 0.05 + 0.05
-            edges = np.arange(lo_edge, hi_edge + 0.025, 0.05)
-            cnts, _ = np.histogram(v_wb, bins=edges)
-            ctrs = 0.5 * (edges[:-1] + edges[1:])
-
-            wb_span_1_99 = float(np.percentile(v_wb, 99.0) - np.percentile(v_wb, 1.0))
-            c_max = float(cnts.max()) if len(cnts) else 0.0
-            if wb_span_1_99 > 3.40 and c_max > 0:
-                low_mask = cnts < (0.30 * c_max)
-                best_gap: tuple[int, int] | None = None
-                i_idx = 0
-                while i_idx < len(cnts):
-                    if low_mask[i_idx]:
-                        j_idx = i_idx
-                        while j_idx < len(cnts) and low_mask[j_idx]:
-                            j_idx += 1
-                        if i_idx >= 5 and j_idx <= len(cnts) - 5 and (j_idx - i_idx) >= 6:
-                            l_max = int(cnts[:i_idx].max())
-                            r_max = int(cnts[j_idx:].max())
-                            if max(l_max, r_max) >= 0.80 * c_max and min(l_max, r_max) < 0.62 * c_max:
-                                best_gap = (i_idx, j_idx)
-                        i_idx = j_idx
+    # Step 1: Align to the 2D Manhattan frame via detect_manhattan_yaw on the wall band
+    # when the cloud is tilted in XY (reduces [2, 98] percentile bounding box area by > 8%
+    # and increases 1D wall-mode peak concentration by > 25%).
+    R_m_applied = np.eye(2, dtype=float)
+    if wb.shape[1] >= 3 and len(wb) >= 100:
+        yaw_deg = detect_manhattan_yaw(wb, up_axis=2)
+        if abs(yaw_deg) > 0.5:
+            R_m = yaw_rotation_matrix(2, yaw_deg)
+            wb_rot = wb @ R_m.T
+            sp0 = np.percentile(wb[:, :2], 98.0, axis=0) - np.percentile(wb[:, :2], 2.0, axis=0)
+            sp1 = np.percentile(wb_rot[:, :2], 98.0, axis=0) - np.percentile(wb_rot[:, :2], 2.0, axis=0)
+            s_pre = max(0.25, float(np.hypot(sp1[0], sp1[1])) / 2.60)
+            if (sp1[0] * sp1[1]) < 0.92 * (sp0[0] * sp0[1]):
+                pk0 = 0.0
+                pk1 = 0.0
+                for ax_k in (0, 1):
+                    v0_k = wb[:, ax_k]
+                    g0_k = np.linspace(float(np.percentile(v0_k, 0.5)) - 0.04 * s_pre, float(np.percentile(v0_k, 99.5)) + 0.04 * s_pre, 120)
+                    kde0_k = _eval_continuous_kde_1d(v0_k, g0_k, bandwidth=0.012 * s_pre, window_scale=0.03 * s_pre)
+                    pk0 += float(np.max(kde0_k)) if len(kde0_k) else 0.0
+                    v1_k = wb_rot[:, ax_k]
+                    g1_k = np.linspace(float(np.percentile(v1_k, 0.5)) - 0.04 * s_pre, float(np.percentile(v1_k, 99.5)) + 0.04 * s_pre, 120)
+                    kde1_k = _eval_continuous_kde_1d(v1_k, g1_k, bandwidth=0.012 * s_pre, window_scale=0.03 * s_pre)
+                    pk1 += float(np.max(kde1_k)) if len(kde1_k) else 0.0
+                if pk1 > 1.25 * pk0:
+                    wb = wb_rot
+                    R_m_applied = R_m[:2, :2].copy()
+                    if kc.shape[1] >= 3:
+                        kc = kc @ R_m.T
                     else:
-                        i_idx += 1
-                if best_gap is not None:
-                    gi, gj = best_gap
-                    if cnts[:gi].max() >= cnts[gj:].max():
-                        sub_cnts, sub_ctrs = cnts[:gi], ctrs[:gi]
-                    else:
-                        sub_cnts, sub_ctrs = cnts[gj:], ctrs[gj:]
-                    sub_max = float(sub_cnts.max())
-                    p_idx = [
-                        k for k in range(1, len(sub_cnts) - 1)
-                        if sub_cnts[k] >= sub_cnts[k - 1]
-                        and sub_cnts[k] >= sub_cnts[k + 1]
-                        and sub_cnts[k] >= 0.65 * sub_max
-                    ]
+                        kc = kc @ R_m[:2, :2].T
                     if traj_leveled is not None and len(traj_leveled) > 0:
-                        sub_lo, sub_med = t_lo, t_med
-                    else:
-                        sub_med = float(np.average(sub_ctrs, weights=np.maximum(sub_cnts, 1)))
-                        sub_lo = sub_med
-                    neg_sub = [k for k in p_idx if sub_ctrs[k] < sub_lo]
-                    pos_sub_gap = [k for k in p_idx if sub_ctrs[k] > sub_med]
-                    if neg_sub and pos_sub_gap:
-                        max_neg_sub = max(sub_cnts[k] for k in neg_sub)
-                        p_lo = max(k for k in neg_sub if sub_cnts[k] >= 0.90 * max_neg_sub)
-                        p_last = max(pos_sub_gap, key=lambda k: sub_cnts[k])
-                        if (
-                            p_last + 1 < len(sub_cnts)
-                            and sub_cnts[p_last + 1] >= 0.95 * sub_cnts[p_last]
-                        ):
-                            p_last += 1
-                        lo_b = _interp_flank_crossing(
-                            sub_ctrs,
-                            sub_cnts,
-                            p_lo,
-                            +1,
-                            0.66 * float(sub_cnts[p_lo]),
-                            stop_at_valley=True,
-                        )
-                        hi_b = float(
-                            np.average(
-                                sub_ctrs[max(0, p_last - 2) : p_last + 1],
-                                weights=sub_cnts[max(0, p_last - 2) : p_last + 1],
-                            )
-                        )
-                        if 1.15 <= (hi_b - lo_b) <= 2.60:
-                            bounds.append((lo_b, hi_b))
-                            continue
+                        traj_leveled = traj_leveled[:, :2] @ R_m[:2, :2].T
 
-            peaks = [
-                k for k in range(1, len(cnts) - 1)
-                if cnts[k] >= cnts[k - 1] and cnts[k] >= cnts[k + 1] and cnts[k] >= 4450.0 * cnt_scale
-            ]
-            neg_p = [k for k in peaks if ctrs[k] < t_med]
-            pos_p = [k for k in peaks if ctrs[k] > t_med]
-            if not pos_p or ctrs[pos_p[-1]] < t_hi + 0.05:
-                pos_p.extend(
-                    k for k in range(1, len(cnts) - 1)
-                    if ctrs[k] >= t_hi + 0.15
-                    and cnts[k] >= cnts[k - 1]
-                    and cnts[k] >= cnts[k + 1]
-                    and cnts[k] >= 4350.0 * cnt_scale
-                    and k not in pos_p
-                )
-            kc_p1 = float(np.percentile(v_kc, 1.0))
-            kc_p99 = float(np.percentile(v_kc, 99.0))
+    sp_95 = np.percentile(wb[:, :2], 95.0, axis=0) - np.percentile(wb[:, :2], 5.0, axis=0)
+    s_xy = max(0.25, float(np.hypot(sp_95[0], sp_95[1])) / 2.55)
 
-            is_wide_wb = float(np.max(np.ptp(wb[:, :2], axis=0))) >= 3.00
-            if neg_p:
-                lo_idx = neg_p[0]
-                if (
-                    len(neg_p) >= 2
-                    and pos_p
-                    and (ctrs[pos_p[-1]] - ctrs[neg_p[0]]) > 2.40
-                ):
-                    neg_ratio_min = 1.30 if is_wide_wb else 1.45
-                    neg_sep_min = 0.28 if is_wide_wb else 0.30
-                    for p_k in neg_p[1:]:
-                        if (
-                            cnts[p_k] >= neg_ratio_min * cnts[neg_p[0]]
-                            and (ctrs[p_k] - ctrs[neg_p[0]]) >= neg_sep_min
-                            and abs(float(ctrs[p_k]) - t_lo) <= 0.14
-                        ):
-                            lo_idx = p_k
-                            break
-                lo_val = float(ctrs[lo_idx])
-                if t_lo < lo_val - 0.05 and kc_p1 < lo_val - 0.18:
-                    if t_lo <= kc_p1:
-                        lo_val = kc_p1
-                    else:
-                        has_outer_valley = (
-                            lo_idx >= 6
-                            and float(np.min(cnts[max(0, lo_idx - 10) : lo_idx])) < 0.20 * float(cnts[lo_idx])
-                            and float(np.max(cnts[: max(1, lo_idx - 8)])) > 0.50 * float(cnts[lo_idx])
-                        )
-                        lo_ratio = 0.28 if has_outer_valley else 0.55
-                        lo_val = max(
-                            kc_p1,
-                            _interp_flank_crossing(
-                                ctrs, cnts, lo_idx, -1, lo_ratio * float(cnts[lo_idx])
-                            ),
-                        )
-            else:
-                lo_idx = -1
-                lo_val = kc_p1
+    # Step 2: Estimate outer bounding box [x0, x1] x [y0, y1] using continuous 1D KDE
+    # + IRLS Huber M-estimator along both Manhattan axes.
+    def _solve_axis_bounds(ax: int, ortho_bounds: tuple[float, float] | None = None) -> tuple[float, float] | None:
+        wb_use = wb
+        o_span_cap = None
+        if ortho_bounds is not None:
+            o_lo, o_hi = ortho_bounds
+            o_span = o_hi - o_lo
+            wb_o_span = float(np.percentile(wb[:, 1 - ax], 98.0) - np.percentile(wb[:, 1 - ax], 2.0))
+            if o_span >= 0.40 * s_xy and wb_o_span > o_span + 0.25 * s_xy:
+                m_in_o = (wb[:, 1 - ax] >= o_lo - 0.04 * s_xy) & (wb[:, 1 - ax] <= o_hi + 0.04 * s_xy)
+                if int(np.count_nonzero(m_in_o)) >= 100:
+                    wb_use = wb[m_in_o]
+                    o_span_cap = o_span
 
-            if pos_p:
-                hi_idx = pos_p[-1]
-                best_pos_idx = max(pos_p, key=lambda idx: cnts[idx])
-                if (
-                    cnts[best_pos_idx] >= 1.25 * cnts[hi_idx]
-                    and ctrs[best_pos_idx] >= t_hi + 0.05
-                    and (ctrs[hi_idx] - ctrs[best_pos_idx]) >= 0.24
-                ) or (
-                    (float(ctrs[hi_idx]) - lo_val) > 2.40
-                    and cnts[best_pos_idx] > cnts[hi_idx]
-                    and ctrs[best_pos_idx] >= t_hi + 0.12
-                    and (ctrs[hi_idx] - ctrs[best_pos_idx]) >= 0.35
-                ):
-                    hi_idx = best_pos_idx
-                elif (
-                    len(pos_p) >= 2
-                    and 1.60 < (float(ctrs[hi_idx]) - lo_val) <= 1.70
-                    and ctrs[pos_p[-2]] >= t_hi + 0.18
-                    and 1.42 <= (float(ctrs[pos_p[-2]]) - lo_val) <= 1.50
-                    and cnts[pos_p[-2]] >= 0.92 * cnts[hi_idx]
-                ):
-                    hi_idx = pos_p[-2]
-                hi_val = float(ctrs[hi_idx])
-                if t_hi > hi_val + 0.05 and kc_p99 > hi_val + 0.18:
-                    if t_hi >= kc_p99:
-                        hi_val = kc_p99
-                    else:
-                        hi_val = min(
-                            kc_p99,
-                            _interp_flank_crossing(
-                                ctrs, cnts, hi_idx, +1, 0.73 * float(cnts[hi_idx])
-                            ),
-                        )
-            else:
-                hi_idx = -1
-                hi_val = kc_p99
+        v_wb = wb_use[:, ax]
+        v_ortho = wb_use[:, 1 - ax]
+        v_kc_ortho = kc[:, 1 - ax] if len(kc) >= 50 else v_ortho
+        ospan_wb = float(np.percentile(v_ortho, 95.0) - np.percentile(v_ortho, 5.0))
+        ospan_kc = float(np.percentile(v_kc_ortho, 95.0) - np.percentile(v_kc_ortho, 5.0))
+        core_ospan = max(min(ospan_wb, ospan_kc), 0.20 * s_xy)
+        if o_span_cap is not None:
+            core_ospan = max(min(core_ospan, o_span_cap), 0.20 * s_xy)
+        ospan99_wb = float(np.percentile(v_ortho, 99.0) - np.percentile(v_ortho, 1.0))
+        ospan99_kc = float(np.percentile(v_kc_ortho, 99.0) - np.percentile(v_kc_ortho, 1.0))
+        core_ospan_99 = max(min(ospan99_wb, ospan99_kc), 0.20 * s_xy)
+        if o_span_cap is not None:
+            core_ospan_99 = max(min(core_ospan_99, o_span_cap), 0.20 * s_xy)
+        if traj_leveled is not None and len(traj_leveled) > 0:
+            t_med = float(np.median(traj_leveled[:, ax]))
+        else:
+            t_med = float(np.median(v_wb))
 
-            if (
-                2.22 < (hi_val - lo_val) <= 2.28
-                and len(neg_p) >= 2
-                and (ctrs[neg_p[1]] - ctrs[neg_p[0]]) <= 0.11
-                and cnts[neg_p[1]] > cnts[neg_p[0]]
-                and ctrs[neg_p[1]] < t_lo
-            ):
-                lo_val = 0.5 * float(ctrs[neg_p[0]] + ctrs[neg_p[1]])
-            elif (
-                (hi_val - lo_val) >= 2.12
-                and len(pos_p) >= 2
-                and ctrs[pos_p[-1]] > t_hi + 0.75
-            ):
-                v_ortho = wb[:, 1 - ax]
-                m_outer_ortho = np.abs(v_wb - float(ctrs[pos_p[-1]])) <= 0.06
-                m_main_ortho = (v_wb >= lo_val - 0.05) & (v_wb <= float(t_hi) + 0.45)
-                ortho_outer_span = (
-                    float(np.percentile(v_ortho[m_outer_ortho], 95.0) - np.percentile(v_ortho[m_outer_ortho], 5.0))
-                    if int(np.count_nonzero(m_outer_ortho)) >= 20
-                    else 0.0
-                )
-                ortho_main_span = (
-                    float(np.percentile(v_ortho[m_main_ortho], 95.0) - np.percentile(v_ortho[m_main_ortho], 5.0))
-                    if int(np.count_nonzero(m_main_ortho)) >= 20
-                    else 1.0
-                )
-                inner_ratio_min = 0.80 if is_wide_wb else 0.90
-                inner_valley_max = 0.45 if is_wide_wb else 0.40
-                inner_cands = (
-                    [
-                        p_k
-                        for p_k in pos_p[:-1]
-                        if ctrs[p_k] >= t_hi + 0.12
-                        and (ctrs[pos_p[-1]] - ctrs[p_k]) >= 0.50
-                        and cnts[p_k] >= inner_ratio_min * cnts[pos_p[-1]]
-                        and float(np.min(cnts[p_k : pos_p[-1]])) < inner_valley_max * float(cnts[p_k])
-                    ]
-                    if ortho_outer_span < 0.70 * max(ortho_main_span, 1e-6)
-                    else []
-                )
-                if inner_cands:
-                    hi_idx = inner_cands[0]
-                    if (
-                        hi_idx > 0
-                        and ctrs[hi_idx - 1] >= t_hi + 0.15
-                        and cnts[hi_idx - 1] >= 0.95 * cnts[hi_idx]
-                    ):
-                        hi_idx -= 1
-                    hi_val = float(ctrs[hi_idx]) - 0.025
-                    if lo_idx >= 0:
-                        if abs(float(ctrs[lo_idx]) - t_lo) <= 0.06:
-                            lo_val = float(ctrs[lo_idx])
-                        elif (
-                            lo_idx > 0
-                            and abs(float(ctrs[lo_idx - 1]) - t_lo) <= 0.06
-                            and cnts[lo_idx - 1] >= 0.85 * cnts[lo_idx]
-                        ):
-                            lo_idx -= 1
-                            lo_val = float(ctrs[lo_idx])
-            elif (
-                (hi_val - lo_val) >= 2.12
-                and len(neg_p) >= 2
-                and ctrs[neg_p[0]] < t_lo - 0.75
-            ):
-                v_ortho = wb[:, 1 - ax]
-                m_outer_ortho = np.abs(v_wb - float(ctrs[neg_p[0]])) <= 0.06
-                m_main_ortho = (v_wb >= float(t_lo) - 0.45) & (v_wb <= hi_val + 0.05)
-                ortho_outer_span = (
-                    float(np.percentile(v_ortho[m_outer_ortho], 95.0) - np.percentile(v_ortho[m_outer_ortho], 5.0))
-                    if int(np.count_nonzero(m_outer_ortho)) >= 20
-                    else 0.0
-                )
-                ortho_main_span = (
-                    float(np.percentile(v_ortho[m_main_ortho], 95.0) - np.percentile(v_ortho[m_main_ortho], 5.0))
-                    if int(np.count_nonzero(m_main_ortho)) >= 20
-                    else 1.0
-                )
-                inner_neg_cands = (
-                    [
-                        p_k
-                        for p_k in neg_p[1:]
-                        if ctrs[p_k] <= t_lo - 0.15
-                        and (ctrs[p_k] - ctrs[neg_p[0]]) >= 0.50
-                        and cnts[p_k] >= 0.80 * cnts[neg_p[0]]
-                        and float(np.min(cnts[neg_p[0] : p_k + 1])) < 0.45 * float(cnts[p_k])
-                    ]
-                    if ortho_outer_span < 0.70 * max(ortho_main_span, 1e-6)
-                    else []
-                )
-                if inner_neg_cands:
-                    lo_idx = inner_neg_cands[-1]
-                    if (
-                        lo_idx + 1 < len(cnts)
-                        and ctrs[lo_idx + 1] <= t_lo - 0.15
-                        and cnts[lo_idx + 1] >= 0.95 * cnts[lo_idx]
-                    ):
-                        lo_idx += 1
-                    lo_val = float(ctrs[lo_idx]) + 0.025
-                    if hi_idx >= 0 and abs(float(ctrs[hi_idx]) - t_hi) <= 0.06:
-                        hi_val = float(ctrs[hi_idx])
+        v_p001 = float(np.percentile(v_wb, 0.1))
+        v_p999 = float(np.percentile(v_wb, 99.9))
+        v_min = max(float(v_wb.min()), v_p001 - 0.15 * s_xy) if float(v_wb.min()) < v_p001 - 0.50 * s_xy else float(v_wb.min())
+        v_max = min(float(v_wb.max()), v_p999 + 0.15 * s_xy) if float(v_wb.max()) > v_p999 + 0.50 * s_xy else float(v_wb.max())
+        if v_max - v_min < 0.25 * s_xy:
+            return None
 
-            if (hi_val - lo_val) < 1.40 and lo_idx > 0 and kc_p1 < lo_val - 0.25:
-                while lo_idx > 0 and (hi_val - lo_val) < 1.44 and cnts[lo_idx - 1] >= 5000.0 * cnt_scale and kc_p1 <= float(ctrs[lo_idx - 1]):
-                    lo_idx -= 1
-                    lo_val = float(ctrs[lo_idx])
+        step = 0.005 * s_xy
+        grid = np.arange(v_min - 0.04 * s_xy, v_max + 0.04 * s_xy + step, step)
+        if len(grid) < 8:
+            return (float(np.percentile(v_wb, 0.5)), float(np.percentile(v_wb, 99.5)))
 
-            if 1.55 <= (hi_val - lo_val) < 1.90 and (
-                (kc_p99 - kc_p1) >= 2.25
-                or (1.78 <= (hi_val - lo_val) <= 1.86 and (kc_p99 - kc_p1) >= 2.04)
-            ):
-                sub_peaks = [
-                    k for k in range(1, len(cnts) - 1)
-                    if cnts[k] >= cnts[k - 1] and cnts[k] >= cnts[k + 1] and cnts[k] >= 3600.0 * cnt_scale
-                ]
-                pos_sub = [k for k in sub_peaks if hi_val < ctrs[k] <= kc_p99]
-                if pos_sub:
-                    hi_idx = pos_sub[-1]
-                    hi_val = float(ctrs[hi_idx])
-                lo_sub_thresh = (3200.0 if len(pts_arr) < 150000 else 3600.0) * cnt_scale
-                while lo_idx > 0 and cnts[lo_idx - 1] >= lo_sub_thresh and kc_p1 <= float(ctrs[lo_idx - 1]):
-                    lo_idx -= 1
-                    lo_val = float(ctrs[lo_idx])
-                if 1.98 <= (hi_val - lo_val) <= 2.02 and kc_p99 >= hi_val + 0.02:
-                    hi_val = float(round(min(kc_p99, hi_val + 0.05), VERTEX_DECIMALS))
-            elif (
-                1.72 <= (hi_val - lo_val) <= 1.78
-                and pos_p
-                and len(neg_p) >= 2
-                and cnts[best_pos_idx] > 1.10 * cnts[hi_idx]
-                and ctrs[best_pos_idx] >= t_hi + 0.25
-                and cnts[neg_p[1]] >= 0.85 * cnts[neg_p[0]]
-                and ctrs[neg_p[1]] <= t_lo - 0.20
-            ):
-                hi_idx = best_pos_idx
-                hi_val = float(ctrs[hi_idx])
-                lo_idx = neg_p[1]
-                lo_val = float(ctrs[lo_idx]) - 0.05
+        kde = _eval_continuous_kde_1d(v_wb, grid, bandwidth=0.0125 * s_xy, window_scale=0.035 * s_xy)
+        max_kde = float(np.max(kde)) if len(kde) else 0.0
+        if max_kde <= 0.0:
+            return (float(np.percentile(v_wb, 0.5)), float(np.percentile(v_wb, 99.5)))
 
-            if 1.90 <= (hi_val - lo_val) < 2.12:
-                outer_lo_peaks = (
-                    [
-                        k for k in range(max(1, lo_idx - 5), lo_idx)
-                        if cnts[k] >= cnts[k - 1]
-                        and cnts[k] >= cnts[k + 1]
-                        and cnts[k] >= 3800.0 * cnt_scale
-                        and kc_p1 <= float(ctrs[k]) + 0.02
-                        and (hi_val - float(ctrs[k])) <= 2.22
-                    ]
-                    if ((kc_p99 - kc_p1) >= 2.60 and lo_val > t_lo - 0.12 and lo_idx >= 2)
-                    else []
-                )
-                if outer_lo_peaks:
-                    lo_idx = outer_lo_peaks[0]
-                    lo_val = float(ctrs[lo_idx])
-                elif lo_idx > 0 and cnts[lo_idx - 1] >= 6200.0 * cnt_scale and kc_p1 <= float(ctrs[lo_idx - 1]) + 0.01:
-                    lo_val = float(ctrs[lo_idx - 1])
-                    for _ in range(2):
-                        if (
-                            0 <= hi_idx < len(cnts) - 1
-                            and cnts[hi_idx + 1] >= 4000.0 * cnt_scale
-                            and kc_p99 >= float(ctrs[hi_idx + 1]) - 0.01
-                            and (float(ctrs[hi_idx + 1]) - lo_val) <= 2.22
-                        ):
-                            hi_idx += 1
-                            hi_val = float(ctrs[hi_idx])
-                        else:
-                            break
-                    if 1.98 <= (hi_val - lo_val) <= 2.02 and kc_p99 >= hi_val + 0.02:
-                        hi_val = float(round(min(kc_p99, hi_val + 0.05), VERTEX_DECIMALS))
+        min_slice_pts = max(8, int(0.00008 * len(v_wb)))
+        win_sl = 0.05 * s_xy
+        has_z_mid = wb_use.shape[1] >= 3 and int(np.count_nonzero(wb_use[:, 2] <= 0.76 * float(height_m))) >= 100
+        z_mid_mask = (wb_use[:, 2] <= 0.76 * float(height_m)) if has_z_mid else None
 
-            p02_wb = float(np.percentile(v_wb, 2.0))
-            p98_wb = float(np.percentile(v_wb, 98.0))
-            m_lo_sh = np.abs(v_wb - p02_wb) <= 0.025
-            m_hi_sh = np.abs(v_wb - p98_wb) <= 0.025
-            n_lo_sh = int(np.count_nonzero(m_lo_sh))
-            n_hi_sh = int(np.count_nonzero(m_hi_sh))
-            sh_min_cnt = max(200, int(0.12 * len(v_wb)))
-            if abs(p02_wb) <= 0.015 and (
-                (
-                    abs(lo_val - p02_wb) <= 0.035
-                    and abs(hi_val - p98_wb) <= 0.035
-                    and n_lo_sh >= 200
-                    and n_hi_sh >= 200
-                )
-                or (n_lo_sh >= sh_min_cnt and n_hi_sh >= sh_min_cnt)
-            ):
-                lo_val = float(np.median(v_wb[m_lo_sh]))
-                hi_val = float(np.median(v_wb[m_hi_sh]))
+        def _ortho_span_at(coord_val: float) -> float:
+            m_sl = np.abs(v_wb - coord_val) <= win_sl
+            sl = v_ortho[m_sl]
+            if len(sl) < min_slice_pts:
+                return 0.0
+            sp_full = float(np.percentile(sl, 95.0) - np.percentile(sl, 5.0))
+            if z_mid_mask is not None:
+                sl_mid = v_ortho[m_sl & z_mid_mask]
+                if len(sl_mid) >= min_slice_pts:
+                    sp_mid = float(np.percentile(sl_mid, 95.0) - np.percentile(sl_mid, 5.0))
+                    return min(sp_full, sp_mid)
+            return sp_full
 
-            bounds.append((lo_val, hi_val))
+        def _ortho_span_99(coord_val: float) -> float:
+            sl = v_ortho[np.abs(v_wb - coord_val) <= win_sl]
+            if len(sl) < min_slice_pts:
+                return 0.0
+            return float(np.percentile(sl, 99.0) - np.percentile(sl, 1.0))
 
-        (x0, x1), (y0, y1) = bounds[0], bounds[1]
-        is_canon_box = (
-            abs(float(np.percentile(wb[:, 0], 2.0))) <= 0.015
-            and abs(float(np.percentile(wb[:, 1], 2.0))) <= 0.015
-            and abs(x0) <= 0.015
-            and abs(y0) <= 0.015
-        )
-        if is_canon_box:
-            canon_corner_cnts = [
-                int(
-                    np.count_nonzero(
-                        (np.abs(wb[:, 0] - cx_c) <= 0.22) & (np.abs(wb[:, 1] - cy_c) <= 0.22)
-                    )
-                )
-                for cx_c in (x0, x1)
-                for cy_c in (y0, y1)
-            ]
-            if min(canon_corner_cnts) < max(50, int(300 * cnt_scale)):
-                is_canon_box = False
-        wb_expanded = False
-        if max(x1 - x0, y1 - y0) < 2.00:
-            wb_span_0 = float(np.percentile(wb[:, 0], 99.0) - np.percentile(wb[:, 0], 1.0))
-            wb_span_1 = float(np.percentile(wb[:, 1], 99.0) - np.percentile(wb[:, 1], 1.0))
-            kc_span_0 = float(np.percentile(kc[:, 0], 99.5) - np.percentile(kc[:, 0], 0.5))
-            kc_span_1 = float(np.percentile(kc[:, 1], 99.5) - np.percentile(kc[:, 1], 0.5))
-            if (y1 - y0) < 1.35 <= (x1 - x0) and 2.15 <= wb_span_1 <= 2.60:
-                y0 = float(np.percentile(wb[:, 1], 1.3))
-                y1 = float(np.percentile(wb[:, 1], 98.7))
-                wb_expanded = True
-            elif (x1 - x0) < 1.35 <= (y1 - y0) and 2.15 <= wb_span_0 <= 2.60:
-                x0 = float(np.percentile(wb[:, 0], 1.3))
-                x1 = float(np.percentile(wb[:, 0], 98.7))
-                wb_expanded = True
-            elif max(kc_span_0, kc_span_1) >= 2.15:
-                if kc_span_0 >= kc_span_1:
-                    q_lo, q_hi = (2.5, 97.5) if kc_span_0 > 2.22 else (0.5, 99.5)
-                    x0 = float(np.percentile(kc[:, 0], q_lo))
-                    x1 = float(np.percentile(kc[:, 0], q_hi))
-                else:
-                    q_lo, q_hi = (2.5, 97.5) if kc_span_1 > 2.22 else (0.5, 99.5)
-                    y0 = float(np.percentile(kc[:, 1], q_lo))
-                    y1 = float(np.percentile(kc[:, 1], q_hi))
-                wb_expanded = max(wb_span_0, wb_span_1) < 2.15
-
-        wb_in_box = wb[
-            (wb[:, 0] >= x0 - 0.05)
-            & (wb[:, 0] <= x1 + 0.05)
-            & (wb[:, 1] >= y0 - 0.05)
-            & (wb[:, 1] <= y1 + 0.05)
+        peaks = [
+            i
+            for i in range(1, len(kde) - 1)
+            if kde[i] >= kde[i - 1]
+            and kde[i] >= kde[i + 1]
+            and kde[i] >= 0.08 * max_kde
         ]
-        l_cands = []
-        if not is_canon_box and not wb_expanded and float(np.min(np.ptp(wb[:, :2], axis=0) - np.ptp(kc[:, :2], axis=0))) < 0.85:
-            kc_in_box = kc[
-                (kc[:, 0] >= x0 - 0.05)
-                & (kc[:, 0] <= x1 + 0.05)
-                & (kc[:, 1] >= y0 - 0.05)
-                & (kc[:, 1] <= y1 + 0.05)
+
+        p05 = float(np.percentile(v_wb, 0.5))
+        p02 = float(np.percentile(v_wb, 2.0))
+        p98 = float(np.percentile(v_wb, 98.0))
+        p995 = float(np.percentile(v_wb, 99.5))
+        is_clean_lo = (
+            (p05 - float(v_wb.min())) <= 0.06 * s_xy
+            and (p02 - p05) <= 0.035 * s_xy
+            and _ortho_span_99(p05) >= 0.50 * core_ospan_99
+        )
+        is_clean_hi = (
+            (float(v_wb.max()) - p995) <= 0.06 * s_xy
+            and (p995 - p98) <= 0.035 * s_xy
+            and _ortho_span_99(p995) >= 0.50 * core_ospan_99
+        )
+
+        span_gate = (0.54 if o_span_cap is not None else 0.55) * core_ospan
+        lo_peaks = [i for i in peaks if grid[i] <= t_med and _ortho_span_at(float(grid[i])) >= span_gate]
+        lo_init = p05 if is_clean_lo else float(np.percentile(v_wb, 1.0))
+        if lo_peaks:
+            max_lo_kde = max(float(kde[i]) for i in lo_peaks)
+            best_lo_idx = max(lo_peaks, key=lambda i: float(kde[i]))
+            cand_lo = [
+                i
+                for i in lo_peaks
+                if float(kde[i]) >= (0.20 if is_clean_lo else 0.48) * max_lo_kde
+                or (float(kde[i]) >= 0.25 * max_lo_kde and abs(float(grid[i]) - p05) <= 0.025 * s_xy)
             ]
-            l_cands.append((fit_missing_corner_l_shape(wb_in_box, return_info=True), False))
-            l_cands.append((fit_missing_corner_l_shape(kc_in_box, return_info=True), False))
-            if len(wb_in_box) >= 1000 and len(kc_in_box) >= 500:
-                corner_defs = [
-                    (0, x0, y0, 1.0, 1.0),
-                    (1, x1, y0, -1.0, 1.0),
-                    (2, x1, y1, -1.0, -1.0),
-                    (3, x0, y1, 1.0, -1.0),
-                ]
-                c_stats = []
-                for cid, cx, cy, sx_d, sy_d in corner_defs:
-                    dx_c = sx_d * (wb_in_box[:, 0] - cx)
-                    dy_c = sy_d * (wb_in_box[:, 1] - cy)
-                    dx_kc = sx_d * (kc_in_box[:, 0] - cx)
-                    dy_kc = sy_d * (kc_in_box[:, 1] - cy)
-                    apx = int(np.count_nonzero((dx_c >= -0.05) & (dx_c <= 0.22) & (dy_c >= -0.05) & (dy_c <= 0.22)))
-                    c45 = int(np.count_nonzero((dx_c >= -0.05) & (dx_c <= 0.45) & (dy_c >= -0.05) & (dy_c <= 0.45)))
-                    kc_c45 = int(np.count_nonzero((dx_kc >= -0.05) & (dx_kc <= 0.45) & (dy_kc >= -0.05) & (dy_kc <= 0.45)))
-                    hol = int(np.count_nonzero((dx_c >= 0.08) & (dx_c <= 0.32) & (dy_c >= 0.08) & (dy_c <= 0.28)))
-                    m_sx = (dx_c >= 0.35) & (dx_c <= 0.50) & (dy_c >= 0.0) & (dy_c <= 0.45)
-                    m_sy = (dy_c >= 0.35) & (dy_c <= 0.50) & (dx_c >= 0.0) & (dx_c <= 0.45)
-                    c_stats.append((cid, cx, cy, sx_d, sy_d, c45, hol, m_sx, m_sy, apx, kc_c45))
-                min_hol_idx = int(np.argmin([s[6] for s in c_stats]))
-                cid, cx, cy, sx_d, sy_d, c45, hol, m_sx, m_sy, apx, _ = c_stats[min_hol_idx]
-                other_hols = [s[6] for idx_s, s in enumerate(c_stats) if idx_s != min_hol_idx]
-                other_c45s = [s[5] for idx_s, s in enumerate(c_stats) if idx_s != min_hol_idx]
-                other_kc_c45s = [s[10] for idx_s, s in enumerate(c_stats) if idx_s != min_hol_idx]
-                sx_cnt = int(np.count_nonzero(m_sx))
-                sy_cnt = int(np.count_nonzero(m_sy))
-                is_origin_box = abs(x0) <= 0.02 and abs(y0) <= 0.02
-                is_wide_unchoked = float(np.min(np.ptp(kc[:, :2], axis=0))) >= 2.75
-                if (
-                    (hol <= max(35, int(160 * cnt_scale)) or hol <= 0.15 * min(other_hols))
-                    and min(other_hols) >= max(180, int(650 * cnt_scale))
-                    and min(other_kc_c45s) >= max(100, int(350 * cnt_scale))
-                    and (c45 < 0.35 * min(other_c45s) or ((is_origin_box or is_wide_unchoked) and c45 < 0.80 * min(other_c45s)))
-                    and (apx <= max(25, int(100 * cnt_scale)) or is_origin_box or is_wide_unchoked)
-                    and sx_cnt >= max(70, int(250 * cnt_scale))
-                    and sy_cnt >= max(70, int(250 * cnt_scale))
-                ):
-                    mx_h = float(np.median(wb_in_box[m_sx, 0]))
-                    my_h = float(np.median(wb_in_box[m_sy, 1]))
-                    if (
-                        cid == 1
-                        and (x1 - x0) >= 2.15
-                        and (y1 - y0) >= 1.85
-                        and apx > max(25, int(100 * cnt_scale))
-                    ):
-                        y0 = float(round(my_h + 0.05, VERTEX_DECIMALS))
-                        l_cands = []
-                    else:
-                        if cid == 0:
-                            hc_cand = np.array([[mx_h, y0], [x1, y0], [x1, y1], [x0, y1], [x0, my_h], [mx_h, my_h]], dtype=float)
-                        elif cid == 1:
-                            hc_cand = np.array([[x0, y0], [mx_h, y0], [mx_h, my_h], [x1, my_h], [x1, y1], [x0, y1]], dtype=float)
-                        elif cid == 2:
-                            hc_cand = np.array([[x0, y0], [x1, y0], [x1, my_h], [mx_h, my_h], [mx_h, y1], [x0, y1]], dtype=float)
-                        else:
-                            hc_cand = np.array([[x0, y0], [x1, y0], [x1, y1], [mx_h, y1], [mx_h, my_h], [x0, my_h]], dtype=float)
-                        l_cands.append((hc_cand, True))
+            chosen_lo_idx = cand_lo[0]
+            if chosen_lo_idx < best_lo_idx:
+                val_slice = kde[chosen_lo_idx : best_lo_idx + 1]
+                min_rel = int(np.argmin(val_slice))
+                val_min = float(val_slice[min_rel])
+                val_coord = float(grid[chosen_lo_idx + min_rel])
+                if val_min < 0.25 * float(kde[chosen_lo_idx]) and _ortho_span_at(val_coord) < 0.65 * core_ospan:
+                    chosen_lo_idx = best_lo_idx
+            lo_init = float(grid[chosen_lo_idx])
+            if is_clean_lo and (lo_init - p05) > 0.08 * s_xy:
+                idx_p05 = max(0, min(len(kde) - 1, int(np.searchsorted(grid, p05))))
+                has_empty_gap_lo = False
+                if idx_p05 < chosen_lo_idx:
+                    v_sl = kde[idx_p05 : chosen_lo_idx + 1]
+                    m_rel = int(np.argmin(v_sl))
+                    if float(v_sl[m_rel]) <= 1e-6 and _ortho_span_at(float(grid[idx_p05 + m_rel])) <= 0.0:
+                        has_empty_gap_lo = True
+                if not has_empty_gap_lo:
+                    lo_init = p05
 
-    for l_cand, hollow_corner_used in l_cands:
-        if l_cand is None:
+        hi_peaks = [i for i in peaks if grid[i] >= t_med and _ortho_span_at(float(grid[i])) >= span_gate]
+        hi_init = p995 if is_clean_hi else float(np.percentile(v_wb, 99.0))
+        if hi_peaks:
+            max_hi_kde = max(float(kde[i]) for i in hi_peaks)
+            best_hi_idx = max(hi_peaks, key=lambda i: float(kde[i]))
+            cand_hi = [
+                i
+                for i in hi_peaks
+                if float(kde[i]) >= (0.20 if is_clean_hi else 0.48) * max_hi_kde
+                or (float(kde[i]) >= 0.25 * max_hi_kde and abs(float(grid[i]) - p995) <= 0.025 * s_xy)
+            ]
+            chosen_hi_idx = cand_hi[-1]
+            if chosen_hi_idx > best_hi_idx:
+                val_slice = kde[best_hi_idx : chosen_hi_idx + 1]
+                min_rel = int(np.argmin(val_slice))
+                val_min = float(val_slice[min_rel])
+                val_coord = float(grid[best_hi_idx + min_rel])
+                if val_min < 0.25 * float(kde[chosen_hi_idx]) and _ortho_span_at(val_coord) < 0.65 * core_ospan:
+                    chosen_hi_idx = best_hi_idx
+            hi_init = float(grid[chosen_hi_idx])
+            if is_clean_hi and (p995 - hi_init) > 0.08 * s_xy:
+                idx_p995 = max(0, min(len(kde) - 1, int(np.searchsorted(grid, p995))))
+                has_empty_gap_hi = False
+                if idx_p995 > chosen_hi_idx:
+                    v_sl = kde[chosen_hi_idx : idx_p995 + 1]
+                    m_rel = int(np.argmin(v_sl))
+                    if float(v_sl[m_rel]) <= 1e-6 and _ortho_span_at(float(grid[chosen_hi_idx + m_rel])) <= 0.0:
+                        has_empty_gap_hi = True
+                if not has_empty_gap_hi:
+                    hi_init = p995
+
+        lo_win = v_wb[np.abs(v_wb - lo_init) <= win_sl]
+        lo_cont = (
+            lo_init
+            if (is_clean_lo and abs(lo_init - p05) <= 1e-6)
+            else (_irls_huber_1d_lidar(lo_win, lo_init, delta=0.015 * s_xy) if len(lo_win) >= min_slice_pts else lo_init)
+        )
+        hi_win = v_wb[np.abs(v_wb - hi_init) <= win_sl]
+        hi_cont = (
+            hi_init
+            if (is_clean_hi and abs(hi_init - p995) <= 1e-6)
+            else (_irls_huber_1d_lidar(hi_win, hi_init, delta=0.015 * s_xy) if len(hi_win) >= min_slice_pts else hi_init)
+        )
+        return (float(lo_cont), float(hi_cont))
+
+    b0 = _solve_axis_bounds(0, None)
+    if b0 is None:
+        return None
+    b1 = _solve_axis_bounds(1, b0)
+    if b1 is None:
+        return None
+    b0_ref = _solve_axis_bounds(0, b1)
+    if b0_ref is not None:
+        b0 = b0_ref
+    b1_ref = _solve_axis_bounds(1, b0)
+    if b1_ref is not None:
+        b1 = b1_ref
+    cont_bounds = [b0, b1]
+
+    (x0_cont, x1_cont), (y0_cont, y1_cont) = cont_bounds
+    span_x_box = x1_cont - x0_cont
+    span_y_box = y1_cont - y0_cont
+    if span_x_box < 0.40 * s_xy or span_y_box < 0.40 * s_xy:
+        return None
+
+    in_box_mask = (
+        (wb[:, 0] >= x0_cont - 0.06 * s_xy)
+        & (wb[:, 0] <= x1_cont + 0.06 * s_xy)
+        & (wb[:, 1] >= y0_cont - 0.06 * s_xy)
+        & (wb[:, 1] <= y1_cont + 0.06 * s_xy)
+    )
+    wb_in_box = wb[in_box_mask]
+    if len(wb_in_box) < 50:
+        wb_in_box = wb
+
+    # Step 3: Evaluate L-shape candidates via density-normalized corner-notch detection
+    # and continuous 1D KDE + IRLS step-wall fitting.
+    l_cands: list[tuple[np.ndarray, bool]] = []
+    xw0 = min(x0_cont, float(np.percentile(wb[:, 0], 2.0)))
+    xw1 = max(x1_cont, float(np.percentile(wb[:, 0], 98.0)))
+    yw0 = min(y0_cont, float(np.percentile(wb[:, 1], 2.0)))
+    yw1 = max(y1_cont, float(np.percentile(wb[:, 1], 98.0)))
+    corners_spec = [
+        ("bl", x0_cont, y0_cont, xw0, yw0, +1.0, +1.0),
+        ("br", x1_cont, y0_cont, xw1, yw0, -1.0, +1.0),
+        ("tr", x1_cont, y1_cont, xw1, yw1, -1.0, -1.0),
+        ("tl", x0_cont, y1_cont, xw0, yw1, +1.0, -1.0),
+    ]
+    ck_counts: dict[str, int] = {}
+    cw_counts: dict[str, int] = {}
+    c_lo = -0.04 * s_xy
+    c_hi = 0.22 * s_xy
+    for cname, cx, cy, cxw, cyw, sx, sy in corners_spec:
+        ck_counts[cname] = int(
+            np.count_nonzero(
+                (sx * (wb_in_box[:, 0] - cx) >= c_lo)
+                & (sx * (wb_in_box[:, 0] - cx) <= c_hi)
+                & (sy * (wb_in_box[:, 1] - cy) >= c_lo)
+                & (sy * (wb_in_box[:, 1] - cy) <= c_hi)
+            )
+        )
+        cw_counts[cname] = int(
+            np.count_nonzero(
+                (sx * (wb[:, 0] - cxw) >= c_lo)
+                & (sx * (wb[:, 0] - cxw) <= c_hi)
+                & (sy * (wb[:, 1] - cyw) >= c_lo)
+                & (sy * (wb[:, 1] - cyw) <= c_hi)
+            )
+        )
+
+    med_ck = max(float(np.median(list(ck_counts.values()))), 1.0)
+    nz_cw = [v for v in cw_counts.values() if v > 0]
+    med_cw = max(float(np.median(nz_cw)) if nz_cw else 1.0, 1.0)
+    max_cw_empty = max(2, int(0.00012 * len(wb)))
+    min_sub_pts = max(10, int(0.00018 * len(wb_in_box)))
+    min_seg_pts = max(8, int(0.00010 * len(wb_in_box)))
+    min_kde_pk = max(3.0, 0.00006 * len(wb_in_box))
+    has_outer_shift = (
+        (xw0 < x0_cont - 0.02 * s_xy)
+        or (xw1 > x1_cont + 0.02 * s_xy)
+        or (yw0 < y0_cont - 0.02 * s_xy)
+        or (yw1 > y1_cont + 0.02 * s_xy)
+    )
+    best_corner_l = None
+    best_corner_score = -1.0
+    for cname, cx, cy, _cxw, _cyw, sx, sy in corners_spec:
+        rk = float(ck_counts[cname]) / med_ck
+        rw = float(cw_counts[cname]) / med_cw
+        other_cks = [ck_counts[k] for k in ck_counts if k != cname]
+        other_cws = [cw_counts[k] for k in cw_counts if k != cname]
+        other_rks = [float(c) / med_ck for c in other_cks]
+        other_populated = (
+            min(other_cks) >= 0.25 * max(max(other_cks), 1)
+            and min(other_cks) >= max(8, int(0.0012 * len(wb_in_box)))
+        )
+        cond_box_notch = (
+            rk <= 0.42
+            and rw <= 0.40
+            and min(other_rks) >= 0.65
+            and min(other_cws) >= 0.25 * max(max(other_cws), 1)
+            and (has_outer_shift or other_populated)
+        )
+        cond_outer_notch = (
+            cw_counts[cname] <= max_cw_empty
+            and (
+                (rk <= 0.70 and min(other_rks) >= 0.50)
+                or (rk <= 0.78 and min(other_rks) >= 0.88)
+            )
+            and (has_outer_shift or other_populated)
+        )
+        if not (cond_box_notch or cond_outer_notch):
             continue
-        l_poly = l_cand[0] if isinstance(l_cand, tuple) else l_cand
-        l_poly = np.asarray(l_poly, dtype=float).copy()
-        if len(l_poly) == 6:
-            xs = l_poly[:, 0]
-            ys = l_poly[:, 1]
-            lx0, lx1 = float(xs.min()), float(xs.max())
-            ly0, ly1 = float(ys.min()), float(ys.max())
-            mid_x_vals = [float(x) for x in xs if abs(x - lx0) > 0.05 and abs(x - lx1) > 0.05]
-            mid_y_vals = [float(y) for y in ys if abs(y - ly0) > 0.05 and abs(y - ly1) > 0.05]
-            if mid_x_vals and mid_y_vals:
-                mx_raw = float(np.median(mid_x_vals))
-                my_raw = float(np.median(mid_y_vals))
-                mx, my = mx_raw, my_raw
-                if not (x0 + 0.30 <= mx <= x1 - 0.30 and y0 + 0.30 <= my <= y1 - 0.30):
-                    if (lx1 - lx0) > 0.5 and (ly1 - ly0) > 0.5:
-                        mx = x0 + ((mx_raw - lx0) / (lx1 - lx0)) * (x1 - x0)
-                        my = y0 + ((my_raw - ly0) / (ly1 - ly0)) * (y1 - y0)
-                poly_sh = ShapelyPolygon(l_poly)
-                quadrants = [
-                    (x0, mx, y0, my, 0.5 * (lx0 + mx_raw), 0.5 * (ly0 + my_raw)),
-                    (mx, x1, y0, my, 0.5 * (mx_raw + lx1), 0.5 * (ly0 + my_raw)),
-                    (mx, x1, my, y1, 0.5 * (mx_raw + lx1), 0.5 * (my_raw + ly1)),
-                    (x0, mx, my, y1, 0.5 * (lx0 + mx_raw), 0.5 * (my_raw + ly1)),
-                ]
-                missing_q = None
-                for qx0, qx1, qy0, qy1, tqx, tqy in quadrants:
-                    if not poly_sh.contains(ShapelyPoint(tqx, tqy)):
-                        missing_q = (qx0, qx1, qy0, qy1)
-                        break
-                if missing_q is not None:
-                    nx0, nx1, ny0, ny1 = missing_q
-                    notch_w = nx1 - nx0
-                    notch_h = ny1 - ny0
-                    traj_in_notch = False
-                    if traj_leveled is not None and len(traj_leveled) > 0:
-                        tx = traj_leveled[:, 0]
-                        ty = traj_leveled[:, 1]
-                        t_in_pad = 0.10 if hollow_corner_used else 0.05
-                        in_x = (tx > nx0 + 0.05) & (tx < nx1 - t_in_pad)
-                        in_y = (ty > ny0 + 0.05) & (ty < ny1 - t_in_pad)
-                        if bool(np.any(in_x & in_y)):
-                            traj_in_notch = True
-                    if (
-                        notch_h > 0.55
-                        and 0.22 <= notch_w <= 0.42
-                        and (y1 - y0) <= 1.55
-                        and abs(nx0 - x0) < 0.05
-                        and abs(ny1 - y1) < 0.05
-                    ):
-                        m_stepx = (
-                            (wb_in_box[:, 0] >= x0 + 0.28)
-                            & (wb_in_box[:, 0] <= x0 + 0.55)
-                            & (wb_in_box[:, 1] >= y1 - 0.45)
-                            & (wb_in_box[:, 1] <= y1)
-                        )
-                        if int(np.count_nonzero(m_stepx)) >= max(120, int(350 * cnt_scale)):
-                            mx_ref = float(np.median(wb_in_box[m_stepx, 0]))
-                            y_lo_h = max(y1 - 0.52, y0 + 0.96)
-                            m_horiz = (
-                                (wb_in_box[:, 0] >= x0 + 0.04)
-                                & (wb_in_box[:, 0] <= mx_ref - 0.04)
-                                & (wb_in_box[:, 1] >= y_lo_h)
-                                & (wb_in_box[:, 1] <= y1 - 0.34)
-                            )
-                            if int(np.count_nonzero(m_horiz)) >= max(70, int(200 * cnt_scale)):
-                                my_ref = float(np.median(wb_in_box[m_horiz, 1]))
-                                if y_lo_h <= my_ref <= y1 - 0.36:
-                                    mx = mx_ref
-                                    my = my_ref
-                                    nx1 = mx
-                                    ny0 = my
-                                    notch_w = nx1 - nx0
-                                    notch_h = ny1 - ny0
-                    elif (
-                        0.22 <= notch_w <= 0.38
-                        and 0.25 <= notch_h <= 0.65
-                        and (y1 - y0) >= 2.00
-                        and abs(nx0 - x0) < 0.05
-                        and abs(ny1 - y1) < 0.05
-                    ):
-                        m_sx_tl = (
-                            (wb_in_box[:, 0] >= x0 + 0.35)
-                            & (wb_in_box[:, 0] <= x0 + 0.50)
-                            & (wb_in_box[:, 1] >= y1 - 0.45)
-                            & (wb_in_box[:, 1] <= y1)
-                        )
-                        m_sy_tl = (
-                            (wb_in_box[:, 1] >= y1 - 0.50)
-                            & (wb_in_box[:, 1] <= y1 - 0.35)
-                            & (wb_in_box[:, 0] >= x0)
-                            & (wb_in_box[:, 0] <= x0 + 0.45)
-                        )
-                        apx_tl = int(
-                            np.count_nonzero(
-                                (wb_in_box[:, 0] <= x0 + 0.22) & (wb_in_box[:, 1] >= y1 - 0.22)
-                            )
-                        )
-                        n_sx_tl = int(np.count_nonzero(m_sx_tl))
-                        n_sy_tl = int(np.count_nonzero(m_sy_tl))
-                        if (
-                            n_sx_tl >= max(800, int(2500 * cnt_scale))
-                            and n_sy_tl >= max(800, int(2500 * cnt_scale))
-                            and apx_tl < 0.12 * min(n_sx_tl, n_sy_tl)
-                        ):
-                            mx = float(np.median(wb_in_box[m_sx_tl, 0]))
-                            my = float(np.median(wb_in_box[m_sy_tl, 1]))
-                            nx1 = mx
-                            ny0 = my
-                            notch_w = nx1 - nx0
-                            notch_h = ny1 - ny0
-                            traj_in_notch = False
-                            if traj_leveled is not None and len(traj_leveled) > 0:
-                                tx = traj_leveled[:, 0]
-                                ty = traj_leveled[:, 1]
-                                if bool(np.any((tx > nx0 + 0.05) & (tx < nx1 - 0.05) & (ty > ny0 + 0.05) & (ty < ny1 - 0.05))):
-                                    traj_in_notch = True
-                    for idx_v in range(len(l_poly)):
-                        if abs(l_poly[idx_v, 0] - lx0) < 0.05:
-                            l_poly[idx_v, 0] = x0
-                        elif abs(l_poly[idx_v, 0] - lx1) < 0.05:
-                            l_poly[idx_v, 0] = x1
-                        elif abs(l_poly[idx_v, 0] - mx_raw) < 0.08:
-                            l_poly[idx_v, 0] = mx
-                        if abs(l_poly[idx_v, 1] - ly0) < 0.05:
-                            l_poly[idx_v, 1] = y0
-                        elif abs(l_poly[idx_v, 1] - ly1) < 0.05:
-                            l_poly[idx_v, 1] = y1
-                        elif abs(l_poly[idx_v, 1] - my_raw) < 0.08:
-                            l_poly[idx_v, 1] = my
-                    ax_x = x0 if abs(nx0 - x0) < 0.05 else x1
-                    ax_y = y0 if abs(ny0 - y0) < 0.05 else y1
-                    apex_cnt = int(
-                        np.count_nonzero(
-                            (np.abs(wb_in_box[:, 0] - ax_x) <= 0.22)
-                            & (np.abs(wb_in_box[:, 1] - ax_y) <= 0.22)
-                        )
-                    )
-                    step_x_cnt = int(
-                        np.count_nonzero(
-                            (np.abs(wb_in_box[:, 0] - mx) <= 0.06)
-                            & (wb_in_box[:, 1] >= ny0)
-                            & (wb_in_box[:, 1] <= ny1)
-                        )
-                    )
-                    step_y_cnt = int(
-                        np.count_nonzero(
-                            (np.abs(wb_in_box[:, 1] - my) <= 0.06)
-                            & (wb_in_box[:, 0] >= nx0)
-                            & (wb_in_box[:, 0] <= nx1)
-                        )
-                    )
-                    is_bl_long_x = (
-                        abs(ax_x - x0) < 0.05
-                        and abs(ax_y - y0) < 0.05
-                        and (x1 - x0) > (y1 - y0)
-                    )
-                    if apex_cnt > (step_x_cnt + step_y_cnt) or is_bl_long_x or notch_w < 0.35:
-                        opp_ay = y1 if abs(ax_y - y0) < 0.05 else y0
-                        opp_my = (y1 - notch_h) if abs(ax_y - y0) < 0.05 else (y0 + notch_h)
-                        if notch_h > 0.55 and (y1 - y0) > 1.85:
-                            y_band_lo = (y1 - 0.52) if abs(opp_ay - y1) < 0.05 else (y0 + 0.36)
-                            y_band_hi = (y1 - 0.36) if abs(opp_ay - y1) < 0.05 else (y0 + 0.52)
-                            m_opp_sy = (
-                                (wb_in_box[:, 0] >= nx0)
-                                & (wb_in_box[:, 0] <= nx1)
-                                & (wb_in_box[:, 1] >= y_band_lo)
-                                & (wb_in_box[:, 1] <= y_band_hi)
-                            )
-                            if int(np.count_nonzero(m_opp_sy)) >= max(80, int(250 * cnt_scale)):
-                                opp_my = float(np.median(wb_in_box[m_opp_sy, 1]))
-                        opp_ny0, opp_ny1 = min(opp_ay, opp_my), max(opp_ay, opp_my)
-                        opp_apex_cnt = int(
-                            np.count_nonzero(
-                                (np.abs(wb_in_box[:, 0] - ax_x) <= 0.22)
-                                & (np.abs(wb_in_box[:, 1] - opp_ay) <= 0.22)
-                            )
-                        )
-                        opp_step_x = int(
-                            np.count_nonzero(
-                                (np.abs(wb_in_box[:, 0] - mx) <= 0.06)
-                                & (wb_in_box[:, 1] >= opp_ny0)
-                                & (wb_in_box[:, 1] <= opp_ny1)
-                            )
-                        )
-                        opp_step_y = int(
-                            np.count_nonzero(
-                                (np.abs(wb_in_box[:, 1] - opp_my) <= 0.06)
-                                & (wb_in_box[:, 0] >= nx0)
-                                & (wb_in_box[:, 0] <= nx1)
-                            )
-                        )
-                        opp_traj = False
-                        if traj_leveled is not None and len(traj_leveled) > 0:
-                            tx = traj_leveled[:, 0]
-                            ty = traj_leveled[:, 1]
-                            if bool(
-                                np.any(
-                                    (tx > nx0 + 0.05)
-                                    & (tx < nx1 - 0.20)
-                                    & (ty > opp_ny0 + 0.05)
-                                    & (ty < opp_ny1 - 0.05)
-                                )
-                            ):
-                                opp_traj = True
-                        if not opp_traj and (
-                            (
-                                apex_cnt > (step_x_cnt + step_y_cnt)
-                                and opp_apex_cnt < 0.20 * apex_cnt
-                                and (opp_step_x + opp_step_y) > 5.0 * max(opp_apex_cnt, 1)
-                            )
-                            or (
-                                is_bl_long_x
-                                and opp_step_x > 1.25 * step_x_cnt
-                                and opp_step_y >= 0.75 * step_y_cnt
-                            )
-                        ):
-                            old_flip_my = (y0 + y1) - my
-                            l_poly[:, 1] = (y0 + y1) - l_poly[:, 1]
-                            for idx_v in range(len(l_poly)):
-                                if abs(l_poly[idx_v, 1] - old_flip_my) < 0.05:
-                                    l_poly[idx_v, 1] = opp_my
-                            l_poly = l_poly[::-1]
-                            ny0, ny1 = opp_ny0, opp_ny1
-                            my = opp_my
-                            notch_h = ny1 - ny0
-                            ax_y = opp_ay
-                            apex_cnt = opp_apex_cnt
-                            step_x_cnt = opp_step_x
-                            step_y_cnt = opp_step_y
-                            traj_in_notch = False
-                        elif apex_cnt > (step_x_cnt + step_y_cnt) or notch_w < 0.35:
-                            opp_ax = x1 if abs(ax_x - x0) < 0.05 else x0
-                            opp_mx = (x1 - notch_w) if abs(ax_x - x0) < 0.05 else (x0 + notch_w)
-                            if notch_w < 0.35 and (x1 - x0) >= 1.35:
-                                x_band_lo = (x1 - 0.50) if abs(opp_ax - x1) < 0.05 else (x0 + 0.35)
-                                x_band_hi = (x1 - 0.35) if abs(opp_ax - x1) < 0.05 else (x0 + 0.50)
-                                m_opp_sx = (
-                                    (wb_in_box[:, 0] >= x_band_lo)
-                                    & (wb_in_box[:, 0] <= x_band_hi)
-                                    & (wb_in_box[:, 1] >= ny0)
-                                    & (wb_in_box[:, 1] <= ny1)
-                                )
-                                if int(np.count_nonzero(m_opp_sx)) >= max(80, int(250 * cnt_scale)):
-                                    opp_mx = float(np.median(wb_in_box[m_opp_sx, 0]))
-                            opp_nx0, opp_nx1 = min(opp_ax, opp_mx), max(opp_ax, opp_mx)
-                            opp_apex_x = int(
-                                np.count_nonzero(
-                                    (np.abs(wb_in_box[:, 0] - opp_ax) <= 0.22)
-                                    & (np.abs(wb_in_box[:, 1] - ax_y) <= 0.22)
-                                )
-                            )
-                            opp_sx_x = int(
-                                np.count_nonzero(
-                                    (np.abs(wb_in_box[:, 0] - opp_mx) <= 0.06)
-                                    & (wb_in_box[:, 1] >= ny0)
-                                    & (wb_in_box[:, 1] <= ny1)
-                                )
-                            )
-                            opp_sy_x = int(
-                                np.count_nonzero(
-                                    (np.abs(wb_in_box[:, 1] - my) <= 0.06)
-                                    & (wb_in_box[:, 0] >= opp_nx0)
-                                    & (wb_in_box[:, 0] <= opp_nx1)
-                                )
-                            )
-                            opp_traj_x = False
-                            if traj_leveled is not None and len(traj_leveled) > 0:
-                                tx = traj_leveled[:, 0]
-                                ty = traj_leveled[:, 1]
-                                if bool(
-                                    np.any(
-                                        (tx > opp_nx0 + 0.05)
-                                        & (tx < opp_nx1 - 0.15)
-                                        & (ty > ny0 + 0.05)
-                                        & (ty < ny1 - 0.05)
-                                    )
-                                ):
-                                    opp_traj_x = True
-                            if (
-                                not opp_traj_x
-                                and opp_apex_x < 0.35 * max(apex_cnt, 1)
-                                and (opp_sx_x + opp_sy_x) > 3.0 * max(opp_apex_x, 1)
-                            ):
-                                old_flip_mx = (x0 + x1) - mx
-                                l_poly[:, 0] = (x0 + x1) - l_poly[:, 0]
-                                for idx_v in range(len(l_poly)):
-                                    if abs(l_poly[idx_v, 0] - old_flip_mx) < 0.05:
-                                        l_poly[idx_v, 0] = opp_mx
-                                l_poly = l_poly[::-1]
-                                nx0, nx1 = opp_nx0, opp_nx1
-                                mx = opp_mx
-                                notch_w = nx1 - nx0
-                                ax_x = opp_ax
-                                traj_in_notch = False
-                    geom_ok = (
-                        min(notch_w, notch_h) >= (0.335 if (notch_h > 0.60 and (y1 - y0) <= 1.55) else 0.35)
-                        and max(notch_w, notch_h) >= 0.42
-                        and (notch_w * notch_h) >= (0.15 if len(pts_arr) < 150000 else 0.16)
-                    )
-                    if geom_ok and not traj_in_notch:
-                        l_poly = close_orthogonal_polygon(l_poly)
-                        hints = _hints_from_ring(l_poly)
-                        if len(hints) == 6:
-                            return hints
 
-    rect_ring = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=float)
-    return _hints_from_ring(rect_ring)
+        dx_lo, dx_hi = 0.14 * span_x_box, 0.55 * span_x_box
+        dy_lo, dy_hi = 0.14 * span_y_box, 0.55 * span_y_box
+        sub_x = wb_in_box[
+            (sy * (wb_in_box[:, 1] - cy) >= 0.0)
+            & (sy * (wb_in_box[:, 1] - cy) <= 0.45 * span_y_box)
+            & (sx * (wb_in_box[:, 0] - cx) >= dx_lo)
+            & (sx * (wb_in_box[:, 0] - cx) <= dx_hi)
+        ]
+        sub_y = wb_in_box[
+            (sx * (wb_in_box[:, 0] - cx) >= 0.0)
+            & (sx * (wb_in_box[:, 0] - cx) <= 0.45 * span_x_box)
+            & (sy * (wb_in_box[:, 1] - cy) >= dy_lo)
+            & (sy * (wb_in_box[:, 1] - cy) <= dy_hi)
+        ]
+        if len(sub_x) < min_sub_pts or len(sub_y) < min_sub_pts:
+            continue
+
+        gx = np.linspace(min(cx + sx * dx_lo, cx + sx * dx_hi), max(cx + sx * dx_lo, cx + sx * dx_hi), 60)
+        gy = np.linspace(min(cy + sy * dy_lo, cy + sy * dy_hi), max(cy + sy * dy_lo, cy + sy * dy_hi), 60)
+        kde_x = _eval_continuous_kde_1d(sub_x[:, 0], gx, bandwidth=0.012 * s_xy, window_scale=0.04 * s_xy)
+        kde_y = _eval_continuous_kde_1d(sub_y[:, 1], gy, bandwidth=0.012 * s_xy, window_scale=0.04 * s_xy)
+        if len(kde_x) == 0 or len(kde_y) == 0 or np.max(kde_x) < min_kde_pk or np.max(kde_y) < min_kde_pk:
+            continue
+
+        pk_rel_min = 0.55 if cond_box_notch else 0.72
+        pks_x = [
+            i
+            for i in range(1, len(kde_x) - 1)
+            if kde_x[i] >= kde_x[i - 1]
+            and kde_x[i] >= kde_x[i + 1]
+            and kde_x[i] >= pk_rel_min * float(np.max(kde_x))
+        ]
+        pks_y = [
+            i
+            for i in range(1, len(kde_y) - 1)
+            if kde_y[i] >= kde_y[i - 1]
+            and kde_y[i] >= kde_y[i + 1]
+            and kde_y[i] >= pk_rel_min * float(np.max(kde_y))
+        ]
+        ix_step = (
+            float(min((gx[i] for i in pks_x), key=lambda v: abs(v - cx)))
+            if pks_x
+            else float(gx[int(np.argmax(kde_x))])
+        )
+        iy_step = (
+            float(min((gy[i] for i in pks_y), key=lambda v: abs(v - cy)))
+            if pks_y
+            else float(gy[int(np.argmax(kde_y))])
+        )
+        seg_vx = wb_in_box[
+            (np.abs(wb_in_box[:, 0] - ix_step) <= 0.045 * s_xy)
+            & (sy * (wb_in_box[:, 1] - cy) >= -0.02 * s_xy)
+            & (sy * (wb_in_box[:, 1] - iy_step) <= 0.04 * s_xy)
+        ]
+        seg_vy = wb_in_box[
+            (np.abs(wb_in_box[:, 1] - iy_step) <= 0.045 * s_xy)
+            & (sx * (wb_in_box[:, 0] - cx) >= -0.02 * s_xy)
+            & (sx * (wb_in_box[:, 0] - ix_step) <= 0.04 * s_xy)
+        ]
+        if len(seg_vx) < min_seg_pts or len(seg_vy) < min_seg_pts:
+            continue
+
+        ix_step = _irls_huber_1d_lidar(seg_vx[:, 0], ix_step, delta=0.015 * s_xy)
+        iy_step = _irls_huber_1d_lidar(seg_vy[:, 1], iy_step, delta=0.015 * s_xy)
+        if not cond_box_notch:
+            max_step_rel = max(
+                abs(ix_step - cx) / max(span_x_box, 1e-6),
+                abs(iy_step - cy) / max(span_y_box, 1e-6),
+            )
+            if max_step_rel < 0.28:
+                continue
+
+        score = float(len(seg_vx) + len(seg_vy))
+        if score > best_corner_score:
+            best_corner_score = score
+            if cname == "bl":
+                best_corner_l = np.array(
+                    [[ix_step, y0_cont], [x1_cont, y0_cont], [x1_cont, y1_cont], [x0_cont, y1_cont], [x0_cont, iy_step], [ix_step, iy_step]],
+                    dtype=float,
+                )
+            elif cname == "br":
+                best_corner_l = np.array(
+                    [[x0_cont, y0_cont], [ix_step, y0_cont], [ix_step, iy_step], [x1_cont, iy_step], [x1_cont, y1_cont], [x0_cont, y1_cont]],
+                    dtype=float,
+                )
+            elif cname == "tr":
+                best_corner_l = np.array(
+                    [[x0_cont, y0_cont], [x1_cont, y0_cont], [x1_cont, iy_step], [ix_step, iy_step], [ix_step, y1_cont], [x0_cont, y1_cont]],
+                    dtype=float,
+                )
+            else:
+                best_corner_l = np.array(
+                    [[x0_cont, y0_cont], [x1_cont, y0_cont], [x1_cont, y1_cont], [ix_step, y1_cont], [ix_step, iy_step], [x0_cont, iy_step]],
+                    dtype=float,
+                )
+
+    if best_corner_l is not None:
+        l_cands.append((best_corner_l, True))
+    occ_l = fit_missing_corner_l_shape(wb_in_box, return_info=True)
+    if occ_l is not None:
+        l_cands.append((np.asarray(occ_l[0] if isinstance(occ_l, tuple) else occ_l, dtype=float), False))
+
+    for l_poly_raw, is_direct in l_cands:
+        l_poly_raw = l_poly_raw.copy()
+        if len(l_poly_raw) != 6:
+            continue
+        if not is_direct:
+            lx_min, ly_min = l_poly_raw.min(axis=0)
+            lx_max, ly_max = l_poly_raw.max(axis=0)
+            l_poly_raw[np.isclose(l_poly_raw[:, 0], lx_min, atol=0.05 * s_xy), 0] = x0_cont
+            l_poly_raw[np.isclose(l_poly_raw[:, 0], lx_max, atol=0.05 * s_xy), 0] = x1_cont
+            l_poly_raw[np.isclose(l_poly_raw[:, 1], ly_min, atol=0.05 * s_xy), 1] = y0_cont
+            l_poly_raw[np.isclose(l_poly_raw[:, 1], ly_max, atol=0.05 * s_xy), 1] = y1_cont
+
+        l_poly = close_orthogonal_polygon(l_poly_raw)
+        if l_poly is not None and len(l_poly) == 6:
+            xs_u = np.unique(np.round(l_poly[:, 0], 3))
+            ys_u = np.unique(np.round(l_poly[:, 1], 3))
+            if len(xs_u) >= 3 and len(ys_u) >= 3:
+                ix_m = float(xs_u[1])
+                iy_m = float(ys_u[1])
+                notch_x_lo = x0_cont if abs(ix_m - x0_cont) < abs(x1_cont - ix_m) else ix_m
+                notch_x_hi = ix_m if notch_x_lo == x0_cont else x1_cont
+                notch_y_lo = y0_cont if abs(iy_m - y0_cont) < abs(y1_cont - iy_m) else iy_m
+                notch_y_hi = iy_m if notch_y_lo == y0_cont else y1_cont
+                notch_w = notch_x_hi - notch_x_lo
+                notch_h = notch_y_hi - notch_y_lo
+
+                traj_in_notch = False
+                if traj_leveled is not None and len(traj_leveled) > 0:
+                    tx = traj_leveled[:, 0]
+                    ty = traj_leveled[:, 1]
+                    in_n = (
+                        (tx >= notch_x_lo + 0.05 * s_xy)
+                        & (tx <= notch_x_hi - 0.05 * s_xy)
+                        & (ty >= notch_y_lo + 0.05 * s_xy)
+                        & (ty <= notch_y_hi - 0.05 * s_xy)
+                    )
+                    traj_in_notch = bool(np.count_nonzero(in_n) >= max(2, int(0.05 * len(traj_leveled))))
+
+                geom_ok = (
+                    notch_w >= 0.12 * span_x_box
+                    and notch_h >= 0.12 * span_y_box
+                    and (span_x_box - notch_w) >= 0.15 * span_x_box
+                    and (span_y_box - notch_h) >= 0.15 * span_y_box
+                )
+                if geom_ok and not traj_in_notch:
+                    hints = _hints_from_ring(l_poly @ R_m_applied)
+                    if len(hints) == 6:
+                        return hints
+
+    rect_ring = np.array([[x0_cont, y0_cont], [x1_cont, y0_cont], [x1_cont, y1_cont], [x0_cont, y1_cont]], dtype=float)
+    return _hints_from_ring(rect_ring @ R_m_applied)
+
 
 
 def extract_pure_lidar_topology_walls(
@@ -2685,18 +2337,6 @@ def segment_point_cloud(
         res = empty_layout(gravity)
         return _finish(res, empty_pcd)
 
-    if gravity is not None and session_dir is not None and len(pcd.points) >= 1000:
-        g_arr = np.asarray(gravity, dtype=float).reshape(-1)
-        if g_arr.size == 3 and abs(g_arr[2]) > 0.9 * float(np.linalg.norm(g_arr)):
-            raw_pts = np.asarray(pcd.points, dtype=float)
-            if (
-                float(raw_pts[:, 2].max() - raw_pts[:, 2].min()) < 1.35
-                and float(raw_pts[:, 2].max()) <= 0.05
-                and float(raw_pts[:, 1].min()) < -1.0
-                and float(raw_pts[:, 1].max()) > 1.0
-            ):
-                gravity = G_ARCORE_WORLD.copy()
-
     if (
         gravity is None
         and vggt_prior is not None
@@ -2728,44 +2368,12 @@ def segment_point_cloud(
         res["level_frame"] = level_frame
         return _finish(res, empty_pcd)
 
+    cloud_height_m = float(height_m)
     z_max_cloud = float(np.max(pts[:, 2])) if len(pts) else 0.0
-    if z_max_cloud <= CEILING_WALL_BAND_HI_M + 0.30 or height_m <= CEILING_WALL_BAND_HI_M + 0.30 or height_m == DEFAULT_HEIGHT_M:
-        dtof_h = _extract_ceiling_height_from_dtof(session_dir, trajectory, gravity, level_frame)
-        if dtof_h is not None and CEILING_WALL_BAND_HI_M + 0.30 < dtof_h <= 5.0 and dtof_h != DEFAULT_HEIGHT_M:
-            if height_m == DEFAULT_HEIGHT_M or height_m <= CEILING_WALL_BAND_HI_M + 0.30 or dtof_h > height_m:
-                height_m = float(dtof_h)
-        elif height_m < CEILING_WALL_BAND_HI_M:
-            height_m = DEFAULT_HEIGHT_M
 
     traj_leveled_for_choke = None
-    if trajectory is None and session_dir is not None and os.path.isdir(str(session_dir)):
-        try:
-            from app.pipeline.runner import load_pose_table_for_tsdf
-
-            pose_df_auto = load_pose_table_for_tsdf(str(session_dir))
-            if (
-                pose_df_auto is not None
-                and not pose_df_auto.empty
-                and {"x", "y", "z"}.issubset(pose_df_auto.columns)
-            ):
-                trajectory = pose_df_auto[["x", "y", "z"]].to_numpy(dtype=float)
-        except Exception:
-            pass
-    is_canonical_rectified = (
-        session_dir is not None
-        and len(pts) >= 50_000
-        and float(pts[:, 0].min()) >= -0.025
-        and float(pts[:, 1].min()) >= -0.025
-        and float(pts[:, 2].min()) >= -0.025
-        and float(pts[:, 2].max()) >= 2.00
-        and bool(np.all(np.abs(np.percentile(pts, 1.5, axis=0)) <= 0.025))
-    )
-    if is_canonical_rectified:
-        z_rect_top = float(round(np.percentile(pts[:, 2], 99.95), 2))
-        if HEIGHT_SPAN_MIN_M <= z_rect_top <= 5.0:
-            height_m = z_rect_top
-            level_frame["_true_ceiling_height_m"] = z_rect_top
-    if trajectory is not None and not is_canonical_rectified:
+    traj_cam_z_med = None
+    if trajectory is not None:
         traj_arr = np.asarray(trajectory, dtype=float)
         if traj_arr.ndim == 2 and traj_arr.shape[0] and traj_arr.shape[1] >= 3:
             g = np.asarray(gravity, dtype=float).reshape(3) if gravity is not None else None
@@ -2773,23 +2381,117 @@ def segment_point_cloud(
             cam_work = traj_arr @ r_align.T
             R_floor = np.array(level_frame.get("rotation_3x3", np.eye(3)), dtype=float)
             t_floor = np.array(level_frame.get("translation", [0.0, 0.0, 0.0]), dtype=float)
-            traj_leveled_for_choke = ((cam_work @ R_floor.T) + t_floor)[:, :2]
+            cam_leveled_3d = (cam_work @ R_floor.T) + t_floor
+            traj_leveled_for_choke = cam_leveled_3d[:, :2]
+            traj_cam_z_med = float(np.median(cam_leveled_3d[:, 2]))
         elif traj_arr.ndim == 2 and traj_arr.shape[0] and traj_arr.shape[1] == 2:
             traj_leveled_for_choke = traj_arr[:, :2]
 
-    is_dense_tsdf = is_canonical_rectified or (
-        len(pts) >= (50000 if (vggt_prior is not None or session_dir is not None) else 150000)
+    t_floor_z = float(np.asarray(level_frame.get("translation", [0.0, 0.0, 0.0]), dtype=float)[2])
+    traj_frame_mismatch = bool(
+        traj_leveled_for_choke is not None
+        and len(traj_leveled_for_choke) > 0
+        and float(np.min(traj_leveled_for_choke)) < -0.15
+        and (
+            (traj_cam_z_med is not None and traj_cam_z_med <= 0.25)
+            or (traj_cam_z_med is None and float(np.min(np.percentile(traj_leveled_for_choke, 25.0, axis=0))) < -0.05)
+        )
     )
-    skip_aperture_filter = (vggt_prior is not None) or is_dense_tsdf
-    if not skip_aperture_filter:
-        work = filter_wall_aperture_leakage(work, height_m, trajectory=traj_leveled_for_choke)
+    is_canonical_rectified = (
+        abs(t_floor_z) <= 0.30
+        and float(np.percentile(pts[:, 0], 1.0)) >= -0.12
+        and float(np.percentile(pts[:, 1], 1.0)) >= -0.12
+        and float(np.percentile(pts[:, 2], 1.0)) >= -0.08
+        and float(pts[:, 2].max()) >= 1.70
+        and (
+            traj_frame_mismatch
+            or (trajectory is None and work.has_colors())
+        )
+    )
+    if is_canonical_rectified:
+        traj_leveled_for_choke = None
+        trajectory = None
+        z_rect_top = float(round(np.percentile(pts[:, 2], 99.95), 2))
+        if HEIGHT_SPAN_MIN_M <= z_rect_top <= 5.0:
+            height_m = z_rect_top
+            cloud_height_m = z_rect_top
+
+    skip_hough = is_canonical_rectified or (
+        vggt_prior is not None and getattr(vggt_prior, "frame", "") == "occupancy"
+    )
+    R_yaw_2x2 = np.eye(2)
+    yaw = 0.0
+    line_count = 0
+    if not skip_hough:
+        wb_init = slice_wall_band(pts, cloud_height_m)
+        if len(wb_init) >= 50:
+            yaw_3d = detect_manhattan_yaw(wb_init, up_axis=2) if wb_init.shape[1] >= 3 else 0.0
+            _, yaw_h, line_count = apply_hough_yaw(wb_init)
+            if vggt_prior is not None and line_count == 0 and abs(yaw_h) >= 25.0:
+                yaw_h = 0.0
+            if abs(yaw_3d) > 0.25:
+                yaw = float(yaw_3d)
+                if line_count >= 50 and abs(yaw_h - yaw_3d) > 5.0:
+                    def _yaw_kde_pk(y_cand: float) -> float:
+                        th_c = np.radians(y_cand)
+                        cc, sc = np.cos(th_c), np.sin(th_c)
+                        wbr_c = wb_init[:, :2] @ np.array([[cc, -sc], [sc, cc]], dtype=float).T
+                        sp_c = np.percentile(wbr_c, 95.0, axis=0) - np.percentile(wbr_c, 5.0, axis=0)
+                        s_c = max(0.25, float(np.hypot(sp_c[0], sp_c[1])) / 2.55)
+                        pk_c = 0.0
+                        for ax_c in (0, 1):
+                            vc = wbr_c[:, ax_c]
+                            gc = np.linspace(float(np.percentile(vc, 0.5)) - 0.04 * s_c, float(np.percentile(vc, 99.5)) + 0.04 * s_c, 120)
+                            kc = _eval_continuous_kde_1d(vc, gc, bandwidth=0.012 * s_c, window_scale=0.03 * s_c)
+                            pk_c += float(np.max(kc)) if len(kc) else 0.0
+                        return pk_c
+                    cands_h = np.linspace(float(yaw_h) - 3.0, float(yaw_h) + 3.0, 25)
+                    scores_h = [_yaw_kde_pk(float(c)) for c in cands_h]
+                    best_idx_h = int(np.argmax(scores_h))
+                    if scores_h[best_idx_h] > 1.08 * _yaw_kde_pk(float(yaw_3d)):
+                        yaw = float(cands_h[best_idx_h])
+                        if yaw > 45.0:
+                            yaw -= 90.0
+                        elif yaw <= -45.0:
+                            yaw += 90.0
+                else:
+                    line_count = max(line_count, 2)
+            else:
+                yaw = float(yaw_h)
+            if abs(yaw) > 1e-6:
+                theta = np.radians(yaw)
+                c, s = np.cos(theta), np.sin(theta)
+                R_yaw_3x3 = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+                R_yaw_2x2 = np.array([[c, -s], [s, c]], dtype=float)
+                pts = pts @ R_yaw_3x3.T
+                work.points = o3d.utility.Vector3dVector(pts)
+                if work.has_normals() and len(work.normals) == len(pts):
+                    n_rot = np.asarray(work.normals, dtype=float) @ R_yaw_3x3.T
+                    work.normals = o3d.utility.Vector3dVector(n_rot)
+                if "rotation_3x3" in level_frame:
+                    R_prev = np.array(level_frame["rotation_3x3"], dtype=float)
+                    R_combined = R_yaw_3x3 @ R_prev
+                    level_frame["rotation_3x3"] = [
+                        [float(R_combined[i, j]) for j in range(3)] for i in range(3)
+                    ]
+                if "translation" in level_frame:
+                    t_prev = np.array(level_frame["translation"], dtype=float)
+                    t_rot = R_yaw_3x3 @ t_prev
+                    level_frame["translation"] = [float(x) for x in t_rot]
+                if traj_leveled_for_choke is not None:
+                    traj_leveled_for_choke = traj_leveled_for_choke @ R_yaw_2x2.T
+
+    traj_leveled_pre_yaw = traj_leveled_for_choke
+
+    if vggt_prior is None:
+        work = filter_wall_aperture_leakage(work, cloud_height_m, trajectory=traj_leveled_for_choke)
     pts = np.asarray(work.points, dtype=float)
     if len(pts) == 0:
         res = empty_layout(gravity)
         res["level_frame"] = level_frame
         return _finish(res, empty_pcd)
 
-    slice_pts = slice_wall_band(pts, height_m)
+    slice_pts = slice_wall_band(pts, cloud_height_m)
     if len(slice_pts) == 0:
         res = empty_layout(gravity)
         res["level_frame"] = level_frame
@@ -2816,13 +2518,8 @@ def segment_point_cloud(
         w_ref = max(w_neck, OPEN_CORRIDOR_MIN_WIDTH_M)
         is_compact_neck = (0.0 < area_a < 4.0 * (w_ref ** 2))
         is_narrow_aperture = (0.0 < w_neck < 2.0 * OPEN_CORRIDOR_MIN_WIDTH_M)
-        max_kept_span = float(np.max(np.ptp(kept[:, :2], axis=0))) if len(kept) else 0.0
-        is_wide_l_arm_in_compact_room = is_dense_tsdf and (
-            (w_neck >= 0.78 and max_kept_span < 2.80)
-            or (w_neck >= 0.65 and max_kept_span <= 2.60)
-        )
         should_choke = (
-            (neck_kind == "door" and not is_wide_l_arm_in_compact_room)
+            neck_kind == "door"
             or (neck_kind == "open_corridor" and is_compact_neck and is_narrow_aperture)
         )
 
@@ -2830,7 +2527,7 @@ def segment_point_cloud(
             kept_choked, cur_choke_info = choke_doorway_tails(
                 kept,
                 trajectory=traj_leveled_for_choke,
-                neck=None if (is_dense_tsdf and (w_neck >= 0.78 or max_kept_span <= 2.60)) else neck,
+                neck=neck,
             )
             if cur_choke_info.get("doorway_choke_applied"):
                 neck["neck_kind"] = "door"
@@ -2848,48 +2545,6 @@ def segment_point_cloud(
                     "choke_guard_reason": f"neck_is_{neck_kind}",
                 }
             break
-    if (
-        is_dense_tsdf
-        and 50000 <= len(pts) < 270000
-        and float(np.max(np.ptp(kept_before_choke[:, :2], axis=0))) >= 3.25
-        and float(np.min(np.ptp(kept_before_choke[:, :2], axis=0))) <= 2.92
-        and (
-            not choke_info.get("doorway_choke_applied")
-            or max(choke_info.get("post_choke_bbox_m", [0.0])) >= 2.95
-        )
-    ):
-        p2d_s = slice_pts[:, :2]
-        xm_s, ym_s = p2d_s.min(axis=0)
-        xM_s, yM_s = p2d_s.max(axis=0)
-        res_s = 0.01
-        w_s = int(np.ceil((xM_s - xm_s) / res_s)) + 2
-        h_s = int(np.ceil((yM_s - ym_s) / res_s)) + 2
-        if w_s <= 4096 and h_s <= 4096:
-            grid_s = np.zeros((h_s, w_s), dtype=np.uint8)
-            ix_s = np.clip(np.round((p2d_s[:, 0] - xm_s) / res_s).astype(int), 0, w_s - 1)
-            iy_s = np.clip(np.round((p2d_s[:, 1] - ym_s) / res_s).astype(int), 0, h_s - 1)
-            grid_s[iy_s, ix_s] = 1
-            kc_s = (3, 3) if len(slice_pts) < 90000 else (2, 2)
-            grid_sc = cv2.morphologyEx(grid_s, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, kc_s))
-            op_s = cv2.morphologyEx(grid_sc, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
-            nlab_s, labels_s, stats_s, _ = cv2.connectedComponentsWithStats(op_s, 8)
-            if nlab_s > 1:
-                areas_s = stats_s[1:, cv2.CC_STAT_AREA]
-                max_a_s = float(np.max(areas_s))
-                sc_s = min(1.0, len(slice_pts) / 210000.0)
-                v_labs = [i + 1 for i, a in enumerate(areas_s) if a >= 0.15 * max_a_s or a >= max(50, int(200 * sc_s))]
-                kept_heal = slice_pts[np.isin(labels_s[iy_s, ix_s], v_labs)]
-                if len(kept_heal) >= 50:
-                    kc_h, ci_h = choke_doorway_tails(kept_heal, trajectory=traj_leveled_for_choke, neck=None)
-                    if ci_h.get("doorway_choke_applied") and (
-                        max(ci_h.get("post_choke_bbox_m", [9.9])) < 2.95
-                        or (
-                            min(ci_h.get("post_choke_bbox_m", [9.9])) < 2.85
-                            and float(ci_h.get("discarded_cavity_ratio", 0.0)) >= 0.085
-                        )
-                    ):
-                        kept = kc_h
-                        choke_info = ci_h
     layout_diag["post_choke_point_count"] = len(kept)
     layout_diag["choke_info"] = choke_info
     if len(kept) == 0:
@@ -2903,59 +2558,6 @@ def segment_point_cloud(
         res["level_frame"] = level_frame
         return _finish(res, work)
     layout_diag["density_trim_diag"] = density_diag
-
-    skip_hough = is_canonical_rectified or (
-        vggt_prior is not None and getattr(vggt_prior, "frame", "") == "occupancy"
-    )
-    R_yaw_2x2 = np.eye(2)
-    traj_leveled_pre_yaw = traj_leveled_for_choke
-    if not skip_hough:
-        kept_pre_hough = kept
-        kept, yaw, line_count = apply_hough_yaw(kept)
-        if is_dense_tsdf and (abs(yaw) < 5.0 or abs(yaw) >= 38.0 or (line_count < 30 and abs(yaw) < 10.0) or line_count < 15):
-            _, yaw_wb, line_count_wb = apply_hough_yaw(slice_pts)
-            if (
-                (
-                    (abs(yaw_wb) >= 15.0 and line_count_wb > line_count)
-                    or (abs(yaw) < 1.0 and abs(yaw_wb) >= 4.0 and line_count_wb >= 50)
-                )
-                and abs(yaw_wb) < 44.5
-            ):
-                yaw = yaw_wb
-                line_count = line_count_wb
-                theta_wb = np.radians(yaw)
-                c_wb, s_wb = np.cos(theta_wb), np.sin(theta_wb)
-                R_wb_2x2 = np.array([[c_wb, -s_wb], [s_wb, c_wb]], dtype=float)
-                kept = kept_pre_hough.copy()
-                kept[:, :2] = kept[:, :2] @ R_wb_2x2.T
-        if vggt_prior is not None and not is_dense_tsdf and ((line_count == 0 and abs(yaw) >= 25.0) or len(pts) >= 50000):
-            kept = kept_pre_hough
-            yaw = 0.0
-        if abs(yaw) > 1e-6:
-            theta = np.radians(yaw)
-            c, s = np.cos(theta), np.sin(theta)
-            R_yaw_3x3 = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=float)
-            R_yaw_2x2 = np.array([[c, -s], [s, c]], dtype=float)
-            pts = pts @ R_yaw_3x3.T
-            work.points = o3d.utility.Vector3dVector(pts)
-            if "rotation_3x3" in level_frame:
-                R_prev = np.array(level_frame["rotation_3x3"], dtype=float)
-                R_combined = R_yaw_3x3 @ R_prev
-                level_frame["rotation_3x3"] = [
-                    [float(R_combined[i, j]) for j in range(3)] for i in range(3)
-                ]
-            if "translation" in level_frame:
-                t_prev = np.array(level_frame["translation"], dtype=float)
-                t_rot = R_yaw_3x3 @ t_prev
-                level_frame["translation"] = [float(x) for x in t_rot]
-            if neck.get("start_xy") and neck.get("end_xy"):
-                neck["start_xy"] = (R_yaw_2x2 @ np.asarray(neck["start_xy"], dtype=float)).tolist()
-                neck["end_xy"] = (R_yaw_2x2 @ np.asarray(neck["end_xy"], dtype=float)).tolist()
-            if traj_leveled_for_choke is not None:
-                traj_leveled_for_choke = traj_leveled_for_choke @ R_yaw_2x2.T
-    else:
-        yaw = 0.0
-        line_count = 0
 
     forced_wall_positions = None
     prior_used = False
@@ -2984,15 +2586,10 @@ def segment_point_cloud(
                         if len(pcd.points)
                         else pts
                     )
-                    use_r0_dense = len(pts) >= 50000 and getattr(vggt_prior, "R0", None) is not None
                     init_R = (
-                        getattr(vggt_prior, "R0", None)
-                        if use_r0_dense
-                        else (
-                            sim3.R
-                            if (sim3.ok and sim3.R is not None and np.all(np.isfinite(sim3.R)))
-                            else getattr(vggt_prior, "R0", None)
-                        )
+                        sim3.R
+                        if (sim3.ok and sim3.R is not None and np.all(np.isfinite(sim3.R)))
+                        else getattr(vggt_prior, "R0", None)
                     )
                     if init_R is None or not np.all(np.isfinite(init_R)):
                         init_R = getattr(vggt_prior, "R0", None)
@@ -3006,27 +2603,27 @@ def segment_point_cloud(
                             c_cent = c_arr - np.mean(c_arr, axis=0)
                             r_rms = float(np.sqrt(np.mean(np.sum(c_cent ** 2, axis=1))))
                             _, svals, _ = np.linalg.svd(c_cent, full_matrices=False)
+                            planar_ratio = float(svals[1] / svals[0]) if (svals.size >= 2 and svals[0] > 1e-9) else 0.0
                             sig_ratio = (
                                 float(svals[-1] / svals[0])
                                 if (svals.size >= 3 and svals[0] > 1e-9)
-                                else (float(svals[1] / svals[0]) if (svals.size >= 2 and svals[0] > 1e-9) else 0.0)
+                                else planar_ratio
                             )
-                            if r_rms < 0.20 or sig_ratio < 0.16:
+                            if len(c_arr) >= 20 and planar_ratio >= 0.25:
+                                if r_rms < 0.08 or sig_ratio < 0.05:
+                                    cam_degenerate = True
+                            elif r_rms < 0.20 or sig_ratio < 0.16:
                                 cam_degenerate = True
 
                     imu_h_v = getattr(vggt_prior, "imu_leveled_h_vggt", None)
                     imu_w_v = getattr(vggt_prior, "imu_leveled_w_vggt", None)
                     init_s = (
-                        None
-                        if use_r0_dense
-                        else (
-                            sim3.s
-                            if (sim3.ok and sim3.s is not None and np.isfinite(sim3.s) and SIM3_SCALE_MIN <= sim3.s <= SIM3_SCALE_MAX)
-                            else None
-                        )
+                        sim3.s
+                        if (sim3.ok and sim3.s is not None and np.isfinite(sim3.s) and SIM3_SCALE_MIN <= sim3.s <= SIM3_SCALE_MAX)
+                        else None
                     )
                     if (
-                        use_r0_dense
+                        init_s is None
                         and imu_h_v is not None
                         and float(imu_h_v) >= 1.50
                         and len(points_vggt) >= 100
@@ -3035,7 +2632,7 @@ def segment_point_cloud(
                         h_rot = float(np.percentile(z_rot, 99.5) - np.percentile(z_rot, 0.5))
                         if float(imu_h_v) > h_rot + 0.10:
                             init_s = float(
-                                np.clip(float(height_m) / float(imu_h_v), SIM3_SCALE_MIN, SIM3_SCALE_MAX)
+                                np.clip(float(cloud_height_m) / float(imu_h_v), SIM3_SCALE_MIN, SIM3_SCALE_MAX)
                             )
 
                     ok_reg, s_reg, R_reg, t_reg, rmse_reg = reg.register(
@@ -3043,25 +2640,12 @@ def segment_point_cloud(
                         pts_lidar,
                         initial_R=init_R,
                         initial_s=init_s,
-                        height_m=(
-                            min(float(height_m), z_max_cloud + 0.05)
-                            if (
-                                not is_dense_tsdf
-                                and z_max_cloud < 2.15
-                                and float(height_m) > z_max_cloud + 0.20
-                                and imu_h_v is not None
-                                and imu_w_v is not None
-                                and float(imu_h_v) > z_max_cloud
-                                and float(imu_h_v) >= 1.15 * float(imu_w_v)
-                            )
-                            else height_m
-                        ),
+                        height_m=cloud_height_m,
                         camera_centers=cam_centers,
                         vggt_camera_centers=getattr(vggt_prior, "C_vggt", None),
                     )
                     use_pointcloud_reg = ok_reg and (
-                        use_r0_dense
-                        or not sim3.ok
+                        not sim3.ok
                         or (rmse_reg is not None and sim3.rmse is not None and rmse_reg < sim3.rmse - 0.01)
                     )
                     if use_pointcloud_reg:
@@ -3077,7 +2661,7 @@ def segment_point_cloud(
                     elif sim3.ok:
                         sim3_ok = True
                         h_v = float(np.percentile(points_vggt[:, 2], 99.8) - np.percentile(points_vggt[:, 2], 0.2))
-                        s_fallback = float(np.clip(float(height_m) / max(h_v, 0.05), SIM3_SCALE_MIN, SIM3_SCALE_MAX))
+                        s_fallback = float(np.clip(float(cloud_height_m) / max(h_v, 0.05), SIM3_SCALE_MIN, SIM3_SCALE_MAX))
                         s_use = (s_reg if (s_reg is not None and s_reg > 0) else s_fallback) if cam_degenerate else sim3.s
                         vggt_diag["sim3_s"] = float(s_use)
                         vggt_diag["sim3_R"] = sim3.R.tolist()
@@ -3094,65 +2678,30 @@ def segment_point_cloud(
                     p_floor_aligned = points_occ.copy()
                     if len(p_floor_aligned):
                         p_floor_aligned[:, 2] -= np.percentile(points_occ[:, 2], 0.5)
-                    wall_band = pts[(pts[:, 2] >= 0.15) & (pts[:, 2] <= max(1.8, float(height_m) - 0.2))]
+                    wall_band = pts[(pts[:, 2] >= 0.15) & (pts[:, 2] <= max(1.8, float(cloud_height_m) - 0.2))]
                     if (choke_info.get("doorway_choke_applied") or vggt_prior is not None) and len(kept) >= 50:
                         wall_band_xy = kept[:, :2]
                     else:
                         wall_band_xy = wall_band[:, :2] if len(wall_band) >= 50 else kept[:, :2]
                     axes = extract_vggt_wall_axes(
                         p_floor_aligned,
-                        height_m,
+                        cloud_height_m,
                         trajectory=traj_leveled_for_choke,
-                        lidar_xy=kept if is_dense_tsdf else wall_band_xy,
-                        unchoked_xy=pts if is_dense_tsdf else pts[:, :2],
+                        lidar_xy=wall_band_xy,
+                        unchoked_xy=pts[:, :2],
                     )
                     leveled_h = getattr(axes, "leveled_height_m", None)
-                    if leveled_h is not None and float(leveled_h) > max(float(height_m), z_max_cloud) + 0.15 and float(leveled_h) <= 4.0 and len(pts) < 50000:
+                    if leveled_h is not None and float(leveled_h) > max(float(height_m), z_max_cloud) + 0.15 and float(leveled_h) <= 4.0:
                         height_m = float(round(float(leveled_h), VERTEX_DECIMALS))
-                    pure_walls_dense = None
-                    if is_dense_tsdf:
-                        keepout_pre = detect_builtin_keepouts(kept, trajectory=traj_leveled_for_choke)
-                        has_keepouts_pre = bool(keepout_pre.get("strips", []))
-                        pure_walls_dense = extract_pure_lidar_topology_walls(
-                            pts,
-                            kept,
-                            traj_leveled_for_choke,
-                            float(height_m),
-                            has_keepouts=has_keepouts_pre,
-                        )
-                    if pure_walls_dense is not None and len(pure_walls_dense) in (4, 6):
-                        walls = [
-                            T2Wall(n=n_w, pos_hint=pos_m, pos_metric=pos_m, source="lidar_peak")
-                            for n_w, pos_m in pure_walls_dense
-                        ]
-                        mask = _clip_mask_for_t2_walls(kept[:, :2], walls)
-                        if int(np.count_nonzero(mask)) >= 50:
-                            kept = kept[mask]
-                        forced_wall_positions = [(w.n, float(w.pos_metric)) for w in walls]
-                        vggt_diag["used"] = True
-                        vggt_diag["n_walls"] = len(forced_wall_positions)
-                        vggt_diag["n_fallback_hints"] = 0
-                        vggt_diag["all_walls_hint"] = False
-                        prior_used = True
-                        logger.info(
-                            "VGGT topology prior used (metric LiDAR wall lock): images=%s correspondences=%s s=%s rmse=%s walls=%s fallbacks=0",
-                            vggt_diag["n_images"],
-                            vggt_diag["n_correspondences"],
-                            vggt_diag["sim3_s"],
-                            vggt_diag["sim3_rmse"],
-                            vggt_diag["n_walls"],
-                        )
-                    elif axes.hints is None:
+                    if axes.hints is None:
                         vggt_diag["skip_reason"] = axes.skip_reason or "unsupported_shape"
                     else:
                         hints_to_apply = axes.hints
-                        if choke_info.get("doorway_choke_applied") and axes.hints and len(pts) < 50000:
+                        if choke_info.get("doorway_choke_applied") and axes.hints:
                             choked_hints = []
                             any_small_interior_choke = False
                             kept_before_yaw = (
-                                (kept_before_choke[:, :2] @ R_yaw_2x2.T)
-                                if (len(kept_before_choke) and not skip_hough)
-                                else (kept_before_choke[:, :2] if len(kept_before_choke) else wall_band_xy)
+                                kept_before_choke[:, :2] if len(kept_before_choke) else wall_band_xy
                             )
                             hint_by_dir = {}
                             for h_it in axes.hints:
@@ -3164,7 +2713,7 @@ def segment_point_cloud(
                                     if prev_h is None or float(h_it.pos_hint) > float(prev_h.pos_hint):
                                         hint_by_dir[k_dir] = h_it
 
-                            min_choke_span_m = CEILING_WALL_BAND_HI_M
+                            min_choke_span_m = CEILING_WALL_BAND_HI_M * max(0.5, float(cloud_height_m) / 2.25)
                             for h in axes.hints:
                                 n_h = np.asarray(h.n, dtype=float).reshape(-1)[:2]
                                 nrm_h = float(np.linalg.norm(n_h))
@@ -3205,13 +2754,13 @@ def segment_point_cloud(
                                     )
                                     valid_short_side_tail_sever = (
                                         is_tail_severed
-                                        and choked_axis_span >= 1.35
+                                        and choked_axis_span >= 0.75 * vggt_axis_span
                                         and ortho_span >= min_choke_span_m
                                         and has_traj
                                         and not traj_in_severed
                                     )
                                     if vggt_axis_span >= 1.0 and (
-                                        choked_axis_span < 1.35
+                                        choked_axis_span < 0.75 * vggt_axis_span
                                         or (vggt_axis_span < min_choke_span_m and choked_axis_span < vggt_axis_span - 0.35)
                                         or (
                                             vggt_axis_span >= min_choke_span_m
@@ -3240,17 +2789,71 @@ def segment_point_cloud(
                                     kept_before_choke, trajectory=traj_leveled_pre_yaw
                                 )
                                 if len(kept_unchoked) >= 50:
-                                    wall_band_xy = (
-                                        (kept_unchoked[:, :2] @ R_yaw_2x2.T)
-                                        if not skip_hough
-                                        else kept_unchoked[:, :2]
-                                    )
+                                    wall_band_xy = kept_unchoked[:, :2]
                                     kept = np.column_stack([wall_band_xy, kept_unchoked[:, 2]])
                         t2 = apply_vggt_topology_prior(wall_band_xy, hints_to_apply)
                         walls = list(t2.walls)
-                        mask = _clip_mask_for_t2_walls(kept[:, :2], walls)
-                        kept = kept[mask]
                         forced_wall_positions = [(w.n, float(w.pos_metric)) for w in walls]
+                        if (
+                            frame != "occupancy"
+                            and neck_kind != "room_connector"
+                            and traj_leveled_for_choke is not None
+                        ):
+                            pure_walls_session = extract_pure_lidar_topology_walls(
+                                pts, kept, traj_leveled_for_choke, float(cloud_height_m), has_keepouts=False
+                            )
+                            if pure_walls_session is not None and len(pure_walls_session) in (4, 6):
+                                max_pos_l_by_dir: dict[tuple[float, float], float] = {}
+                                for nl_it, pl_it in pure_walls_session:
+                                    nl_arr = np.asarray(nl_it, dtype=float).reshape(2)
+                                    kd_l = tuple(np.round(nl_arr, 1))
+                                    max_pos_l_by_dir[kd_l] = max(max_pos_l_by_dir.get(kd_l, -1e9), float(pl_it))
+
+                                fused_walls: list[tuple[np.ndarray, float]] = []
+                                n_fallback_fused = 0
+                                all_hint_fused = True
+                                for n_l, pos_l in pure_walls_session:
+                                    n_l_arr = np.asarray(n_l, dtype=float).reshape(2)
+                                    kd_l = tuple(np.round(n_l_arr, 1))
+                                    is_inner_notch_wall = (
+                                        len(pure_walls_session) == 6
+                                        and float(pos_l) < max_pos_l_by_dir.get(kd_l, float(pos_l)) - 0.12
+                                    )
+                                    best_w_v = None
+                                    best_diff = 1e9
+                                    for w_v in walls:
+                                        n_v_arr = np.asarray(w_v.n, dtype=float).reshape(2)
+                                        if float(np.dot(n_l_arr, n_v_arr)) >= 0.90:
+                                            diff = abs(float(w_v.pos_metric) - float(pos_l))
+                                            if diff < best_diff:
+                                                best_diff = diff
+                                                best_w_v = w_v
+                                    tol_fuse = 0.08 if (is_inner_notch_wall and len(walls) == 6) else (0.0 if is_inner_notch_wall else 0.12)
+                                    if best_w_v is not None and best_diff <= tol_fuse:
+                                        pos_fused = 0.5 * (float(pos_l) + float(best_w_v.pos_metric))
+                                        if getattr(best_w_v, "source", "") == "vggt_hint":
+                                            n_fallback_fused += 1
+                                        else:
+                                            all_hint_fused = False
+                                    else:
+                                        pos_fused = float(pos_l)
+                                        all_hint_fused = False
+                                    fused_walls.append((n_l_arr, float(pos_fused)))
+                                forced_wall_positions = fused_walls
+                                vggt_diag["n_fallback_hints"] = int(n_fallback_fused)
+                                vggt_diag["all_walls_hint"] = bool(all_hint_fused)
+                            else:
+                                mask = _clip_mask_for_t2_walls(kept[:, :2], walls)
+                                if int(np.count_nonzero(mask)) >= 50:
+                                    kept = kept[mask]
+                                vggt_diag["n_fallback_hints"] = int(t2.n_fallback_hints)
+                                vggt_diag["all_walls_hint"] = bool(t2.all_walls_hint)
+                        else:
+                            mask = _clip_mask_for_t2_walls(kept[:, :2], walls)
+                            if int(np.count_nonzero(mask)) >= 50:
+                                kept = kept[mask]
+                            vggt_diag["n_fallback_hints"] = int(t2.n_fallback_hints)
+                            vggt_diag["all_walls_hint"] = bool(t2.all_walls_hint)
                         n_w = len(forced_wall_positions)
                         if n_w not in (4, 6):
                             kept = kept_before_t2
@@ -3259,20 +2862,18 @@ def segment_point_cloud(
                         else:
                             vggt_diag["used"] = True
                             vggt_diag["n_walls"] = n_w
-                            vggt_diag["n_fallback_hints"] = int(t2.n_fallback_hints)
-                            vggt_diag["all_walls_hint"] = bool(t2.all_walls_hint)
                             prior_used = True
+                    if prior_used:
                             h_v_imu = getattr(vggt_prior, "imu_leveled_h_vggt", None)
                             w_v_imu = getattr(vggt_prior, "imu_leveled_w_vggt", None)
                             s_reg_cur = float(vggt_diag.get("sim3_s") or 0.0)
                             if (
-                                not is_dense_tsdf
-                                and h_v_imu is not None
+                                h_v_imu is not None
                                 and w_v_imu is not None
                                 and float(w_v_imu) > 0.2
                                 and s_reg_cur > 0.0
                                 and z_max_cloud < 2.15
-                                and (s_reg_cur * float(h_v_imu)) > max(float(height_m), z_max_cloud) + 0.25
+                                and (s_reg_cur * float(h_v_imu)) > max(float(height_m), z_max_cloud - 0.10) + 0.20
                             ):
                                 max_by_dir: dict[tuple[float, float], float] = {}
                                 for w_it in walls:
@@ -3303,39 +2904,12 @@ def segment_point_cloud(
                                 vggt_diag["n_walls"],
                                 vggt_diag["n_fallback_hints"],
                             )
-                            if t2.all_walls_hint:
+                            if vggt_diag.get("all_walls_hint"):
                                 logger.warning("VGGT topology prior: all_walls_hint")
         except Exception:
             logger.exception("VGGT topology prior failed")
             vggt_diag = empty_vggt_diag()
             vggt_diag["skip_reason"] = "exception"
-            kept = kept_before_t2
-            forced_wall_positions = None
-            prior_used = False
-    if not prior_used and (is_dense_tsdf or len(pts) >= 150000):
-        try:
-            keepout_pre = detect_builtin_keepouts(kept, trajectory=traj_leveled_for_choke)
-            has_keepouts_pre = bool(keepout_pre.get("strips", []))
-            forced_wall_positions = extract_pure_lidar_topology_walls(
-                pts,
-                kept,
-                traj_leveled_for_choke,
-                float(height_m),
-                has_keepouts=has_keepouts_pre,
-            )
-            if forced_wall_positions is not None and len(forced_wall_positions) in (4, 6):
-                walls_pure = [
-                    T2Wall(n=n_w, pos_hint=pos_m, pos_metric=pos_m, source="lidar_peak")
-                    for n_w, pos_m in forced_wall_positions
-                ]
-                mask = _clip_mask_for_t2_walls(kept[:, :2], walls_pure)
-                if int(np.count_nonzero(mask)) >= 50:
-                    kept = kept[mask]
-                prior_used = True
-            else:
-                forced_wall_positions = None
-        except Exception:
-            logger.exception("Pure LiDAR topology wall extraction failed")
             kept = kept_before_t2
             forced_wall_positions = None
             prior_used = False
@@ -3362,38 +2936,12 @@ def segment_point_cloud(
 
     lambda0 = 0.0 if gravity is None else float(LAMBDA_GRAVITY_PER_INLIER)
     g_work = G_WORK.copy()
-    floor_mode_shift_m = float(level_frame.pop("_floor_mode_shift_m", 0.0) or 0.0)
-    true_ceiling_h = level_frame.pop("_true_ceiling_height_m", None)
-    if (
-        true_ceiling_h is not None
-        and (
-            (len(pts) < 50000 and float(true_ceiling_h) > float(height_m) + 0.15)
-            or (len(pts) >= 50000 and float(true_ceiling_h) > float(height_m))
-        )
-        and HEIGHT_SPAN_MIN_M <= float(true_ceiling_h) <= 5.0
-    ):
-        height_m = float(round(float(true_ceiling_h), VERTEX_DECIMALS))
-    if (
-        len(pts) >= 50000
-        and height_m <= CEILING_WALL_BAND_HI_M + 0.40
-        and len(forced_wall_positions or []) == 4
-    ):
-        dtof_h_post = _extract_ceiling_height_from_dtof(session_dir, trajectory, gravity, level_frame)
-        if dtof_h_post is not None and float(height_m) < float(dtof_h_post) <= float(height_m) + 0.10:
-            height_m = float(round(float(dtof_h_post), VERTEX_DECIMALS))
-    if (
-        len(pts) >= 50000
-        and len(forced_wall_positions or []) == 6
-        and height_m <= CEILING_WALL_BAND_HI_M + 0.38
-    ):
-        z_p998 = float(np.percentile(pts[:, 2], 99.8))
-        if float(height_m) + 0.03 <= z_p998 <= float(height_m) + 0.10:
-            height_m = float(round(z_p998, VERTEX_DECIMALS))
     h_peak = float(height_m)
+    s_ceil = max(0.25, min(2.0, h_peak / 2.25))
     z_med = float(np.median(pts[:, 2]))
 
     floor = None
-    floor_cand = pts[np.abs(pts[:, 2]) <= 0.08]
+    floor_cand = pts[np.abs(pts[:, 2]) <= 0.08 * s_ceil]
     if len(floor_cand) >= 100:
         floor = {
             "n": np.array([0.0, 0.0, 1.0]),
@@ -3402,14 +2950,12 @@ def segment_point_cloud(
             "inlier_count": len(floor_cand),
         }
     ceiling = None
-    pts_ceil_z = pts[:, 2] + floor_mode_shift_m
+    pts_ceil_z = pts[:, 2]
     ceil_mask = (
-        (pts_ceil_z >= h_peak - CEILING_HARVEST_BELOW_M)
-        & (pts_ceil_z <= h_peak + CEILING_RANSAC_GATE_M)
+        (pts_ceil_z >= h_peak - CEILING_HARVEST_BELOW_M * s_ceil)
+        & (pts_ceil_z <= h_peak + CEILING_RANSAC_GATE_M * s_ceil)
     )
     ceil_cand = pts[ceil_mask].copy()
-    if floor_mode_shift_m > 0.0 and len(ceil_cand):
-        ceil_cand[:, 2] += floor_mode_shift_m
     if len(ceil_cand) >= 100:
         ceiling = {
             "n": np.array([0.0, 0.0, -1.0]),
@@ -3459,10 +3005,10 @@ def segment_point_cloud(
         z_plane = float(np.mean(np.asarray(ceiling["inliers"], dtype=float)[:, 2]))
         ceiling_plane_m = z_plane
         tilt = float(np.degrees(np.arccos(np.clip(abs(n_up[2]), 0.0, 1.0))))
-        min_cand_z = max(1.2, float(np.percentile(pts[:, 2], 50)))
+        min_cand_z = max(1.2 * s_ceil, float(np.percentile(pts[:, 2], 50)))
         n_upper = int(np.count_nonzero(pts[:, 2] >= min_cand_z))
         if (
-            abs(z_plane - h_peak) <= CEILING_RANSAC_GATE_M
+            abs(z_plane - h_peak) <= CEILING_RANSAC_GATE_M * s_ceil
             and tilt <= 3.0
             and n_upper > 0
             and len(ceil_cand) >= 0.25 * n_upper
@@ -3646,7 +3192,7 @@ def segment_point_cloud(
         )
 
     if winner_xy is None:
-        if not gates or fill >= BBOX_FILL_RATIO_THRESHOLD:
+        if not gates or fill >= 0.96:
             snapped = rect_snapped
             gate_reason = (
                 "keepouts"
@@ -3663,7 +3209,7 @@ def segment_point_cloud(
             ngon_attempted = True
             l_xy = None
             n_xy = None
-            if fill < BBOX_FILL_RATIO_THRESHOLD:
+            if fill < 0.96:
                 l_res = fit_missing_corner_l_shape(kept[:, :2], return_info=True)
                 if l_res is not None:
                     lxy_raw, edge_support = l_res
@@ -3678,6 +3224,31 @@ def segment_point_cloud(
             contours, _ = cv2.findContours(
                 filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
+            bbox_area_k = float(np.ptp(kept[:, 0]) * np.ptp(kept[:, 1]))
+            max_c_area = (
+                float(cv2.contourArea(max(contours, key=cv2.contourArea)) * (resolution**2))
+                if contours
+                else 0.0
+            )
+            if max_c_area < 0.55 * bbox_area_k and bbox_area_k > 1.0:
+                bridge_px = _odd_px(DOORWAY_BRIDGE_M, resolution, 11)
+                pad = bridge_px + 2
+                occupied_k, _, _, _, _, _ = _raster_u8(kept[:, :2])
+                padded = np.pad(occupied_k, pad, mode="constant", constant_values=0)
+                closed_b = cv2.morphologyEx(
+                    padded,
+                    cv2.MORPH_CLOSE,
+                    cv2.getStructuringElement(cv2.MORPH_RECT, (bridge_px, bridge_px)),
+                )
+                cnts_b, _ = cv2.findContours(closed_b, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if cnts_b:
+                    best_b = max(cnts_b, key=cv2.contourArea)
+                    filled_padded = np.zeros(closed_b.shape, dtype=np.uint8)
+                    cv2.drawContours(filled_padded, [best_b], -1, 255, thickness=cv2.FILLED)
+                    filled = filled_padded[pad:-pad, pad:-pad]
+                    contours, _ = cv2.findContours(
+                        filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
             if contours:
                 cnt = max(contours, key=cv2.contourArea).reshape(-1, 2)
                 if len(cnt) >= 3:
@@ -3701,6 +3272,72 @@ def segment_point_cloud(
             winner_xy = pick_layout_candidate(
                 rect_corners, l_xy, n_xy, cavity, traj_leveled, heading_xy=h_xy
             )
+
+    heading_won = bool(
+        winner_xy is not None
+        and h_xy is not None
+        and len(winner_xy) == len(h_xy)
+        and np.array_equal(winner_xy, h_xy)
+    )
+    if (
+        not prior_used
+        and (vggt_prior is None or vggt_diag.get("skip_reason") != "unsupported_shape")
+        and neck_kind != "room_connector"
+        and not has_keepouts
+        and not heading_won
+        and (winner_xy is None or (len(winner_xy) in (4, 6) and not _has_oblique_edge(winner_xy)))
+    ):
+        try:
+            forced_pure = extract_pure_lidar_topology_walls(
+                pts,
+                kept,
+                traj_leveled_for_choke,
+                float(cloud_height_m),
+                has_keepouts=has_keepouts,
+            )
+            if forced_pure is not None and len(forced_pure) == 6:
+                l_layout = _layout_from_forced_l_walls(forced_pure, height_m)
+                if l_layout.get("walls"):
+                    rect_snapped = l_layout
+                    winner_xy = np.array(
+                        [l_layout["vertices"][f"v{i}"] for i in range(6)], dtype=float
+                    )
+                    walls_pure = [
+                        T2Wall(n=n_w, pos_hint=pos_m, pos_metric=pos_m, source="lidar_peak")
+                        for n_w, pos_m in forced_pure
+                    ]
+                    mask_p = _clip_mask_for_t2_walls(kept[:, :2], walls_pure)
+                    if int(np.count_nonzero(mask_p)) >= 50:
+                        kept = kept[mask_p]
+            elif (
+                forced_pure is not None
+                and len(forced_pure) == 4
+                and (winner_xy is None or len(winner_xy) == 4)
+            ):
+                rect_pure = fit_oriented_manhattan_rectangle(
+                    refined_walls,
+                    floor,
+                    ceiling,
+                    kept,
+                    pcd_z_span,
+                    keepouts=[],
+                    trajectory=traj_leveled,
+                    forced_wall_positions=forced_pure,
+                )
+                if len(rect_pure.get("walls") or []) == 4:
+                    rect_snapped = rect_pure
+                    winner_xy = np.array(
+                        [rect_pure["vertices"][f"v{i}"] for i in range(4)], dtype=float
+                    )
+                    walls_pure = [
+                        T2Wall(n=n_w, pos_hint=pos_m, pos_metric=pos_m, source="lidar_peak")
+                        for n_w, pos_m in forced_pure
+                    ]
+                    mask_p = _clip_mask_for_t2_walls(kept[:, :2], walls_pure)
+                    if int(np.count_nonzero(mask_p)) >= 50:
+                        kept = kept[mask_p]
+        except Exception:
+            logger.exception("Pure LiDAR topology wall extraction failed")
 
     if winner_xy is not None:
         if len(winner_xy) == 4:
@@ -3874,7 +3511,30 @@ def segment_point_cloud(
     if obstacles:
         out["obstacles"] = obstacles
     diagnostics["obstacle_count"] = len(obstacles)
+    if (
+        len(work.points) >= 500
+        and isinstance(out.get("vertices"), dict)
+        and len(out["vertices"]) >= 4
+        and isinstance(out.get("floorplan_frame"), dict)
+    ):
+        try:
+            from shapely.vectorized import contains as _contains_wf_xy
+
+            verts_wf = out["vertices"]
+            coords_wf = [verts_wf[f"v{i}"] for i in range(len(verts_wf)) if f"v{i}" in verts_wf]
+            if len(coords_wf) >= 4:
+                poly_wf = ShapelyPolygon(coords_wf).buffer(0.18)
+                rot_wf = np.asarray(out["floorplan_frame"].get("rotation_2x2", np.eye(2)), dtype=float)
+                trans_wf = np.asarray(out["floorplan_frame"].get("translation_xy", [0.0, 0.0]), dtype=float).reshape(2)
+                pts_wf = np.asarray(work.points, dtype=float)
+                xy_wf = (rot_wf @ pts_wf[:, :2].T).T + trans_wf
+                keep_wf = _contains_wf_xy(poly_wf, xy_wf[:, 0], xy_wf[:, 1])
+                if int(np.count_nonzero(keep_wf)) >= 500:
+                    work = work.select_by_index(np.flatnonzero(keep_wf).tolist())
+        except Exception:
+            pass
     return out, work
+
 
 
 
@@ -3887,33 +3547,26 @@ def canonicalize_l_polygon_se2(
         return {"vertices": {}, "walls": []}
     if not np.all(np.isfinite(pts)):
         return {"vertices": {}, "walls": []}
-    rot = np.eye(2)
-    primed = (rot @ pts.T).T
-    t = -primed.min(axis=0)
-    canon = primed + t
-    rounded = np.round(canon, VERTEX_DECIMALS)
-    origin_i = int(np.argmin(rounded[:, 0] ** 2 + rounded[:, 1] ** 2))
-    ordered = np.array(
-        [rounded[(origin_i + k) % 6] for k in range(6)], dtype=float
-    )
-    if _signed_shoelace(ordered) < 0.0:
-        ordered = ordered[::-1]
-        origin_i = int(np.argmin(ordered[:, 0] ** 2 + ordered[:, 1] ** 2))
-        ordered = np.array(
-            [ordered[(origin_i + k) % 6] for k in range(6)], dtype=float
-        )
-    xs, ys = ordered[:, 0], ordered[:, 1]
-    w_span = float(np.max(xs) - np.min(xs))
-    d_span = float(np.max(ys) - np.min(ys))
-    if w_span < d_span:
-        if float(np.min(rounded[:, 0] ** 2 + rounded[:, 1] ** 2)) > 0.05:
-            rot90 = np.array([[0.0, 1.0], [-1.0, 0.0]])
-        else:
-            rot90 = np.array([[0.0, -1.0], [1.0, 0.0]])
-        rot = rot90 @ rot
-        primed = (rot @ pts.T).T
-        t = -primed.min(axis=0)
-        rounded = np.round(primed + t, VERTEX_DECIMALS)
+
+    # Search ONLY over the 4 proper 2D rotations in SO(2), det(R) = +1 (0, 90, 180, 270 deg)
+    SO2_ROTATIONS = [
+        np.array([[1.0, 0.0], [0.0, 1.0]]),
+        np.array([[0.0, -1.0], [1.0, 0.0]]),
+        np.array([[-1.0, 0.0], [0.0, -1.0]]),
+        np.array([[0.0, 1.0], [-1.0, 0.0]]),
+    ]
+
+    best_score = -1e9
+    best_rot = np.eye(2)
+    best_t = np.zeros(2)
+    best_ordered = None
+
+    for rot_cand in SO2_ROTATIONS:
+        primed = (rot_cand @ pts.T).T
+        t_cand = -primed.min(axis=0)
+        canon = primed + t_cand
+        rounded = np.round(canon, VERTEX_DECIMALS)
+
         origin_i = int(np.argmin(rounded[:, 0] ** 2 + rounded[:, 1] ** 2))
         ordered = np.array(
             [rounded[(origin_i + k) % 6] for k in range(6)], dtype=float
@@ -3924,22 +3577,40 @@ def canonicalize_l_polygon_se2(
             ordered = np.array(
                 [ordered[(origin_i + k) % 6] for k in range(6)], dtype=float
             )
-    elif float(np.min((ordered[:, 0] - w_span) ** 2 + ordered[:, 1] ** 2)) > 0.05:
-        rot180 = np.array([[-1.0, 0.0], [0.0, -1.0]])
-        rot = rot180 @ rot
-        primed = (rot @ pts.T).T
-        t = -primed.min(axis=0)
-        rounded = np.round(primed + t, VERTEX_DECIMALS)
-        origin_i = int(np.argmin(rounded[:, 0] ** 2 + rounded[:, 1] ** 2))
-        ordered = np.array(
-            [rounded[(origin_i + k) % 6] for k in range(6)], dtype=float
-        )
-        if _signed_shoelace(ordered) < 0.0:
-            ordered = ordered[::-1]
-            origin_i = int(np.argmin(ordered[:, 0] ** 2 + ordered[:, 1] ** 2))
-            ordered = np.array(
-                [ordered[(origin_i + k) % 6] for k in range(6)], dtype=float
-            )
+
+        w = float(np.max(ordered[:, 0]))
+        d = float(np.max(ordered[:, 1]))
+        if w < 1e-6 or d < 1e-6:
+            continue
+
+        origin_dist = float(np.min(ordered[:, 0] ** 2 + ordered[:, 1] ** 2))
+        origin_ok = origin_dist <= 0.05
+        aspect_pref = 1000.0 if (w >= d) else 0.0
+
+        # Bounding box corners: (0, 0), (w, 0), (w, d), (0, d).
+        # Canonical preference: missing corner at Top-Left (0, d)
+        d_tl = float(np.min((ordered[:, 0] - 0.0) ** 2 + (ordered[:, 1] - d) ** 2))
+        tl_missing = d_tl > 0.05
+
+        score = aspect_pref
+        if origin_ok:
+            score += 50.0
+        if tl_missing:
+            score += 200.0
+
+        if score > best_score:
+            best_score = score
+            best_rot = rot_cand
+            best_t = t_cand
+            best_ordered = ordered
+
+    if best_ordered is None:
+        return {"vertices": {}, "walls": []}
+
+    ordered = best_ordered
+    rot = best_rot
+    t = best_t
+
     vertices = {
         f"v{i}": [float(ordered[i, 0]), float(ordered[i, 1])]
         for i in range(6)
@@ -4278,43 +3949,46 @@ def canonicalize_floorplan_se2(
     if nrm < 1e-9:
         return {"vertices": {}, "walls": []}
     u = u / nrm
-    rot = np.array([[u[0], u[1]], [-u[1], u[0]]], dtype=float)
-    short = edges[(i_long + 1) % 4]
-    short_r = rot @ short
-    if float(short_r[1]) < 0.0:
-        rot = np.array([[1.0, 0.0], [0.0, -1.0]]) @ rot
-    primed = (rot @ pts.T).T
-    t = -primed.min(axis=0)
-    canon = primed + t
-    rounded = np.round(canon, VERTEX_DECIMALS)
-    origin_i = int(np.argmin(rounded[:, 0] ** 2 + rounded[:, 1] ** 2))
-    ordered = np.array(
-        [rounded[(origin_i + k) % 4] for k in range(4)], dtype=float
-    )
-    if (
-        (ordered[1, 0] - ordered[0, 0]) * (ordered[3, 1] - ordered[0, 1])
-        - (ordered[1, 1] - ordered[0, 1]) * (ordered[3, 0] - ordered[0, 0])
-    ) < 0.0:
-        ordered = np.array([ordered[0], ordered[3], ordered[2], ordered[1]])
-    xs, ys = ordered[:, 0], ordered[:, 1]
-    if float(np.max(xs) - np.min(xs)) < float(np.max(ys) - np.min(ys)):
-        # long edge must be +X; rotate 90° CCW in canonical plane
-        rot90 = np.array([[0.0, -1.0], [1.0, 0.0]])
-        rot = rot90 @ rot
-        primed = (rot @ pts.T).T
-        t = -primed.min(axis=0)
-        rounded = np.round(primed + t, VERTEX_DECIMALS)
-        origin_i = int(np.argmin(rounded[:, 0] ** 2 + rounded[:, 1] ** 2))
-        ordered = np.array(
-            [rounded[(origin_i + k) % 4] for k in range(4)], dtype=float
-        )
-        if (
-            (ordered[1, 0] - ordered[0, 0]) * (ordered[3, 1] - ordered[0, 1])
-            - (ordered[1, 1] - ordered[0, 1]) * (ordered[3, 0] - ordered[0, 0])
-        ) < 0.0:
-            ordered = np.array([ordered[0], ordered[3], ordered[2], ordered[1]])
-    w = float(round(float(np.max(ordered[:, 0]) - np.min(ordered[:, 0])), VERTEX_DECIMALS))
-    d = float(round(float(np.max(ordered[:, 1]) - np.min(ordered[:, 1])), VERTEX_DECIMALS))
+    R0 = np.array([[u[0], u[1]], [-u[1], u[0]]], dtype=float)
+
+    # Search ONLY over the 4 proper 2D rotations in SO(2), det(R) = +1 (0, 90, 180, 270 deg)
+    SO2_ROTATIONS = [
+        np.array([[1.0, 0.0], [0.0, 1.0]]),
+        np.array([[0.0, -1.0], [1.0, 0.0]]),
+        np.array([[-1.0, 0.0], [0.0, -1.0]]),
+        np.array([[0.0, 1.0], [-1.0, 0.0]]),
+    ]
+
+    best_score = -1e9
+    best_rot = R0
+    best_t = np.zeros(2)
+    best_w, best_d = 0.0, 0.0
+
+    for r_k in SO2_ROTATIONS:
+        rot_cand = r_k @ R0
+        primed = (rot_cand @ pts.T).T
+        t_cand = -primed.min(axis=0)
+        canon = primed + t_cand
+        w_cand = float(canon[:, 0].max())
+        d_cand = float(canon[:, 1].max())
+        if w_cand < 1e-9 or d_cand < 1e-9:
+            continue
+
+        score = 100.0 if (w_cand >= d_cand) else 0.0
+        trace_val = float(rot_cand[0, 0] + rot_cand[1, 1])
+        score += trace_val * 0.1
+
+        if score > best_score:
+            best_score = score
+            best_rot = rot_cand
+            best_t = t_cand
+            best_w = w_cand
+            best_d = d_cand
+
+    rot = best_rot
+    t = best_t
+    w = float(round(best_w, VERTEX_DECIMALS))
+    d = float(round(best_d, VERTEX_DECIMALS))
     if w < 1e-9 or not np.isfinite(w) or not np.isfinite(d):
         return {"vertices": {}, "walls": []}
     vertices = {
@@ -4608,6 +4282,11 @@ def fit_oriented_manhattan_rectangle(
             if cnt > best_count:
                 best_count = cnt
                 best_n = nxy / nrm
+        if best_n is not None and len(walls) >= 5 and max(abs(float(best_n[0])), abs(float(best_n[1]))) >= float(np.cos(np.radians(15.0))):
+            if abs(float(best_n[0])) >= abs(float(best_n[1])):
+                best_n = np.array([1.0 if best_n[0] >= 0.0 else -1.0, 0.0], dtype=float)
+            else:
+                best_n = np.array([0.0, 1.0 if best_n[1] >= 0.0 else -1.0], dtype=float)
     if best_n is None and forced_wall_positions:
         n0 = np.asarray(forced_wall_positions[0][0], dtype=float).reshape(-1)[:2]
         nrm0 = float(np.linalg.norm(n0))

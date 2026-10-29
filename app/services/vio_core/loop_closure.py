@@ -39,6 +39,16 @@ class LoopDetector:
         else:
             return int(hash(desc.tobytes()) & 0xFFFF)
 
+    def _lsh_hashes(self, desc: np.ndarray) -> tuple[int, ...]:
+        """Multi-band 12-bit LSH hashes across descriptor bytes for robust cross-pass retrieval."""
+        if desc.dtype == np.uint8 and len(desc) >= 26:
+            h0 = (int(desc[0]) | ((int(desc[1]) & 0x0F) << 8))
+            h1 = (int(desc[8]) | ((int(desc[9]) & 0x0F) << 8)) | (1 << 12)
+            h2 = (int(desc[16]) | ((int(desc[17]) & 0x0F) << 8)) | (2 << 12)
+            h3 = (int(desc[24]) | ((int(desc[25]) & 0x0F) << 8)) | (3 << 12)
+            return (h0, h1, h2, h3)
+        return (self._hash_descriptor(desc),)
+
     def add_keyframe(
         self,
         kf_id: int,
@@ -66,12 +76,12 @@ class LoopDetector:
             "kps_2d": kps_2d.copy() if kps_2d is not None else None,
         }
 
-        # Index descriptors into inverted index
+        # Index descriptors into multi-band LSH inverted index
         for idx, desc in enumerate(descriptors):
-            word_id = self._hash_descriptor(desc)
-            if word_id not in self.inverted_index:
-                self.inverted_index[word_id] = []
-            self.inverted_index[word_id].append((kf_id, idx))
+            for word_id in self._lsh_hashes(desc):
+                if word_id not in self.inverted_index:
+                    self.inverted_index[word_id] = []
+                self.inverted_index[word_id].append((kf_id, idx))
 
     def detect_loop(
         self,
@@ -102,17 +112,28 @@ class LoopDetector:
         # Query inverted index for candidate past keyframes sharing visual words
         word_votes: dict[int, int] = {}
         for desc in query_descriptors:
-            word_id = self._hash_descriptor(desc)
-            if word_id in self.inverted_index:
-                for past_kf_id, _ in self.inverted_index[word_id]:
-                    if abs(query_kf_id - past_kf_id) >= diff_threshold:
-                        word_votes[past_kf_id] = word_votes.get(past_kf_id, 0) + 1
+            seen_kfs_for_desc: set[int] = set()
+            for word_id in self._lsh_hashes(desc):
+                if word_id in self.inverted_index:
+                    for past_kf_id, _ in self.inverted_index[word_id]:
+                        if abs(query_kf_id - past_kf_id) >= diff_threshold and past_kf_id not in seen_kfs_for_desc:
+                            seen_kfs_for_desc.add(past_kf_id)
+                            word_votes[past_kf_id] = word_votes.get(past_kf_id, 0) + 1
 
         min_votes = max(8, int(self.min_inliers * 0.6))
-        candidate_ids = [
-            kf_id for kf_id, votes in sorted(word_votes.items(), key=lambda item: item[1], reverse=True)[:5]
+        sorted_votes = [
+            (kf_id, votes)
+            for kf_id, votes in sorted(word_votes.items(), key=lambda item: item[1], reverse=True)
             if votes >= min_votes
         ]
+        short_candidates = [kf_id for kf_id, _ in sorted_votes[:5]]
+        long_diff = max(80, diff_threshold * 2)
+        long_candidates = [
+            kf_id for kf_id, _ in sorted_votes
+            if abs(query_kf_id - kf_id) >= long_diff and kf_id not in short_candidates
+        ][:6]
+        # Prioritize long-range cross-pass loop closures first so multi-pass drift is anchored globally
+        candidate_ids = long_candidates + short_candidates
 
         if not candidate_ids:
             return None
@@ -150,6 +171,14 @@ class LoopDetector:
                     m = match_pair[0]
                     if not is_binary or m.distance <= self.max_hamming_dist:
                         good_matches.append(m)
+
+            if len(good_matches) >= self.min_inliers:
+                by_train: dict[int, cv2.DMatch] = {}
+                for m in good_matches:
+                    if m.trainIdx not in by_train or m.distance < by_train[m.trainIdx].distance:
+                        by_train[m.trainIdx] = m
+                if len(by_train) >= self.min_inliers or len(query_descriptors) >= 40:
+                    good_matches = list(by_train.values())
 
             if len(good_matches) < self.min_inliers:
                 continue

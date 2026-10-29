@@ -147,3 +147,46 @@ def rot_to_quat(R: np.ndarray) -> np.ndarray:
     if q[3] < 0.0:
         q = -q
     return q / np.linalg.norm(q)
+
+
+def umeyama_alignment(gt_pos: np.ndarray, est_pos: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """Perform Umeyama SE(3) rigid body alignment between reference and estimated positions.
+
+    Args:
+        gt_pos: (N, 3) reference positions.
+        est_pos: (N, 3) estimated positions.
+
+    Returns:
+        tuple[aligned_est, ate_rmse, max_ate]:
+            - aligned_est: (N, 3) aligned estimated positions
+            - ate_rmse: RMS Euclidean error in meters
+            - max_ate: Maximum Euclidean error in meters
+    """
+    gt_arr = np.asarray(gt_pos, dtype=np.float64)
+    est_arr = np.asarray(est_pos, dtype=np.float64)
+    if len(gt_arr) != len(est_arr) or len(gt_arr) == 0:
+        return est_arr.copy(), 0.0, 0.0
+
+    centroid_gt = np.mean(gt_arr, axis=0)
+    centroid_est = np.mean(est_arr, axis=0)
+
+    X = gt_arr - centroid_gt
+    Y = est_arr - centroid_est
+
+    H = Y.T @ X
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+
+    if np.linalg.det(R) < 0:
+        Vt_corr = Vt.copy()
+        Vt_corr[-1, :] *= -1
+        R = Vt_corr.T @ U.T
+
+    t = centroid_gt - R @ centroid_est
+    aligned_est = (R @ est_arr.T).T + t
+
+    errors = np.linalg.norm(aligned_est - gt_arr, axis=1)
+    ate_rmse = float(np.sqrt(np.mean(errors ** 2)))
+    max_ate = float(np.max(errors))
+
+    return aligned_est, ate_rmse, max_ate

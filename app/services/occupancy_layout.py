@@ -61,20 +61,22 @@ def slice_wall_band(points: np.ndarray, height_m: float) -> np.ndarray:
     pts = np.asarray(points, dtype=float)
     if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) == 0:
         return np.zeros((0, 3), dtype=float)
-    z_hi = max(SLICE_Z_MAX_M, float(height_m) - 0.2)
+    s_h = min(1.0, max(0.25, float(height_m) / 2.10))
+    z_hi = max(SLICE_Z_MAX_M * s_h, float(height_m) - 0.2 * s_h)
 
     def _has_valid_span(b: np.ndarray) -> bool:
         if len(b) < SLICE_MIN_POINTS:
             return False
         sz = float(b[:, 2].max() - b[:, 2].min())
-        if sz < 0.20:
+        if sz < 0.20 * s_h:
             return False
         span_x = float(b[:, 0].max() - b[:, 0].min())
         span_y = float(b[:, 1].max() - b[:, 1].min())
-        return max(span_x, span_y) >= 1.0 and min(span_x, span_y) >= 0.5
+        return max(span_x, span_y) >= 1.0 * s_h and min(span_x, span_y) >= 0.5 * s_h
 
     valid_bands = []
-    for z_lo in (0.15, 0.3, SLICE_Z_MIN_M):
+    for z_lo_base in (0.15, 0.3, SLICE_Z_MIN_M):
+        z_lo = z_lo_base * s_h
         band = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
         if _has_valid_span(band):
             span_x = float(band[:, 0].max() - band[:, 0].min())
@@ -84,7 +86,8 @@ def slice_wall_band(points: np.ndarray, height_m: float) -> np.ndarray:
         valid_bands.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return valid_bands[0][2]
 
-    for z_lo in (0.15, 0.3, SLICE_Z_MIN_M):
+    for z_lo_base in (0.15, 0.3, SLICE_Z_MIN_M):
+        z_lo = z_lo_base * s_h
         band = pts[(pts[:, 2] >= z_lo) & (pts[:, 2] <= z_hi)]
         if len(band) >= SLICE_MIN_POINTS:
             return band
@@ -585,7 +588,8 @@ def estimate_manhattan_angle_bbox_sharpness(
     points = pts[:, :2]
 
     # Subsampling optimization: if N > max_points, sample deterministically after canonical sort
-    n_pts = len(points)
+    n_raw = len(points)
+    n_pts = n_raw
     if n_pts > max_points:
         order_sub = (
             _pre_sorted_order
@@ -644,13 +648,9 @@ def estimate_manhattan_angle_bbox_sharpness(
         ys_batch = sin_a * xa
         ys_batch += cos_a * ya
 
-        # Projection Sharpness via bin_size histogram on contiguous rows
-        min_xs = xs_batch.min(axis=1, keepdims=True)
-        min_ys = ys_batch.min(axis=1, keepdims=True)
-        idx_x_all = ((xs_batch - min_xs) * inv_bin).astype(np.int32)
-        idx_y_all = ((ys_batch - min_ys) * inv_bin).astype(np.int32)
-
         # In-place 2-key partition along contiguous axis=1 for 1%/99% percentiles
+        xs_pos = xs_batch - xs_batch.min(axis=1, keepdims=True)
+        ys_pos = ys_batch - ys_batch.min(axis=1, keepdims=True)
         xs_batch.partition((k1, k99), axis=1)
         ys_batch.partition((k1, k99), axis=1)
         lo_x = xs_batch[:, k1].astype(float)
@@ -660,6 +660,9 @@ def estimate_manhattan_angle_bbox_sharpness(
         spans_x = np.maximum(hi_x - lo_x, 1e-6)
         spans_y = np.maximum(hi_y - lo_y, 1e-6)
         areas = spans_x * spans_y
+
+        idx_x_all = (xs_pos * inv_bin).astype(np.int32)
+        idx_y_all = (ys_pos * inv_bin).astype(np.int32)
 
         scores = np.empty(k_angles, dtype=float)
         sharpnesses = np.empty(k_angles, dtype=float)
@@ -676,17 +679,12 @@ def estimate_manhattan_angle_bbox_sharpness(
 
     # Stage 1: Coarse search [-45°, +45°] with 1.0° step (91 angles)
     coarse_angles = np.arange(-45.0, 45.0001, 1.0)
-    is_wide_cloud = max(float(ptp[0]), float(ptp[1])) >= 3.00
-    if n_pts > 4000 and not is_wide_cloud:
+    if n_pts > 4000:
         x0_c = np.ascontiguousarray(x0[:, ::2])
         y0_c = np.ascontiguousarray(y0[:, ::2])
     else:
         x0_c, y0_c = x0, y0
     coarse_scores, _, coarse_sharp, _, _ = _eval_angles_batch(coarse_angles, x0_c, y0_c)
-    if is_wide_cloud:
-        valid_c = np.abs(coarse_angles) <= 40.0
-        if np.any(valid_c):
-            coarse_scores = np.where(valid_c, coarse_scores, -1e9)
     best_coarse_idx = int(np.argmax(coarse_scores))
     theta_coarse = float(coarse_angles[best_coarse_idx])
 
@@ -732,8 +730,7 @@ def estimate_manhattan_angle_bbox_sharpness(
         # Sharpness Gate: if large rotation (|best_angle| >= 10.0°) degrades projection sharpness
         # compared to 0.0° unrotated baseline, the score is dominated by a diagonal bounding box
         # shrinkage artifact rather than true wall alignment. Reject and revert to 0.0°.
-        sharp_gate_mult = 0.985 if is_wide_cloud else 1.0
-        if (abs(best_angle) >= 10.0 and final_sharp < sharp_gate_mult * base_sharpness) or (
+        if (abs(best_angle) >= 10.0 and final_sharp < base_sharpness) or (
             final_area > base_area and final_sharp <= base_sharpness
         ):
             best_angle = 0.0
@@ -1164,14 +1161,7 @@ def choke_doorway_tails(
                     return pts_clip, info_clip
                 return pts, info
             reduction = max(pre[0] - post[0], pre[1] - post[1])
-            if neck is None and nlab > 1 and max(pre) >= 3.10 and min(pre) <= 2.85:
-                min_red = 0.12
-            elif neck is None and max(pre) <= 2.55 and cavity_area_m2 < 3.30 and discarded_cavity_ratio > 0.08:
-                min_red = 0.60
-            elif neck is None and max(pre) < 2.70 and discarded_cavity_ratio > 0.08:
-                min_red = 0.28
-            else:
-                min_red = MIN_CHOKE_BBOX_REDUCTION_M
+            min_red = MIN_CHOKE_BBOX_REDUCTION_M
             if reduction >= min_red:
                 if trajectory is not None:
                     traj_arr = np.asarray(trajectory, dtype=float)
@@ -1787,11 +1777,7 @@ def fit_missing_corner_l_shape(
     _line_cache = {}
 
     notch_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (NOTCH_OPEN_PX, NOTCH_OPEN_PX))
-    support_for_open = (
-        cv2.morphologyEx(support, cv2.MORPH_CLOSE, notch_kernel)
-        if 35000 <= len(pts_arr) < 140000
-        else support
-    )
+    support_for_open = support
     support_open = cv2.morphologyEx(support_for_open, cv2.MORPH_OPEN, notch_kernel)
     integral_open = cv2.integral((support_open > 0).astype(np.uint8))
     integral_dilated = cv2.integral((dilated > 0).astype(np.uint8))
@@ -1866,11 +1852,7 @@ def fit_missing_corner_l_shape(
             hits.append(line_sup(p[0], p[1], q[0], q[1]))
         return float(np.mean(hits)) if hits else 0.0, hits
 
-    min_std_px = int(math.ceil(MIN_L_SHAPE_NOTCH_SIDE_M / resolution - 1e-9))
-    min_cmp_px = int(math.ceil(0.30 / resolution - 1e-9))
-    max_cmp_px = int(math.ceil(0.35 / resolution - 1e-9))
-    min_rem_std_px = int(math.ceil(0.25 / resolution - 1e-9))
-    min_rem_cmp_px = int(math.ceil(0.50 / resolution - 1e-9))
+    base_notch_px = int(math.ceil(0.25 / resolution - 1e-9))
 
     best = None
     for p in (0.0, 1.5, 2.5):
@@ -1886,12 +1868,11 @@ def fit_missing_corner_l_shape(
             - integral_support[y1, x0]
             + integral_support[y0, x0]
         )
-        max_open_std = MAX_OCC_OUTSIDE_RATIO * max(total_occ, 1)
-        max_open_cmp = 0.05 * max(total_occ, 1)
+        max_open = MAX_OCC_OUTSIDE_RATIO * max(total_occ, 1)
         min_area_px = MIN_CONCAVE_AREA_RATIO * bbox_area
         min_bbox_dim = bbox_w if bbox_w <= bbox_h else bbox_h
-        allow_compact = (min_bbox_dim * resolution) <= 2.0
-        min_ratio_px = MIN_NOTCH_RATIO * max(1, min_bbox_dim)
+        min_notch_px = max(base_notch_px, int(round(0.12 * min_bbox_dim)))
+        min_rem_px = max(base_notch_px, int(round(0.12 * min_bbox_dim)))
 
         rect = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
         iou_rect = poly_iou(target_mask, rect)
@@ -1920,18 +1901,10 @@ def fit_missing_corner_l_shape(
                     notch_w = mx1 - mx0
                     notch_h = my1 - my0
                     min_nh = notch_w if notch_w <= notch_h else notch_h
-                    is_compact_notch = min_nh < min_std_px
-                    if is_compact_notch:
-                        if not allow_compact or min_nh < min_cmp_px:
-                            continue
-                        max_nh = notch_h if notch_w <= notch_h else notch_w
-                        if max_nh < max_cmp_px or min_nh < min_ratio_px:
-                            continue
-                        if (bbox_w - notch_w) < min_rem_cmp_px or (bbox_h - notch_h) < min_rem_cmp_px:
-                            continue
-                    else:
-                        if (bbox_w - notch_w) < min_rem_std_px or (bbox_h - notch_h) < min_rem_std_px:
-                            continue
+                    if min_nh < min_notch_px:
+                        continue
+                    if (bbox_w - notch_w) < min_rem_px or (bbox_h - notch_h) < min_rem_px:
+                        continue
                     if (notch_w * notch_h) < min_area_px:
                         continue
 
@@ -1941,16 +1914,15 @@ def fit_missing_corner_l_shape(
                         - integral_open[my1, mx0]
                         + integral_open[my0, mx0]
                     )
-                    if open_count > (max_open_cmp if is_compact_notch else max_open_std):
+                    if open_count > max_open:
                         continue
 
                     # Inward notch edges
-                    min_inward_sup = 0.75 if is_compact_notch else MIN_NOTCH_EDGE_SUPPORT
                     sup_h = line_sup(mx0, ys_mid, mx1, ys_mid)
-                    if sup_h < min_inward_sup:
+                    if sup_h < MIN_NOTCH_EDGE_SUPPORT:
                         continue
                     sup_v = line_sup(xs_mid, my0, xs_mid, my1)
-                    if sup_v < min_inward_sup:
+                    if sup_v < MIN_NOTCH_EDGE_SUPPORT:
                         continue
 
                     # Construct polygon only when candidate passes all gates so far
@@ -1993,56 +1965,61 @@ def fit_missing_corner_l_shape(
 
                     edge_support, edge_hits = calc_support(poly)
                     min_edge_sup = min(edge_hits) if edge_hits else 0.0
-                    req_min_edge = 0.45 if is_compact_notch else MIN_SINGLE_EDGE_SUPPORT
-                    if edge_support < MIN_EDGE_SUPPORT or min_edge_sup < req_min_edge:
-                        continue
-                    if is_compact_notch and edge_support < rect_sup + 0.02:
+                    if edge_support < MIN_EDGE_SUPPORT or min_edge_sup < MIN_SINGLE_EDGE_SUPPORT:
                         continue
 
                     iou_l = poly_iou(target_mask, poly)
                     score = (iou_l - iou_rect) + 0.10 * (edge_support - rect_sup)
 
-                    if is_compact_notch:
-                        min_cmp_iou = (
-                            0.78
-                            if ((iou_l - iou_rect) >= 0.045 and edge_support >= 0.80)
-                            else 0.80
-                        )
-                        if iou_l <= iou_rect or iou_l < min_cmp_iou or score < 0.012:
-                            continue
-                    elif score < MIN_L_SHAPE_SCORE or iou_l < MIN_L_SHAPE_IOU:
+                    if score < MIN_L_SHAPE_SCORE or iou_l < MIN_L_SHAPE_IOU:
                         continue
 
                     if best is not None and score <= best[0]:
                         continue
 
-                    if is_compact_notch and has_3d:
+                    if has_3d:
+                        s_xy = max(0.25, float(np.hypot(span_x, span_y)) / 2.20)
                         x_mid_m = xs_mid * resolution + x_min
                         y_mid_m = ys_mid * resolution + y_min
                         mx0_m = mx0 * resolution + x_min
                         mx1_m = mx1 * resolution + x_min
                         my0_m = my0 * resolution + y_min
                         my1_m = my1 * resolution + y_min
+                        pad_c = 0.04 * s_xy
+                        win_c = 0.08 * s_xy
+                        h_x0 = mx0_m + (pad_c if corner_id in (0, 3) else 0.0)
+                        h_x1 = mx1_m - (pad_c if corner_id in (1, 2) else 0.0)
+                        v_y0 = my0_m + (pad_c if corner_id in (2, 3) else 0.0)
+                        v_y1 = my1_m - (pad_c if corner_id in (0, 1) else 0.0)
                         sub_h = pts_arr[
-                            (np.abs(p2d[:, 1] - y_mid_m) <= 0.08)
-                            & (p2d[:, 0] >= mx0_m - 0.05)
-                            & (p2d[:, 0] <= mx1_m + 0.05)
+                            (np.abs(p2d[:, 1] - y_mid_m) <= win_c)
+                            & (p2d[:, 0] >= h_x0)
+                            & (p2d[:, 0] <= h_x1)
                         ]
                         sub_v = pts_arr[
-                            (np.abs(p2d[:, 0] - x_mid_m) <= 0.08)
-                            & (p2d[:, 1] >= my0_m - 0.05)
-                            & (p2d[:, 1] <= my1_m + 0.05)
+                            (np.abs(p2d[:, 0] - x_mid_m) <= win_c)
+                            & (p2d[:, 1] >= v_y0)
+                            & (p2d[:, 1] <= v_y1)
                         ]
+                        min_notch_pts = max(8, min(30, int(0.00025 * len(pts_arr))))
                         narrow_ok = False
-                        if len(sub_h) >= 30 and len(sub_v) >= 30:
+                        z_span_all = float(np.ptp(pts_arr[:, 2]))
+                        z_top = float(np.percentile(pts_arr[:, 2], 99.5))
+                        if len(sub_h) >= min_notch_pts and len(sub_v) >= min_notch_pts:
                             z_h = sub_h[:, 2]
                             z_v = sub_v[:, 2]
-                            if (
-                                float(np.percentile(z_h, 90)) >= 1.35
-                                and float(np.percentile(z_v, 90)) >= 1.35
-                                and float(np.percentile(z_h, 90) - np.percentile(z_h, 10)) >= 0.50
-                                and float(np.percentile(z_v, 90) - np.percentile(z_v, 10)) >= 0.50
-                            ):
+                            min_z_req = (0.58 * z_top if not allow_tilted_notch else 0.65 * z_top) if z_top >= 0.80 else (z_top - 0.05)
+                            min_h_span = 0.25 * z_span_all
+                            low_z_req = float(np.percentile(pts_arr[:, 2], 15)) + 0.25 * z_span_all
+                            c1 = float(np.percentile(z_h, 90)) >= min_z_req
+                            c2 = float(np.percentile(z_v, 90)) >= min_z_req
+                            c3 = float(np.percentile(z_h, 15)) <= low_z_req
+                            c4 = float(np.percentile(z_v, 15)) <= low_z_req
+                            span_h = float(np.percentile(z_h, 90) - np.percentile(z_h, 10))
+                            span_v = float(np.percentile(z_v, 90) - np.percentile(z_v, 10))
+                            c5 = span_h >= min_h_span
+                            c6 = span_v >= min_h_span
+                            if (c1 and c2 and c3 and c4 and c5 and c6):
                                 xh_raw = sub_h[:, 0]
                                 yv_raw = sub_v[:, 1]
                                 nw_m = mx1_m - mx0_m
@@ -2053,33 +2030,35 @@ def fit_missing_corner_l_shape(
                                 ):
                                     xh = (
                                         xh_raw - np.polyval(np.polyfit(z_h, xh_raw, 1), z_h)
-                                        if float(np.std(z_h)) >= 0.05
+                                        if float(np.std(z_h)) >= 0.03 * max(z_span_all, 0.5)
                                         else xh_raw
                                     )
                                     yv = (
                                         yv_raw - np.polyval(np.polyfit(z_v, yv_raw, 1), z_v)
-                                        if float(np.std(z_v)) >= 0.05
+                                        if float(np.std(z_v)) >= 0.03 * max(z_span_all, 0.5)
                                         else yv_raw
                                     )
                                     r_h = float(np.percentile(xh, 90) - np.percentile(xh, 10)) / max(nw_m, 1e-6)
                                     r_v = float(np.percentile(yv, 90) - np.percentile(yv, 10)) / max(nh_m, 1e-6)
-                                    r_short = r_h if nw_m <= nh_m else r_v
+                                    r_short = min(r_h, r_v)
                                     if r_short >= 0.35 and max(r_h, r_v) >= 0.50:
                                         narrow_ok = True
                         if not narrow_ok:
                             if not allow_tilted_notch:
                                 continue
+                            win_tilt = 0.35 * s_xy
+                            pad_tilt = 0.15 * s_xy
                             sub_h_tilt = pts_arr[
-                                (np.abs(p2d[:, 1] - y_mid_m) <= 0.35)
-                                & (p2d[:, 0] >= mx0_m - 0.15)
-                                & (p2d[:, 0] <= mx1_m + 0.15)
+                                (np.abs(p2d[:, 1] - y_mid_m) <= win_tilt)
+                                & (p2d[:, 0] >= mx0_m - pad_tilt)
+                                & (p2d[:, 0] <= mx1_m + pad_tilt)
                             ]
                             sub_v_tilt = pts_arr[
-                                (np.abs(p2d[:, 0] - x_mid_m) <= 0.35)
-                                & (p2d[:, 1] >= my0_m - 0.15)
-                                & (p2d[:, 1] <= my1_m + 0.15)
+                                (np.abs(p2d[:, 0] - x_mid_m) <= win_tilt)
+                                & (p2d[:, 1] >= my0_m - pad_tilt)
+                                & (p2d[:, 1] <= my1_m + pad_tilt)
                             ]
-                            if len(sub_h_tilt) < 30 or len(sub_v_tilt) < 30:
+                            if len(sub_h_tilt) < min_notch_pts or len(sub_v_tilt) < min_notch_pts:
                                 continue
                             zh_t = sub_h_tilt[:, 2]
                             zv_t = sub_v_tilt[:, 2]
@@ -2088,9 +2067,9 @@ def fit_missing_corner_l_shape(
                             zh_span_t = float(zh90_t - np.percentile(zh_t, 10))
                             zv_span_t = float(zv90_t - np.percentile(zv_t, 10))
                             if (
-                                max(zh90_t, zv90_t) < 1.55
-                                or min(zh90_t, zv90_t) < 0.45
-                                or max(zh_span_t, zv_span_t) < 0.90
+                                max(zh90_t, zv90_t) < 0.72 * z_top
+                                or min(zh90_t, zv90_t) < 0.22 * z_top
+                                or max(zh_span_t, zv_span_t) < 0.45 * z_span_all
                             ):
                                 continue
 
@@ -2231,7 +2210,7 @@ def detect_builtin_keepouts(
             t_dx = float(traj_arr[:, 0].max() - traj_arr[:, 0].min())
             t_dy = float(traj_arr[:, 1].max() - traj_arr[:, 1].min())
             traj_short_side = min(t_dx, t_dy) + 0.35
-            if traj_short_side < min_keepout_room_width_m:
+            if traj_short_side < min_keepout_room_width_m or min(t_dx, t_dy) < 0.80 * short_side:
                 is_compact_cavity = True
 
     if is_compact_cavity:
@@ -2275,12 +2254,14 @@ def _keepout_has_high_z(strip: dict, pts_xyz: np.ndarray) -> bool:
         return False
     x0, y0 = float(poly[:, 0].min()), float(poly[:, 1].min())
     x1, y1 = float(poly[:, 0].max()), float(poly[:, 1].max())
+    z_max = float(pts_xyz[:, 2].max()) if len(pts_xyz) else 0.0
+    high_z_thresh = max(BUILTIN_HIGH_Z_M, 0.88 * z_max) if z_max > 1.80 else BUILTIN_HIGH_Z_M
     inside = (
         (pts_xyz[:, 0] >= x0)
         & (pts_xyz[:, 0] <= x1)
         & (pts_xyz[:, 1] >= y0)
         & (pts_xyz[:, 1] <= y1)
-        & (pts_xyz[:, 2] >= BUILTIN_HIGH_Z_M)
+        & (pts_xyz[:, 2] >= high_z_thresh)
     )
     return int(np.count_nonzero(inside)) >= BUILTIN_HIGH_Z_MIN_POINTS
 

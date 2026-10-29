@@ -439,15 +439,39 @@ def _centroid(pts: list[np.ndarray]) -> np.ndarray | None:
     return np.mean(np.stack(pts, axis=0), axis=0)
 
 
-def _outward(p: np.ndarray, q: np.ndarray, centroid: np.ndarray) -> np.ndarray:
+def _polygon_signed_area(pts: list[np.ndarray] | np.ndarray) -> float:
+    if len(pts) < 3:
+        return 0.0
+    arr = np.asarray(pts, dtype=float)
+    x = arr[:, 0]
+    y = arr[:, 1]
+    return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def _outward(p: np.ndarray, q: np.ndarray, ref: Any = None) -> np.ndarray:
     e = q - p
     nlen = float(np.hypot(e[0], e[1]))
-    hat = e / nlen
-    n = np.array([-hat[1], hat[0]], dtype=float)
-    mid = 0.5 * (p + q)
-    if float(np.dot(mid - centroid, n)) < 0.0:
-        n = -n
-    return n
+    if nlen < 1e-9:
+        return np.zeros(2, dtype=float)
+    dx, dy = float(e[0]) / nlen, float(e[1]) / nlen
+
+    is_ccw = True
+    if ref is not None:
+        if isinstance(ref, (int, float)):
+            is_ccw = (ref >= 0.0)
+        elif hasattr(ref, "__len__") and len(ref) >= 3:
+            area = _polygon_signed_area(ref)
+            is_ccw = (area >= 0.0)
+        elif hasattr(ref, "__len__") and len(ref) == 2:
+            mid = 0.5 * (p + q)
+            n_cand = np.array([dy, -dx], dtype=float)
+            if float(np.dot(mid - np.asarray(ref, dtype=float), n_cand)) < 0.0:
+                is_ccw = False
+
+    if is_ccw:
+        return np.array([dy, -dx], dtype=float)
+    else:
+        return np.array([-dy, dx], dtype=float)
 
 
 def _annotation_items(layout: dict) -> tuple[list[dict], list[dict]]:
@@ -487,9 +511,9 @@ def _annotation_items(layout: dict) -> tuple[list[dict], list[dict]]:
     def add_text(x: float, y: float, s: str, rot: float = 0.0) -> None:
         texts.append({"x": float(x), "y": float(y), "s": s, "rot": float(rot)})
 
-    if c is not None:
+    if c is not None or len(poly) >= 3:
         for p, q, wall in segs:
-            n = _outward(p, q, c)
+            n = _outward(p, q, poly if len(poly) >= 3 else c)
             gap = DIM_EXTENSION_GAP_M
             off = DIM_OFFSET_WALL_M
             a0 = p + n * gap
@@ -680,11 +704,53 @@ def _write_dxf(layout: dict, output_path: str) -> None:
         entity.set_placement(
             (t["x"], t["y"]), align=ezdxf.enums.TextEntityAlignment.MIDDLE_CENTER
         )
+
+    # Render portals (DOOR / WINDOW)
+    portals = layout.get("portals", [])
+    walls = layout.get("walls", [])
+    vertices = layout.get("vertices", {})
+    for p in portals:
+        ptype = str(p.get("type", p.get("kind", "door"))).lower()
+        layer = "WINDOW" if "window" in ptype else "DOOR"
+
+        p_start = None
+        p_end = None
+        if "start_xy" in p and "end_xy" in p:
+            s = p["start_xy"]
+            e = p["end_xy"]
+            if s and e and len(s) >= 2 and len(e) >= 2:
+                p_start = (float(s[0]), float(s[1]))
+                p_end = (float(e[0]), float(e[1]))
+        elif "wall_index" in p:
+            w_idx = int(p["wall_index"])
+            if 0 <= w_idx < len(walls):
+                w = walls[w_idx]
+                joints = w.get("joints") or []
+                if len(joints) >= 2 and joints[0] in vertices and joints[1] in vertices:
+                    v0 = np.array(vertices[joints[0]][:2], dtype=float)
+                    v1 = np.array(vertices[joints[1]][:2], dtype=float)
+                    diff = v1 - v0
+                    L = float(np.linalg.norm(diff))
+                    if L > 1e-6:
+                        tangent = diff / L
+                        offset = float(p.get("offset_along_wall_m", 0.0))
+                        width = float(p.get("width_m", 0.9))
+                        p_s = v0 + tangent * offset
+                        p_e = p_s + tangent * width
+                        p_start = (float(p_s[0]), float(p_s[1]))
+                        p_end = (float(p_e[0]), float(p_e[1]))
+
+        if p_start and p_end:
+            msp.add_line(p_start, p_end, dxfattribs={"layer": layer})
+
     doc.saveas(output_path)
 
 
 def export_dxf(layout: dict | None, output_path: str) -> None:
     _write_dxf(enrich_layout(layout), output_path)
+
+
+export_floorplan_dxf = export_dxf
 
 
 def export_artifacts(layout: dict | None, session_dir: str) -> dict:

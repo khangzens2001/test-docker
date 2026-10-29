@@ -247,6 +247,14 @@ class FloorPlanRenderer(BaseRenderer):
             )
 
             # Thick walls with hatch
+            if n_verts >= 3:
+                x_c = corners[:, 0]
+                y_c = corners[:, 1]
+                poly_signed_area = 0.5 * float(np.sum(x_c * np.roll(y_c, -1) - np.roll(x_c, -1) * y_c))
+            else:
+                poly_signed_area = 0.0
+            is_ccw = (poly_signed_area >= 0.0)
+
             wt = max(WALL_THICKNESS_MM, bb_w * 0.01)
             for i in range(n_verts):
                 c1, c2 = corners[i], corners[(i + 1) % n_verts]
@@ -255,10 +263,9 @@ class FloorPlanRenderer(BaseRenderer):
                 if length < 1e-9:
                     continue
                 dn = d / length
-                perp = np.array([-dn[1], dn[0]])
-                if np.dot(perp, centroid - (c1 + c2) / 2.0) < 0:
-                    perp = -perp
-                hatch_perp = perp * wt
+                n_out = np.array([dn[1], -dn[0]]) if is_ccw else np.array([-dn[1], dn[0]])
+                n_in = -n_out
+                hatch_perp = n_in * wt
 
                 ax.plot(
                     [c1[0], c2[0]],
@@ -297,9 +304,8 @@ class FloorPlanRenderer(BaseRenderer):
                 if ln < 1e-9:
                     continue
                 tangent = d / ln
-                perp = np.array([-tangent[1], tangent[0]])
-                if np.dot(perp, centroid - mid) < 0:
-                    perp = -perp
+                n_out = np.array([tangent[1], -tangent[0]]) if is_ccw else np.array([-tangent[1], tangent[0]])
+                perp = -n_out
                 offset = max(120.0, min(max(bb_w, bb_h) * 0.08, ln * 0.3))
                 label_pos = mid + perp * offset
 
@@ -351,9 +357,7 @@ class FloorPlanRenderer(BaseRenderer):
                     continue
                 d = c2 - c1
                 dn = d / (np.linalg.norm(d) + 1e-9)
-                perp = np.array([-dn[1], dn[0]])
-                if np.dot(perp, centroid - mid) > 0:
-                    perp = -perp
+                perp = np.array([dn[1], -dn[0]]) if is_ccw else np.array([-dn[1], dn[0]])
                 off = max(150.0, bb_w * 0.06)
                 lbl = mid + perp * off
 

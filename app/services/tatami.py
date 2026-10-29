@@ -120,6 +120,7 @@ def _column_row_geometry(
     nx: int,
     ny: int,
     unit: float,
+    frozen_edges: frozenset[str] | set[str] = frozenset(),
 ) -> tuple[list[float], list[float], list[float], list[float]]:
     residual_x_m = nx * unit - room_width_m
     residual_y_m = ny * unit - room_depth_m
@@ -127,14 +128,34 @@ def _column_row_geometry(
         col_w = [room_width_m]
     else:
         col_w = [unit] * nx
-        col_w[0] = unit - residual_x_m / 2.0
-        col_w[-1] = unit - residual_x_m / 2.0
+        left_frozen = "west" in frozen_edges or "left" in frozen_edges
+        right_frozen = "east" in frozen_edges or "right" in frozen_edges
+        if left_frozen and not right_frozen:
+            col_w[0] = unit
+            col_w[-1] = unit - residual_x_m
+        elif right_frozen and not left_frozen:
+            col_w[0] = unit - residual_x_m
+            col_w[-1] = unit
+        else:
+            col_w[0] = unit - residual_x_m / 2.0
+            col_w[-1] = unit - residual_x_m / 2.0
+
     if ny == 1:
         row_h = [room_depth_m]
     else:
         row_h = [unit] * ny
-        row_h[0] = unit - residual_y_m / 2.0
-        row_h[-1] = unit - residual_y_m / 2.0
+        bottom_frozen = "south" in frozen_edges or "bottom" in frozen_edges
+        top_frozen = "north" in frozen_edges or "top" in frozen_edges
+        if bottom_frozen and not top_frozen:
+            row_h[0] = unit
+            row_h[-1] = unit - residual_y_m
+        elif top_frozen and not bottom_frozen:
+            row_h[0] = unit - residual_y_m
+            row_h[-1] = unit
+        else:
+            row_h[0] = unit - residual_y_m / 2.0
+            row_h[-1] = unit - residual_y_m / 2.0
+
     if any(w <= 0 for w in col_w) or any(h <= 0 for h in row_h):
         raise ValueError("Computed non-positive column or row dimension")
     x_orig = [0.0]
@@ -765,7 +786,7 @@ def calculate_tatami_layout(
         raise ValueError(f"Unknown layout_type: {layout_type}")
     mats = _sort_and_id(raw)
     col_w, row_h, x_orig, y_orig = _column_row_geometry(
-        room_width_m, room_depth_m, nx, ny, unit
+        room_width_m, room_depth_m, nx, ny, unit, frozen_edges=frozen_edges
     )
     details = _compute_mat_shaving(
         mats, nx, ny, tapers, room_width_m, room_depth_m, col_w, row_h, x_orig, y_orig

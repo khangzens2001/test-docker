@@ -106,22 +106,55 @@ def _unpack_states(states: list[NominalState], x: np.ndarray, R: np.ndarray) -> 
 
 
 
+def compute_process_noise_q(dt: float = 0.01) -> np.ndarray:
+    """Computes continuous-to-discrete process noise covariance matrix Q_k(dt).
+
+    Scaling with time step dt:
+        q_pos ~ (1/3) * dt^3 * sigma_a^2
+        q_vel ~ dt * sigma_a^2
+        q_rot ~ dt * sigma_g^2
+        q_ba  ~ dt * sigma_ba^2
+        q_bg  ~ dt * sigma_bg^2
+    """
+    dt_val = max(float(dt), 1e-6)
+    sigma_a = 0.05
+    sigma_g = 0.005
+    sigma_ba = 1e-4
+    sigma_bg = 1e-5
+    sigma_bgh = 1e-5
+    sigma_g_const = 1e-7
+    sigma_td = 1e-6
+    sigma_sl = 1e-5
+
+    q_pos = (1.0 / 3.0) * (dt_val ** 3) * (sigma_a ** 2)
+    q_vel = dt_val * (sigma_a ** 2)
+    q_rot = dt_val * (sigma_g ** 2)
+    q_ba = dt_val * (sigma_ba ** 2)
+    q_bg = dt_val * (sigma_bg ** 2)
+    q_bgh = dt_val * (sigma_bgh ** 2)
+    q_grav = dt_val * (sigma_g_const ** 2)
+    q_td = dt_val * (sigma_td ** 2)
+    q_sl = dt_val * (sigma_sl ** 2)
+
+    return np.diag([
+        *([q_pos] * 3),
+        *([q_vel] * 3),
+        *([q_rot] * 3),
+        *([q_ba] * 3),
+        *([q_bg] * 3),
+        *([q_bgh] * 3),
+        *([q_grav] * 3),
+        q_td,
+        q_sl,
+    ])
+
+
 class ManifoldRtsSmoother:
     """Rauch-Tung-Striebel (RTS) Backward Smoother on SO(3) Manifold."""
 
-    def __init__(self) -> None:
-        # Default process noise covariance matrix for 23D state
-        self.default_Q = np.diag([
-            *([0.01**2] * 3),     # Position
-            *([0.01**2] * 3),     # Velocity
-            *([0.001**2] * 3),    # Orientation
-            *([1e-4**2] * 3),     # Phone Accel Bias
-            *([1e-5**2] * 3),     # Phone Gyro Bias
-            *([1e-5**2] * 3),     # Hub Gyro Bias
-            *([1e-4**2] * 3),     # Gravity
-            1e-6**2,              # Time offset
-            1e-5**2,              # LiDAR scale
-        ])
+    def __init__(self, dt_default: float = 0.01) -> None:
+        # Default process noise covariance matrix for 23D state scaled with dt
+        self.default_Q = compute_process_noise_q(dt=dt_default)
 
     def smooth_trajectory(
         self,

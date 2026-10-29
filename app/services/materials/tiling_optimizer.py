@@ -275,6 +275,13 @@ class CuttingPlanGenerator:
                 merged_items.extend(pieces)
                 continue
                 
+            use_rotated = capacity_rotated > capacity_normal
+            if use_rotated:
+                cols, rows = max_nx_rot, max_ny_rot
+                rw, rh = rh, rw
+            else:
+                cols, rows = max_nx, max_ny
+
             # We will merge up to `best_capacity` pieces together
             idx = 0
             while idx < len(pieces):
@@ -285,15 +292,6 @@ class CuttingPlanGenerator:
                 else:
                     chunk = pieces[idx : idx + chunk_size]
                     
-                    # Compute union bounds purely for the packing representation
-                    # We will lay them out in a grid
-                    if capacity_normal >= capacity_rotated:
-                        cols, rows = max_nx, max_ny
-                    else:
-                        cols, rows = max_nx_rot, max_ny_rot
-                        # Swap virtual item dims to represent rotated pack
-                        rw, rh = rh, rw
-                        
                     # Calculate bounding box of the packed chunk
                     actual_cols = min(cols, chunk_size)
                     actual_rows = int(math.ceil(chunk_size / cols))
@@ -308,7 +306,7 @@ class CuttingPlanGenerator:
                     mp._pack_cols = cols
                     mp._pack_rw = rw
                     mp._pack_rh = rh
-                    mp._is_rotated = (capacity_rotated > capacity_normal)
+                    mp._is_rotated = use_rotated
                     
                     merged_items.append(mp)
                     idx += chunk_size
@@ -495,6 +493,7 @@ class TilingOptimizer:
         self.forbidden_threshold = forbidden_piece_side_under_mm
         self.allow_rotation = allow_rotation
         self.search_mode = search_mode
+        self.search_step_mm = search_step_mm
 
         if search_step_mm is not None and search_step_mm > 0:
             self.search_step = search_step_mm
@@ -533,6 +532,14 @@ class TilingOptimizer:
     def _build_allowed_offsets(self, min_coord, max_coord, module_size):
         if self.search_mode == "japanese_standard":
             return [0.0]
+        if self.search_step_mm is not None and self.search_step_mm > 0:
+            step = float(self.search_step_mm)
+            candidates = set(self._build_center_aligned_offsets(min_coord, max_coord, module_size))
+            curr = 0.0
+            while curr < module_size:
+                candidates.add(round(curr, 2))
+                curr += step
+            return sorted(candidates)
         return self._build_center_aligned_offsets(min_coord, max_coord, module_size)
 
     def _build_center_aligned_offsets(self, min_coord, max_coord, module_size):

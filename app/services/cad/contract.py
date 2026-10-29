@@ -107,17 +107,71 @@ def layout_to_metrics_mm(layout: dict, project_name: str = "") -> dict:
     resolved_project_name = project_name or str(layout.get("project_name", "") or "")
 
     area_m2 = float(room.get("area_m2", 0.0) or 0.0)
+    finishable_vertices_mm = None
     finish_verts = room.get("finishable_vertices")
     finish_area = room.get("finishable_area_m2")
-    if isinstance(finish_verts, list) and len(finish_verts) >= 3 and finish_area is not None:
-        area_m2 = float(finish_area)
-        vertices_mm = [
+    if isinstance(finish_verts, list) and len(finish_verts) >= 3:
+        finishable_vertices_mm = [
             [float(round(float(p[0]) * 1000.0, 1)), float(round(float(p[1]) * 1000.0, 1))]
             for p in finish_verts
             if isinstance(p, (list, tuple)) and len(p) >= 2
         ]
+        if finish_area is not None:
+            area_m2 = float(finish_area)
 
-    return {
+    portals_list: list[dict[str, Any]] = []
+    raw_portals = layout.get("portals", [])
+    if isinstance(raw_portals, list):
+        for p in raw_portals:
+            if not isinstance(p, dict):
+                continue
+            item = dict(p)
+            if "wall_index" not in item and "wall_id" in item:
+                wid = str(item["wall_id"]).upper().lstrip("W")
+                if wid.isdigit():
+                    item["wall_index"] = int(wid)
+            if "start_m" in item and "start_mm" not in item:
+                item["start_mm"] = float(round(float(item["start_m"]) * 1000.0, 1))
+            elif "start_mm" in item and "start_m" not in item:
+                item["start_m"] = float(round(float(item["start_mm"]) / 1000.0, 4))
+
+            if "end_m" in item and "end_mm" not in item:
+                item["end_mm"] = float(round(float(item["end_m"]) * 1000.0, 1))
+            elif "end_mm" in item and "end_m" not in item:
+                item["end_m"] = float(round(float(item["end_mm"]) / 1000.0, 4))
+
+            if "offset_along_wall_m" in item and "offset_start_mm" not in item:
+                item["offset_start_mm"] = float(round(float(item["offset_along_wall_m"]) * 1000.0, 1))
+            elif "offset_start_mm" in item and "offset_along_wall_m" not in item:
+                item["offset_along_wall_m"] = float(round(float(item["offset_start_mm"]) / 1000.0, 4))
+
+            if "start_mm" in item and "offset_start_mm" not in item:
+                item["offset_start_mm"] = item["start_mm"]
+            if "offset_start_mm" in item and "start_mm" not in item:
+                item["start_mm"] = item["offset_start_mm"]
+            if "start_m" in item and "offset_along_wall_m" not in item:
+                item["offset_along_wall_m"] = item["start_m"]
+            if "offset_along_wall_m" in item and "start_m" not in item:
+                item["start_m"] = item["offset_along_wall_m"]
+
+            if "width_m" in item and "width_mm" not in item:
+                item["width_mm"] = float(round(float(item["width_m"]) * 1000.0, 1))
+            elif "width_mm" in item and "width_m" not in item:
+                item["width_m"] = float(round(float(item["width_mm"]) / 1000.0, 4))
+
+            if "height_m" in item and "height_mm" not in item:
+                item["height_mm"] = float(round(float(item["height_m"]) * 1000.0, 1))
+            elif "height_mm" in item and "height_m" not in item:
+                item["height_m"] = float(round(float(item["height_mm"]) / 1000.0, 4))
+
+            if "sill_height_m" in item and "sill_height_mm" not in item:
+                item["sill_height_mm"] = float(round(float(item["sill_height_m"]) * 1000.0, 1))
+            elif "sill_height_mm" in item and "sill_height_m" not in item:
+                item["sill_height_m"] = float(round(float(item["sill_height_mm"]) / 1000.0, 4))
+
+            portals_list.append(item)
+
+    metrics_out = {
         "project_name": resolved_project_name,
         "height_mm": float(round(room_h_m * 1000.0, 1)),
         "area_m2": area_m2,
@@ -128,7 +182,14 @@ def layout_to_metrics_mm(layout: dict, project_name: str = "") -> dict:
         "wall_count": wall_count,
         "vertices_mm": vertices_mm,
         "walls": walls_mm,
+        "portals": portals_list,
     }
+    if finishable_vertices_mm is not None:
+        metrics_out["finishable_vertices_mm"] = finishable_vertices_mm
+    if finish_area is not None:
+        metrics_out["finishable_area_m2"] = float(finish_area)
+
+    return metrics_out
 
 
 def write_metrics_json(

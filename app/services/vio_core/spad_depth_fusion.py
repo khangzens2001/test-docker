@@ -9,6 +9,92 @@ from typing import Tuple, Optional
 import numpy as np
 
 
+def compute_vl53l8cx_rays(
+    grid_size: int = 8,
+    fov_deg: float = 45.0,
+    as_grid: bool = False,
+) -> np.ndarray:
+    """Computes physical zone ray vectors in the LiDAR frame for VL53L8CX.
+
+    Uses tan(fov_deg / 2) = tan(22.5°) ≈ 0.41421356:
+        d_x(c) = ((c + 0.5) / (grid_size / 2.0) - 1.0) * tan(fov_deg / 2)
+        d_y(r) = ((r + 0.5) / (grid_size / 2.0) - 1.0) * tan(fov_deg / 2)
+        d_z = 1.0
+
+    Args:
+        grid_size: Number of zones per axis (default 8).
+        fov_deg: Total field-of-view in degrees (default 45.0).
+        as_grid: If True, returns (grid_size, grid_size, 3); otherwise (grid_size^2, 3).
+
+    Returns:
+        np.ndarray: Array of shape (64, 3) or (8, 8, 3) containing 3D ray directions.
+    """
+    tan_half = float(np.tan(np.deg2rad(fov_deg / 2.0)))
+    half_grid = float(grid_size / 2.0)
+
+    c_vals = ((np.arange(grid_size, dtype=np.float64) + 0.5) / half_grid - 1.0) * tan_half
+    r_vals = ((np.arange(grid_size, dtype=np.float64) + 0.5) / half_grid - 1.0) * tan_half
+
+    CC, RR = np.meshgrid(c_vals, r_vals)
+    ZZ = np.ones_like(CC)
+    rays_3d = np.stack([CC, RR, ZZ], axis=-1)
+
+    if as_grid:
+        return rays_3d
+    return rays_3d.reshape(-1, 3)
+
+
+def project_spad_to_camera(
+    K: np.ndarray,
+    T_cam_lidar: Optional[np.ndarray] = None,
+    rays: Optional[np.ndarray] = None,
+    grid_size: int = 8,
+    fov_deg: float = 45.0,
+    depth: float = 1.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Projects physical VL53L8CX SPAD rays into the camera image plane.
+
+    Args:
+        K: (3, 3) Camera intrinsic matrix.
+        T_cam_lidar: (4, 4) Transform from LiDAR frame to Camera frame.
+        rays: Optional (N, 3) or (H, W, 3) array of ray vectors. If None, computed from fov_deg.
+        grid_size: Grid size per axis if rays is None (default 8).
+        fov_deg: FOV in degrees (default 45.0).
+        depth: Assumed depth along ray in meters (default 1.0).
+
+    Returns:
+        uv_coords: (N, 2) array of projected pixel coordinates.
+        valid: (N,) boolean mask indicating rays in front of camera (Z_cam > 1e-6).
+    """
+    if rays is None:
+        rays = compute_vl53l8cx_rays(grid_size=grid_size, fov_deg=fov_deg)
+    rays_arr = np.asarray(rays, dtype=np.float64).reshape(-1, 3)
+
+    if T_cam_lidar is None:
+        R_cl = np.eye(3, dtype=np.float64)
+        t_cl = np.zeros(3, dtype=np.float64)
+    else:
+        T_mat = np.asarray(T_cam_lidar, dtype=np.float64)
+        R_cl = T_mat[:3, :3]
+        t_cl = T_mat[:3, 3]
+
+    # Transform ray points into camera frame
+    pts_cam = (R_cl @ (rays_arr * depth).T).T + t_cl
+    zc = pts_cam[:, 2]
+    valid = zc > 1e-6
+    zc_safe = np.where(valid, zc, 1.0)
+
+    fx = K[0, 0]
+    fy = K[1, 1]
+    cx = K[0, 2]
+    cy = K[1, 2]
+
+    u = (pts_cam[:, 0] / zc_safe) * fx + cx
+    v = (pts_cam[:, 1] / zc_safe) * fy + cy
+    uv_coords = np.column_stack([u, v])
+    return uv_coords, valid
+
+
 def associate_spad_depth(
     spad_depth: np.ndarray,
     keypoints: np.ndarray,
@@ -21,6 +107,7 @@ def associate_spad_depth(
     max_depth: float = 10.0,
     rays: Optional[np.ndarray] = None,
     ray_frame: str = "lidar_optical",
+    fov_deg: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Associates SPAD depth map to 2D feature coordinates with occlusion-aware 3x3 window filtering.
 
@@ -107,11 +194,18 @@ def associate_spad_depth(
 
     valid_ray = in_img & (zs > 1e-6)
     zs_safe = np.where(valid_ray, zs, 1.0)
-    u_proj = (xs / zs_safe) * fx + cx
-    v_proj = (ys / zs_safe) * fy + cy
 
-    c_float = (u_proj / img_w) * w_spad
-    r_float = (v_proj / img_h) * h_spad
+    if fov_deg is not None:
+        tan_half = np.tan(np.deg2rad(fov_deg / 2.0))
+        rho_x = (xs / zs_safe) / tan_half
+        rho_y = (ys / zs_safe) / tan_half
+        c_float = (rho_x + 1.0) * (w_spad / 2.0)
+        r_float = (rho_y + 1.0) * (h_spad / 2.0)
+    else:
+        u_proj = (xs / zs_safe) * fx + cx
+        v_proj = (ys / zs_safe) * fy + cy
+        c_float = (u_proj / img_w) * w_spad
+        r_float = (v_proj / img_h) * h_spad
 
     in_spad = valid_ray & (c_float >= 0) & (c_float < w_spad) & (r_float >= 0) & (r_float < h_spad)
 
@@ -207,6 +301,8 @@ class SpadDepthFusion:
         max_discontinuity_m: float = 0.3,
         min_depth_m: float = 0.1,
         max_depth_m: float = 10.0,
+        rays: Optional[np.ndarray] = None,
+        fov_deg: float = 45.0,
     ):
         """Initialize SpadDepthFusion with configuration parameters.
 
@@ -214,10 +310,14 @@ class SpadDepthFusion:
             max_discontinuity_m: Max allowed depth discontinuity in 3x3 window (meters).
             min_depth_m: Minimum valid depth in meters.
             max_depth_m: Maximum valid depth in meters.
+            rays: Optional (64, 3) SPAD ray direction vectors. If None, computed from fov_deg.
+            fov_deg: SPAD field-of-view in degrees (default 45.0).
         """
         self.max_discontinuity_m = max_discontinuity_m
         self.min_depth_m = min_depth_m
         self.max_depth_m = max_depth_m
+        self.fov_deg = fov_deg
+        self.rays = rays
 
     def associate_depth(
         self,
@@ -227,6 +327,7 @@ class SpadDepthFusion:
         T_cam_spad: Optional[np.ndarray] = None,
         status_mask: Optional[np.ndarray] = None,
         image_size: Optional[Tuple[int, int]] = None,
+        rays: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Associate SPAD depth measurements with 2D feature coordinates.
 
@@ -235,6 +336,7 @@ class SpadDepthFusion:
             validity: (N,) boolean array indicating valid associations.
             variances: (N,) array of depth variances (m^2).
         """
+        effective_rays = rays if rays is not None else self.rays
         return associate_spad_depth(
             spad_depth=spad_depth,
             keypoints=keypoints,
@@ -245,4 +347,6 @@ class SpadDepthFusion:
             image_size=image_size,
             min_depth=self.min_depth_m,
             max_depth=self.max_depth_m,
+            rays=effective_rays,
+            fov_deg=self.fov_deg,
         )

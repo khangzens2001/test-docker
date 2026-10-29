@@ -129,8 +129,47 @@ class PoseGraphOptimizer:
 
         b = np.zeros(M, dtype=np.float64)
 
+        def _eval_cost() -> float:
+            total_c = 0.0
+            for i_e, j_e, R_m, t_m, Om in self.edges:
+                if i_e not in id_to_idx or j_e not in id_to_idx:
+                    continue
+                R_ie, t_ie = self.nodes[i_e]
+                R_je, t_je = self.nodes[j_e]
+                R_er = R_m.T @ R_ie.T @ R_je
+                t_er = R_m.T @ (R_ie.T @ (t_je - t_ie) - t_m)
+                phi_er = so3_log(R_er)
+                e_vec = np.hstack([t_er, phi_er])
+                if abs(j_e - i_e) > 1:
+                    en = float(np.linalg.norm(e_vec))
+                    wh = min(1.0, 1.5 / max(en, 1e-9))
+                    Om_e = Om * wh
+                else:
+                    Om_e = Om
+                total_c += 0.5 * float(e_vec @ Om_e @ e_vec)
+            if 0 in id_to_idx and self.prior_pose_0 is not None:
+                R_0p, t_0p = self.prior_pose_0
+                R_0c, t_0c = self.nodes[0]
+                e_0v = np.hstack([t_0c - t_0p, so3_log(R_0p.T @ R_0c)])
+                total_c += 0.5 * float(e_0v @ Omega_0 @ e_0v)
+            return total_c
+
+        lambda_lm = 1e-3
+        curr_cost = _eval_cost()
+
+        use_dense = M < 600
+        if not use_dense:
+            r6, c6 = np.meshgrid(np.arange(6, dtype=np.int32), np.arange(6, dtype=np.int32), indexing="ij")
+            r6 = r6.ravel()
+            c6 = c6.ravel()
+
         for iteration in range(max_iterations):
-            H_lil = sp.lil_matrix((M, M), dtype=np.float64)
+            if use_dense:
+                H_mat = np.zeros((M, M), dtype=np.float64)
+            else:
+                row_blocks = []
+                col_blocks = []
+                val_blocks = []
             b = np.zeros(M, dtype=np.float64)
 
             # 1. Accumulate edge residuals and Jacobians
@@ -150,6 +189,7 @@ class PoseGraphOptimizer:
                 phi_err = so3_log(R_err)
 
                 e_ij = np.hstack([t_err, phi_err])  # 6D error vector
+                is_loop = abs(j - i) > 1
 
                 # Jacobians
                 Jr_inv_err = self._inverse_right_jacobian_so3(phi_err)
@@ -165,7 +205,6 @@ class PoseGraphOptimizer:
                 J_i[3:6, 3:6] = -Jl_inv_err @ R_meas.T
 
                 # Huber robust cost on loop edges (abs(j - i) > 1)
-                is_loop = abs(j - i) > 1
                 if is_loop:
                     e_norm = float(np.linalg.norm(e_ij))
                     delta_huber = 1.5
@@ -175,13 +214,24 @@ class PoseGraphOptimizer:
                     Omega_eff = Omega
 
                 # Accumulate linear system H dx = -b
-                b[idx_i : idx_i + 6] += J_i.T @ Omega_eff @ e_ij
-                b[idx_j : idx_j + 6] += J_j.T @ Omega_eff @ e_ij
+                JtO_i = J_i.T @ Omega_eff
+                JtO_j = J_j.T @ Omega_eff
+                b[idx_i : idx_i + 6] += JtO_i @ e_ij
+                b[idx_j : idx_j + 6] += JtO_j @ e_ij
 
-                H_lil[idx_i : idx_i + 6, idx_i : idx_i + 6] += J_i.T @ Omega_eff @ J_i
-                H_lil[idx_i : idx_i + 6, idx_j : idx_j + 6] += J_i.T @ Omega_eff @ J_j
-                H_lil[idx_j : idx_j + 6, idx_i : idx_i + 6] += J_j.T @ Omega_eff @ J_i
-                H_lil[idx_j : idx_j + 6, idx_j : idx_j + 6] += J_j.T @ Omega_eff @ J_j
+                H_ii = JtO_i @ J_i
+                H_ij = JtO_i @ J_j
+                H_ji = JtO_j @ J_i
+                H_jj = JtO_j @ J_j
+                if use_dense:
+                    H_mat[idx_i : idx_i + 6, idx_i : idx_i + 6] += H_ii
+                    H_mat[idx_i : idx_i + 6, idx_j : idx_j + 6] += H_ij
+                    H_mat[idx_j : idx_j + 6, idx_i : idx_i + 6] += H_ji
+                    H_mat[idx_j : idx_j + 6, idx_j : idx_j + 6] += H_jj
+                else:
+                    row_blocks.extend((r6 + idx_i, r6 + idx_i, r6 + idx_j, r6 + idx_j))
+                    col_blocks.extend((c6 + idx_i, c6 + idx_j, c6 + idx_i, c6 + idx_j))
+                    val_blocks.extend((H_ii.ravel(), H_ij.ravel(), H_ji.ravel(), H_jj.ravel()))
 
             # 2. Accumulate Anchor Prior on Pose 0
             if 0 in id_to_idx and self.prior_pose_0 is not None:
@@ -194,21 +244,42 @@ class PoseGraphOptimizer:
                 e_0 = np.hstack([e_0_t, e_0_r])
 
                 b[idx_0 : idx_0 + 6] += Omega_0 @ e_0
-                H_lil[idx_0 : idx_0 + 6, idx_0 : idx_0 + 6] += Omega_0
+                if use_dense:
+                    H_mat[idx_0 : idx_0 + 6, idx_0 : idx_0 + 6] += Omega_0
+                else:
+                    row_blocks.append(r6 + idx_0)
+                    col_blocks.append(c6 + idx_0)
+                    val_blocks.append(Omega_0.ravel())
 
-            # Solve sparse linear system H dx = -b with Tikhonov regularizer
-            H_csr = H_lil.tocsr()
-            H_csr.setdiag(H_csr.diagonal() + 1e-4)
-
+            # Solve linear system H dx = -b with Levenberg-Marquardt regularizer
             dx = None
-            try:
-                dx = splinalg.spsolve(H_csr, -b)
-            except Exception:
+            if use_dense:
+                H_mat[np.diag_indices(M)] += lambda_lm
                 try:
-                    H_dense = H_csr.toarray()
-                    dx = np.linalg.lstsq(H_dense, -b, rcond=1e-5)[0]
+                    dx = np.linalg.solve(H_mat, -b)
                 except Exception:
-                    break
+                    try:
+                        dx = np.linalg.lstsq(H_mat, -b, rcond=1e-5)[0]
+                    except Exception:
+                        break
+            else:
+                diag_idx = np.arange(M, dtype=np.int32)
+                row_blocks.append(diag_idx)
+                col_blocks.append(diag_idx)
+                val_blocks.append(np.full(M, lambda_lm, dtype=np.float64))
+                H_csr = sp.coo_matrix(
+                    (np.concatenate(val_blocks), (np.concatenate(row_blocks), np.concatenate(col_blocks))),
+                    shape=(M, M),
+                    dtype=np.float64,
+                ).tocsr()
+                try:
+                    dx = splinalg.spsolve(H_csr, -b)
+                except Exception:
+                    try:
+                        H_dense = H_csr.toarray()
+                        dx = np.linalg.lstsq(H_dense, -b, rcond=1e-5)[0]
+                    except Exception:
+                        break
 
             if dx is None or not np.all(np.isfinite(dx)):
                 break
@@ -240,8 +311,15 @@ class PoseGraphOptimizer:
             if max_dp > 0.80:
                 step_scale = min(step_scale, 0.80 / max_dp)
 
-            # Retract state update on manifold with trust region scaling
+            saved_nodes = {k: (v[0].copy(), v[1].copy()) for k, v in self.nodes.items()}
             self._update_nodes(node_ids, id_to_idx, dx * step_scale)
+            new_cost = _eval_cost()
+            if new_cost <= curr_cost + 1e-6:
+                curr_cost = new_cost
+                lambda_lm = max(1e-4, lambda_lm * 0.5)
+            else:
+                self.nodes = saved_nodes
+                lambda_lm = min(1e4, lambda_lm * 10.0)
 
         return self.nodes
 
@@ -336,16 +414,15 @@ def apply_pgo_se3_interpolation(
         delta_t_0 = t_opt[0] - t_node_f[0]
         for i in range(N):
             R_out[i] = delta_R_0 @ R_filter[i]
-            t_out[i] = t_filter[i] + delta_t_0
+            disp_0 = t_filter[i] - t_node_f[0]
+            t_out[i] = t_opt[0] + delta_R_0 @ disp_0
         return R_out, t_out
 
     delta_R = np.zeros((K, 3, 3), dtype=np.float64)
-    delta_t = np.zeros((K, 3), dtype=np.float64)
     omega = np.zeros((K, 3), dtype=np.float64)
 
     for k in range(K):
         delta_R[k] = R_opt[k] @ R_node_f[k].T
-        delta_t[k] = t_opt[k] - t_node_f[k]
         omega[k] = so3_log(delta_R[k])
 
     t_start = node_times[0]
@@ -355,10 +432,14 @@ def apply_pgo_se3_interpolation(
         t_curr = times[i]
         if t_curr <= t_start:
             R_delta = delta_R[0]
-            v_interp = delta_t[0]
+            disp = t_filter[i] - t_node_f[0]
+            delta_t_0 = t_opt[0] - t_node_f[0]
+            t_out[i] = t_node_f[0] + delta_t_0 + R_delta @ disp
         elif t_curr >= t_end:
             R_delta = delta_R[-1]
-            v_interp = delta_t[-1]
+            disp = t_filter[i] - t_node_f[-1]
+            delta_t_end = t_opt[-1] - t_node_f[-1]
+            t_out[i] = t_node_f[-1] + delta_t_end + R_delta @ disp
         else:
             k = int(np.searchsorted(node_times, t_curr, side="right") - 1)
             k = max(0, min(k, K - 2))
@@ -367,11 +448,26 @@ def apply_pgo_se3_interpolation(
             tau = max(0.0, min(1.0, tau))
 
             omega_interp = (1.0 - tau) * omega[k] + tau * omega[k + 1]
-            v_interp = (1.0 - tau) * delta_t[k] + tau * delta_t[k + 1]
             R_delta = so3_exp(omega_interp)
 
+            # Node endpoints with rotational displacement
+            p_rot_k = t_node_f[k]
+            p_rot_next = t_node_f[k] + delta_R[k + 1] @ (t_node_f[k + 1] - t_node_f[k])
+
+            # Residual translation corrections at endpoints
+            delta_t_k = t_opt[k] - p_rot_k
+            delta_t_next = t_opt[k + 1] - p_rot_next
+
+            # Interpolated residual translation
+            v_interp = (1.0 - tau) * delta_t_k + tau * delta_t_next
+
+            # Rotated displacement for intermediate frame i
+            disp = t_filter[i] - t_node_f[k]
+            p_rot_i = t_node_f[k] + R_delta @ disp
+
+            t_out[i] = p_rot_i + v_interp
+
         R_out[i] = R_delta @ R_filter[i]
-        t_out[i] = t_filter[i] + v_interp
 
     if not np.all(np.isfinite(R_out)) or not np.all(np.isfinite(t_out)):
         return R_filter.copy(), t_filter.copy()

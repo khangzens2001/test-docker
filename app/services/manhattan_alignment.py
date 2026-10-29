@@ -69,14 +69,21 @@ def estimate_vggt_gravity_up(session_dir: str | None) -> np.ndarray | None:
         with open(vio_path, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 k_fr = "frame_index" if "frame_index" in row else "frame"
-                if k_fr not in row:
+                if k_fr not in row or row[k_fr] in (None, ""):
                     continue
-                if "device_timestamp_ns" in row:
-                    src_to_ts[int(float(row[k_fr]))] = int(float(row["device_timestamp_ns"]))
-                elif "timestamp_nanos" in row:
-                    src_to_ts[int(float(row[k_fr]))] = int(float(row["timestamp_nanos"]))
-                elif "timestamp" in row:
-                    src_to_ts[int(float(row[k_fr]))] = int(round(float(row["timestamp"]) * 1e9))
+                try:
+                    fr_val = int(float(row[k_fr]))
+                except (ValueError, TypeError):
+                    continue
+                if fr_val < 0:
+                    continue
+                if "device_timestamp_ns" in row and row["device_timestamp_ns"] not in (None, ""):
+                    src_to_ts[fr_val] = int(float(row["device_timestamp_ns"]))
+                elif "timestamp_nanos" in row and row["timestamp_nanos"] not in (None, ""):
+                    src_to_ts[fr_val] = int(float(row["timestamp_nanos"]))
+                elif "timestamp" in row and row["timestamp"] not in (None, ""):
+                    t_raw = float(row["timestamp"])
+                    src_to_ts[fr_val] = int(round(t_raw if abs(t_raw) > 1e11 else t_raw * 1e9))
 
         imu_ts_list: list[int] = []
         imu_acc_list: list[list[float]] = []
@@ -417,11 +424,11 @@ def _detect_manhattan_yaw_aabb(points: np.ndarray, up_axis: int = 2, max_sample:
     return float(best_angle)
 
 
-def detect_manhattan_yaw(points: np.ndarray, up_axis: int = 2, max_sample: int = 220_000) -> float:
+def detect_manhattan_yaw(points: np.ndarray, up_axis: int = 2, max_sample: int = 250_000) -> float:
     """Find dominant wall yaw rotation angle in [-45 deg, 45 deg] to align walls with X/Y axes.
 
-    Uses Dominant Wall Normal Consensus combined with 2D mid-height wall-slice
-    bounding-box sharpness verification so curved interior fixtures cannot bias the wall yaw.
+    Uses SO(2)-equivariant and scale-invariant KNN-30 surface normal estimation and
+    continuous circular mode refinement on vertical wall normals.
     """
     points = np.asarray(points, dtype=float)
     finite_mask = np.isfinite(points).all(axis=1)
@@ -430,92 +437,59 @@ def detect_manhattan_yaw(points: np.ndarray, up_axis: int = 2, max_sample: int =
     if len(points) < 50:
         return 0.0
 
-    rng = np.random.default_rng(11)
-    sample = points
-    if len(sample) > max_sample:
-        sample = sample[rng.choice(len(sample), max_sample, replace=False)]
-
     axes = [axis for axis in range(3) if axis != up_axis]
     x_ax, y_ax = axes[0], axes[1]
 
+    sample = points
+    c_xy = np.mean(sample[:, [x_ax, y_ax]], axis=0)
+    r2 = (sample[:, x_ax] - c_xy[0]) ** 2 + (sample[:, y_ax] - c_xy[1]) ** 2
+    r_rms = float(np.sqrt(np.mean(r2))) if len(r2) else 1.05
+    s_xy = max(0.25, r_rms / 1.05)
+    if len(sample) > max_sample:
+        order = np.lexsort((sample[:, up_axis], np.round(r2, 8)))
+        idx = np.linspace(0, len(sample) - 1, max_sample, dtype=int)
+        sample = sample[order[idx]]
+
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(sample)
-    diagonal = float(np.linalg.norm(np.ptp(sample, axis=0)))
-    voxel_size = max(diagonal * 0.005, 0.01)
-    p_down = pcd.voxel_down_sample(voxel_size)
-    if len(p_down.points) < 50:
-        p_down = pcd
-
-    p_down.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30))
-    normals = np.asarray(p_down.normals)
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.12 * s_xy, max_nn=min(30, len(sample)))
+    )
+    normals = np.asarray(pcd.normals, dtype=float)
 
     wall_mask = np.abs(normals[:, up_axis]) < 0.25
-    if np.sum(wall_mask) < 20:
+    if int(np.count_nonzero(wall_mask)) < 20:
         return _detect_manhattan_yaw_aabb(points, up_axis=up_axis)
 
     n_x = normals[wall_mask, x_ax]
     n_y = normals[wall_mask, y_ax]
-    theta_raw = np.degrees(np.arctan2(n_y, n_x))
-    theta_mod = theta_raw % 90.0
+    theta_mod = np.degrees(np.arctan2(n_y, n_x)) % 90.0
 
-    n_bins = 180
+    n_bins = 3600
     counts, edges = np.histogram(theta_mod, bins=n_bins, range=(0.0, 90.0))
-    bin_centers = (edges[:-1] + edges[1:]) / 2.0
+    bin_centers = 0.5 * (edges[:-1] + edges[1:])
+    counts_f = counts.astype(float)
 
-    # 3x periodic tiling for circular convolution
-    counts_3x = np.tile(counts, 3)
-    smoothed = gaussian_filter1d(counts_3x.astype(float), sigma=1.5)[n_bins:2 * n_bins]
-    peak_idx = int(np.argmax(smoothed))
-    peak_angle = float(bin_centers[peak_idx])
+    smoothed = gaussian_filter1d(counts_f, sigma=60.0, mode="wrap")
+    peak = float(bin_centers[int(np.argmax(smoothed))])
 
-    # Circular median refinement around peak (+/- 3 deg)
-    diff = (theta_mod - peak_angle + 45.0) % 90.0 - 45.0
-    near = np.abs(diff) < 3.0
-    if np.sum(near) > 0:
-        refined_peak = (peak_angle + float(np.median(diff[near]))) % 90.0
-    else:
-        refined_peak = peak_angle
+    for _ in range(5):
+        d = (bin_centers - peak + 45.0) % 90.0 - 45.0
+        w = counts_f * np.exp(-0.5 * (d / 2.0) ** 2) * (np.abs(d) <= 4.5)
+        w_sum = float(np.sum(w))
+        if w_sum <= 1e-9:
+            break
+        peak = (peak + float(np.sum(w * d) / w_sum)) % 90.0
 
-    delta = refined_peak if refined_peak <= 45.0 else (refined_peak - 90.0)
-    yaw_norm = float(-delta)
-
-    # Verify against 2D mid-height wall-slice bounding-box sharpness when vertical span is present
-    try:
-        z_vals = sample[:, up_axis]
-        z_lo = float(np.percentile(z_vals, 2))
-        z_hi = float(np.percentile(z_vals, 98))
-        dz = z_hi - z_lo
-        if dz > 0.30:
-            mid_mask = (z_vals >= z_lo + 0.20 * dz) & (z_vals <= z_lo + 0.85 * dz)
-            slice_xy = sample[mid_mask][:, [x_ax, y_ax]] if int(np.count_nonzero(mid_mask)) >= 200 else sample[:, [x_ax, y_ax]]
-        else:
-            slice_xy = sample[:, [x_ax, y_ax]]
-        if len(slice_xy) >= 200:
-            from app.services.occupancy_layout import estimate_manhattan_angle_bbox_sharpness
-            sharp_info = estimate_manhattan_angle_bbox_sharpness(slice_xy)
-            yaw_sharp = float(sharp_info.get("angle_deg", 0.0))
-            if abs(yaw_sharp - yaw_norm) > 2.0:
-                def _bbox_area_at(ang_deg: float) -> float:
-                    th = np.deg2rad(ang_deg)
-                    c, s = float(np.cos(th)), float(np.sin(th))
-                    rot = slice_xy @ np.array([[c, -s], [s, c]], dtype=float).T
-                    sp = np.percentile(rot, 98, axis=0) - np.percentile(rot, 2, axis=0)
-                    return float(max(sp[0], 1e-3) * max(sp[1], 1e-3))
-
-                area_norm = _bbox_area_at(yaw_norm)
-                area_sharp = _bbox_area_at(yaw_sharp)
-                if area_sharp < area_norm * 0.96:
-                    return float(yaw_sharp)
-    except Exception:
-        pass
-
-    return yaw_norm
+    delta = peak if peak <= 45.0 else (peak - 90.0)
+    return float(-delta)
 
 
 def align_point_cloud_to_manhattan(
     pcd: o3d.geometry.PointCloud,
     R_init: np.ndarray | None = None,
-    reference_up: np.ndarray = np.array([0.0, 0.0, 1.0]),
+    reference_up: np.ndarray | None = None,
+    gravity: np.ndarray | None = None,
     session_dir: str | None = None,
 ) -> tuple[o3d.geometry.PointCloud, dict]:
     """Level floor normal to vertical (+Z), align walls to X/Y axes, and set floor Z=0.
@@ -523,11 +497,21 @@ def align_point_cloud_to_manhattan(
     If R_init is provided (e.g. camera-to-world rotation R_wc0), points are first
     rotated into the world frame before leveling. If session_dir is provided,
     multi-frame IMU gravity consensus is used to initialize reference_up.
+    If gravity is provided, reference_up is derived from -gravity.
     """
     work = o3d.geometry.PointCloud(pcd)
     work = work.remove_non_finite_points(remove_nan=True, remove_infinite=True)
     if len(work.points) < 50:
         return work, {"applied": False, "reason": "too_few_points"}
+
+    if gravity is not None and reference_up is None:
+        g = np.asarray(gravity, dtype=float)
+        g_norm = float(np.linalg.norm(g))
+        if g_norm > 1e-6:
+            reference_up = -g / g_norm
+
+    if reference_up is None:
+        reference_up = np.array([0.0, 0.0, 1.0])
 
     points = np.asarray(work.points).copy()
     if R_init is not None:
@@ -619,7 +603,8 @@ def clean_and_align_point_cloud(
     stat_neighbors: int = 16,
     stat_std: float = 2.8,
     R_init: np.ndarray | None = None,
-    reference_up: np.ndarray = np.array([0.0, 0.0, 1.0]),
+    reference_up: np.ndarray | None = None,
+    gravity: np.ndarray | None = None,
     session_dir: str | None = None,
 ) -> tuple[o3d.geometry.PointCloud, dict]:
     """Clean point cloud (non-finite removal, voxel downsampling, SOR outlier removal) and align to Manhattan axes."""
@@ -636,11 +621,51 @@ def clean_and_align_point_cloud(
     clean_count = len(work.points)
 
     aligned_pcd, align_info = align_point_cloud_to_manhattan(
-        work, R_init=R_init, reference_up=reference_up, session_dir=session_dir
+        work,
+        R_init=R_init,
+        reference_up=reference_up,
+        gravity=gravity,
+        session_dir=session_dir,
     )
     align_info["original_points"] = orig_count
     align_info["after_voxel_points"] = after_voxel_count
     align_info["output_points"] = clean_count
     return aligned_pcd, align_info
+
+
+def run_manhattan_alignment(
+    pcd: o3d.geometry.PointCloud,
+    gravity: np.ndarray | None = None,
+    reference_up: np.ndarray | None = None,
+    session_dir: str | None = None,
+    pose_source: str | None = None,
+    camera_frame_convention: str | None = None,
+    R_init: np.ndarray | None = None,
+) -> tuple[o3d.geometry.PointCloud, dict]:
+    """Gravity-aware Manhattan frame alignment for 3D point cloud.
+
+    Accepts explicit gravity vector or reference_up, or infers reference_up from
+    camera_frame_convention / pose_source (e.g. OpenGL/ARCore: Y-up, OpenCV/ROS: Z-up).
+    """
+    if reference_up is None:
+        if gravity is not None:
+            g = np.asarray(gravity, dtype=float)
+            g_norm = float(np.linalg.norm(g))
+            if g_norm > 1e-6:
+                reference_up = -g / g_norm
+        elif camera_frame_convention in ("opengl", "arcore") or pose_source in ("opengl", "arcore"):
+            reference_up = np.array([0.0, 1.0, 0.0])
+        elif camera_frame_convention in ("opencv", "ros") or pose_source in ("opencv", "ros"):
+            reference_up = np.array([0.0, 0.0, 1.0])
+        else:
+            reference_up = np.array([0.0, 0.0, 1.0])
+
+    return align_point_cloud_to_manhattan(
+        pcd,
+        R_init=R_init,
+        reference_up=reference_up,
+        gravity=gravity,
+        session_dir=session_dir,
+    )
 
 

@@ -1,5 +1,6 @@
 """Right-Error IMU Pre-integration with PCHIP & Covariance Inflation."""
 
+from typing import Optional
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 from app.services.vio_core import numba_accelerated as _nba
@@ -45,14 +46,32 @@ class ImuPreintegration:
         self.sigma_ba = float(noise_params.get("sigma_ba", 1e-4))
         self.sigma_bg = float(noise_params.get("sigma_bg", 1e-5))
         self.is_inflated = False
-        self.reset(ba, bg)
+        self._prev_accel = None
+        self._prev_gyro = None
+        self.reset(ba, bg, keep_last_sample=False)
 
-    def reset(self, ba: np.ndarray, bg: np.ndarray) -> None:
+    @property
+    def has_prev(self) -> bool:
+        """Whether previous IMU samples exist for midpoint integration."""
+        return self._prev_accel is not None
+
+    @property
+    def prev_acc(self) -> Optional[np.ndarray]:
+        """Previous accelerometer measurement."""
+        return self._prev_accel
+
+    @property
+    def prev_gyro(self) -> Optional[np.ndarray]:
+        """Previous gyroscope measurement."""
+        return self._prev_gyro
+
+    def reset(self, ba: np.ndarray, bg: np.ndarray, keep_last_sample: bool = True) -> None:
         """Reset pre-integration states and Jacobians for a new frame interval.
 
         Args:
             ba: 3D accelerometer bias vector.
             bg: 3D gyroscope bias vector.
+            keep_last_sample: Whether to preserve previous IMU samples for trapezoidal integration (default True).
         """
         self.ba = np.array(ba, dtype=np.float64).copy()
         self.bg = np.array(bg, dtype=np.float64).copy()
@@ -67,8 +86,9 @@ class ImuPreintegration:
         self.J_bg = np.zeros((9, 3), dtype=np.float64)
         
         self.is_inflated = False
-        self._prev_accel = None
-        self._prev_gyro = None
+        if not keep_last_sample:
+            self._prev_accel = None
+            self._prev_gyro = None
 
     def integrate(self, accel: np.ndarray, gyro: np.ndarray, dt: float) -> None:
         """Integrate a single IMU sample (accel, gyro) over interval dt.
@@ -135,3 +155,7 @@ class ImuPreintegration:
         dp_corr = self.delta_p + self.J_ba[0:3, :] @ dba + self.J_bg[0:3, :] @ dbg
 
         return dR_corr, dv_corr, dp_corr
+
+
+# Alias for compatibility with brief / test naming
+ImuPreintegrator = ImuPreintegration

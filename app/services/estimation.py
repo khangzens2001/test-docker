@@ -377,6 +377,21 @@ def get_unobstructed_wall_segments(
     return result
 
 
+def _portal_effective_width(p: dict, room_h: float = 2.40) -> float:
+    ptype = str(p.get("type", p.get("kind", "door"))).lower()
+    width = float(p.get("width_m", 0.0) or 0.0)
+    if width <= 0.0:
+        return 0.0
+    height = float(p.get("height_m", 2.0) or 2.0)
+    sill = float(p.get("sill_height_m", 0.0) or 0.0)
+    is_door = ("door" in ptype or "corridor" in ptype or "connector" in ptype or (sill <= 0.35 and height >= 1.8))
+    if is_door:
+        return width
+    # Window opening deduction proportional to opening height
+    h_ratio = min(1.0, max(0.0, height / room_h)) if room_h > 0 else 0.5
+    return width * h_ratio
+
+
 def _wallpaper_number_of_drops(
     floorplan: dict, width_m: float, overlap_m: float
 ) -> int:
@@ -385,21 +400,50 @@ def _wallpaper_number_of_drops(
         raise MaterialEstimationError(
             detail="wallpaper_width_m must be greater than wallpaper_overlap_m"
         )
+
+    room = floorplan.get("room") if isinstance(floorplan.get("room"), dict) else {}
+    try:
+        room_h = float(room.get("height_meters") or 2.40)
+    except (TypeError, ValueError):
+        room_h = 2.40
+
+    portals = floorplan.get("portals", [])
+    if not isinstance(portals, list):
+        portals = []
+
     usable = _usable_walls(floorplan)
     if usable:
         wall_segments = get_unobstructed_wall_segments(floorplan)
-        flat_lengths = [l for segs in wall_segments for l in segs if l >= _LENGTH_EPS]
-        if flat_lengths:
-            return int(
-                sum(
-                    max(1, math.ceil(max(0.0, length - overlap_m) / w_eff))
-                    for length in flat_lengths
-                )
-            )
-        # All usable walls are completely obstructed by full-height wardrobes
-        return 0
 
-    room = floorplan.get("room") if isinstance(floorplan.get("room"), dict) else {}
+        # Map portals to walls
+        wall_portal_deduct: dict[int, float] = {}
+        unassigned_deduct = 0.0
+        for p in portals:
+            if not isinstance(p, dict):
+                continue
+            eff_w = _portal_effective_width(p, room_h)
+            w_idx = p.get("wall_index")
+            if w_idx is not None:
+                try:
+                    w_i = int(w_idx)
+                    wall_portal_deduct[w_i] = wall_portal_deduct.get(w_i, 0.0) + eff_w
+                except (ValueError, TypeError):
+                    unassigned_deduct += eff_w
+            else:
+                unassigned_deduct += eff_w
+
+        total_drops = 0
+        for i, segs in enumerate(wall_segments):
+            wall_len = sum(l for l in segs if l >= _LENGTH_EPS)
+            deduct = wall_portal_deduct.get(i, 0.0)
+            if unassigned_deduct > 0.0 and len(wall_segments) > 0:
+                deduct += unassigned_deduct / len(wall_segments)
+            net_len = max(0.0, wall_len - deduct)
+            if net_len >= _LENGTH_EPS:
+                total_drops += max(1, math.ceil(max(0.0, net_len - overlap_m) / w_eff))
+
+        return total_drops
+
     try:
         perimeter = float(room.get("perimeter_m") or 0.0)
     except (TypeError, ValueError):
@@ -418,6 +462,11 @@ def _wallpaper_number_of_drops(
             if isinstance(k, dict) and k.get("full_height") is not False
         )
         perimeter = max(0.0, perimeter - kp_len)
+
+    # Deduct portal widths from perimeter
+    portal_deduct = sum(_portal_effective_width(p, room_h) for p in portals if isinstance(p, dict))
+    perimeter = max(0.0, perimeter - portal_deduct)
+
     if perimeter < _LENGTH_EPS:
         return 0
     return int(max(1, math.ceil(max(0.0, perimeter - overlap_m) / w_eff)))

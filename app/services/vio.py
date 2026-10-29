@@ -49,16 +49,16 @@ except ImportError:
     cv2 = None
 
 # Wire all 10 VIO core components
-from app.services.vio_core.math_utils import rot_to_quat, quat_to_rot, so3_exp, so3_log, skew_symmetric
+from app.services.vio_core.math_utils import rot_to_quat, quat_to_rot, so3_exp, so3_log, skew_symmetric, umeyama_alignment
 from app.services.vio_core.state import NominalState, StateIndex
 from app.services.vio_core.imu_preintegration import ImuPreintegration
 from app.services.vio_core.eskf import SRESKF
 from app.services.vio_core.visual_frontend import VisualFrontend
-from app.services.vio_core.spad_depth_fusion import associate_spad_depth
+from app.services.vio_core.spad_depth_fusion import associate_spad_depth, compute_vl53l8cx_rays
 from app.services.vio_core.triangulation import point_3d_to_inverse_depth, compute_parallax_angle
 from app.services.vio_core.lidar_constraints import build_spad_lidar_constraint
 from app.services.vio_core.hub_imu_fusion import build_hub_imu_constraint
-from app.services.vio_core.rts_smoother import ManifoldRtsSmoother, _copy_state, resolve_rts_device
+from app.services.vio_core.rts_smoother import ManifoldRtsSmoother, _copy_state, resolve_rts_device, compute_process_noise_q
 from app.services.calibration import (
     remap_lidar_zones_to_camera_frame,
     load_T_bc,
@@ -83,6 +83,42 @@ from app.services.vio_core.frontend_pipeline import FrontendFrame, FrontendPipel
 PUBLISH_WALL_S = float(os.environ.get("VIO_WALL_CLOCK_BUDGET_S", "450.0"))
 
 logger = logging.getLogger(__name__)
+
+
+def apply_handheld_lever_arm_compensation(
+    R_seq: np.ndarray,
+    t_seq: np.ndarray,
+    l_arm_cam: Optional[np.ndarray] = None,
+    drift_xy_scale: float = 0.12,
+    drift_z_scale: float = 0.08,
+) -> np.ndarray:
+    """Compensate camera optical center displacement for handheld wrist/body lever arm
+    during stationary 360-degree pitch/yaw sweeps when ARCore odometry is runaway."""
+    t_arr = np.asarray(t_seq, dtype=np.float64).copy()
+    if len(t_arr) == 0:
+        return t_arr
+    t_damped = t_arr.copy()
+    t_damped[:, :2] = t_arr[0, :2] + float(drift_xy_scale) * (t_arr[:, :2] - t_arr[0, :2])
+    t_damped[:, 2] = t_arr[0, 2] + float(drift_z_scale) * (t_arr[:, 2] - t_arr[0, 2])
+    R_arr = np.asarray(R_seq, dtype=np.float64)
+    if R_arr.ndim != 3 or len(R_arr) != len(t_arr) or len(t_arr) < 2:
+        return t_damped
+    # In sensor_opencv camera frame (+X down along grip, +Y right, +Z forward along optical axis),
+    # the camera/LiDAR optical center sits ~8cm above the wrist pivot (-X) and ~10cm forward (+Z).
+    lever = (
+        np.asarray(l_arm_cam, dtype=np.float64).reshape(3)
+        if l_arm_cam is not None
+        else np.array([-0.08, 0.0, 0.10], dtype=np.float64)
+    )
+    disp = np.einsum("nij,j->ni", R_arr - R_arr[0], lever)
+    if len(disp) >= 5:
+        k = 5
+        pad = k // 2
+        disp_pad = np.pad(disp, ((pad, pad), (0, 0)), mode="edge")
+        kernel = np.ones(k, dtype=np.float64) / float(k)
+        for ax in range(3):
+            disp[:, ax] = np.convolve(disp_pad[:, ax], kernel, mode="valid")
+    return t_damped + disp
 
 
 class SensorType(Enum):
@@ -341,15 +377,40 @@ class ServerSideVioEstimator:
         odo_times = None
         odo_pos = None
         odo_rots = None
+        odo_frozen = None
         if odometry_df is not None and not odometry_df.empty:
-            t_col = "timestamp" if "timestamp" in odometry_df.columns else "device_timestamp_ns"
-            if t_col in odometry_df.columns and {"x", "y", "z"}.issubset(odometry_df.columns):
-                raw_ts = odometry_df[t_col].to_numpy(dtype=float)
+            odo_work = odometry_df
+            if (
+                "is_frozen_interpolated" not in odo_work.columns
+                and {"x", "y", "z", "qx", "qy", "qz", "qw"}.issubset(odo_work.columns)
+                and len(odo_work) >= 2
+            ):
+                try:
+                    from app.pipeline.runner import select_best_tracking_island
+                    odo_cand = odo_work.copy()
+                    if rot_deg is not None:
+                        odo_cand.attrs["camera_sensor_to_display_rotation_deg"] = int(round(float(rot_deg)))
+                    cleaned_odo = select_best_tracking_island(
+                        odo_cand, imu_df=phone_imu_df, pose_convention="opengl"
+                    )
+                    if len(cleaned_odo) >= max(2, int(0.8 * len(odo_work))):
+                        odo_work = cleaned_odo
+                except Exception:
+                    pass
+            t_col = "timestamp" if "timestamp" in odo_work.columns else "device_timestamp_ns"
+            if t_col in odo_work.columns and {"x", "y", "z"}.issubset(odo_work.columns):
+                raw_ts = odo_work[t_col].to_numpy(dtype=float)
                 odo_times = raw_ts / 1e9 if (len(raw_ts) > 0 and raw_ts[0] > 1e11) else raw_ts
-                odo_pos = odometry_df[["x", "y", "z"]].to_numpy(dtype=float)
-                if {"qx", "qy", "qz", "qw"}.issubset(odometry_df.columns):
-                    qs = odometry_df[["qx", "qy", "qz", "qw"]].to_numpy(dtype=float)
+                odo_pos = odo_work[["x", "y", "z"]].to_numpy(dtype=float)
+                if {"qx", "qy", "qz", "qw"}.issubset(odo_work.columns):
+                    qs = odo_work[["qx", "qy", "qz", "qw"]].to_numpy(dtype=float)
                     odo_rots = Rotation.from_quat(qs).as_matrix()
+                if "is_frozen_interpolated" in odo_work.columns:
+                    odo_frozen = (
+                        pd.to_numeric(odo_work["is_frozen_interpolated"], errors="coerce")
+                        .fillna(0)
+                        .to_numpy(dtype=np.int64)
+                    )
 
         span_xy_odo = None
         odo_horiz = None
@@ -393,37 +454,10 @@ class ServerSideVioEstimator:
                         d_p90 = d_p90 / 1000.0
                     spad_depth_p90 = d_p90
 
-        # Gate out corrupted / runaway external odometry (e.g. ARCore tracking loss > 2.2x LiDAR depth envelope)
-        odo_is_runaway = False
-        if odo_times is not None and odo_horiz is not None and len(odo_times) > 2:
-            dt_arr = np.diff(odo_times)
-            dp_arr = np.linalg.norm(np.diff(odo_horiz, axis=0), axis=1)
-            valid_dt = dt_arr > 1e-3
-            if np.any(valid_dt):
-                odo_p90_speed = float(np.percentile(dp_arr[valid_dt] / dt_arr[valid_dt], 90))
-                if odo_p90_speed > 0.90:
-                    odo_is_runaway = True
-        if span_xy_odo is not None and np.isfinite(span_xy_odo):
-            if spad_depth_p90 is not None and span_xy_odo > max(2.2 * spad_depth_p90, 4.0):
-                odo_is_runaway = True
-            elif span_xy_odo > 12.0:
-                odo_is_runaway = True
-
-        if odo_is_runaway:
-            logger.warning(
-                "Gating out runaway external odometry translation (span_xy_odo=%s, spad_depth_p90=%s)",
-                span_xy_odo,
-                spad_depth_p90,
-            )
-            odo_times = None
-            odo_pos = None
-            span_xy_odo = None
-            span_odo = None
-
         if span_xy_odo is not None and np.isfinite(span_xy_odo) and span_xy_odo > 0:
             r_bound = max(1.25 * float(span_xy_odo), 0.60)
             if spad_depth_p90 is not None and spad_depth_p90 > 0:
-                r_bound = min(r_bound, 1.35 * float(spad_depth_p90))
+                r_bound = min(r_bound, 0.85 * float(spad_depth_p90))
         else:
             r_bound = (0.65 * float(spad_depth_p90)) if (spad_depth_p90 is not None and spad_depth_p90 > 0) else 2.50
         z_bound = min(0.55 * float(spad_depth_p90), 1.20) if (spad_depth_p90 is not None and spad_depth_p90 > 0) else 1.20
@@ -483,6 +517,7 @@ class ServerSideVioEstimator:
         forward_states: List[NominalState] = []
         S_P_list: List[np.ndarray] = []
         F_list: List[np.ndarray] = []
+        Q_list: List[np.ndarray] = []
         pred_states: List[NominalState] = []
         timestamps: List[float] = []
         camera_snapshots: List[Dict[str, Any]] = []
@@ -536,12 +571,18 @@ class ServerSideVioEstimator:
                     if energy < best_energy:
                         best_energy = energy
                         best_w = w_start
-                a_init = np.mean(acc_raw[best_w : best_w + 50], axis=0)
-                bg_init = np.mean(gyr_raw[best_w : best_w + 50], axis=0)
+                # Only treat window as stationary bias calibration if RMS gyro <= 0.04 rad/s
+                if best_energy <= (0.04 ** 2):
+                    a_init = np.mean(acc_raw[best_w : best_w + 50], axis=0)
+                    bg_init = np.mean(gyr_raw[best_w : best_w + 50], axis=0)
+                else:
+                    n_init = min(25, len(acc_raw))
+                    a_init = np.mean(acc_raw[:n_init], axis=0) if n_init > 0 else np.array([0.0, 0.0, 9.80665])
+                    bg_init = np.zeros(3, dtype=float)
             else:
                 n_init = min(50, len(acc_raw))
                 a_init = np.mean(acc_raw[:n_init], axis=0) if n_init > 0 else np.array([0.0, 0.0, 9.80665])
-                bg_init = np.mean(gyr_raw[:n_init], axis=0) if n_init > 0 else np.zeros(3)
+                bg_init = np.mean(gyr_raw[:n_init], axis=0) if (n_init > 0 and float(np.mean(np.sum(gyr_raw[:n_init] ** 2, axis=1))) <= (0.04 ** 2)) else np.zeros(3, dtype=float)
 
             eskf.state.bg = bg_init.copy()
             preint.bg = bg_init.copy()
@@ -565,41 +606,51 @@ class ServerSideVioEstimator:
         R_vio_odo = None
         if odo_rots is not None and len(odo_rots) > 0:
             R_wc_0 = eskf.state.R @ T_bc[:3, :3]
-            # Gravity-aligned coordinate mapping from ARCore world to VIO world:
-            # ARCore world: +Y is UP (aligned with gravity), X-Z is the horizontal ground plane.
-            # VIO world:    +Z is UP (aligned with gravity), X-Y is the horizontal ground plane.
-            # Base rotation R0 maps ARCore UP [0, 1, 0] -> VIO UP [0, 0, 1],
-            # and ARCore forward [0, 0, -1] -> VIO forward [0, 1, 0], [1, 0, 0] -> [1, 0, 0].
+            # Full 3D coordinate mapping from ARCore world to VIO world:
+            # 1. Base mapping R0 maps ARCore UP [0, 1, 0] -> VIO nominal UP [0, 0, 1],
+            #    and ARCore forward [0, 0, -1] -> VIO forward [0, 1, 0], [1, 0, 0] -> [1, 0, 0].
             R0 = np.array([
                 [1.0,  0.0,  0.0],
                 [0.0,  0.0, -1.0],
                 [0.0,  1.0,  0.0],
             ], dtype=float)
 
-            # Align horizontal yaw heading at t=0 between ARCore camera optical axis and VIO camera optical axis
-            # ARCore camera optical axis in ARCore world (OpenGL convention: [0, 0, -1]):
+            # 2. Gravity vector alignment for Pitch/Roll
+            g_vec = eskf.state.g if hasattr(eskf.state, "g") else np.array([0.0, 0.0, -9.80665])
+            norm_g = float(np.linalg.norm(g_vec))
+            g_vio = -g_vec / norm_g if norm_g > 1e-4 else np.array([0.0, 0.0, 1.0])
+
+            v_cross = np.cross(np.array([0.0, 0.0, 1.0]), g_vio)
+            s_cross = float(np.linalg.norm(v_cross))
+            c_dot = float(np.dot(np.array([0.0, 0.0, 1.0]), g_vio))
+            if s_cross > 1e-6:
+                k_axis = v_cross / s_cross
+                theta_tilt = np.arctan2(s_cross, c_dot)
+                R_tilt = so3_exp(k_axis * theta_tilt)
+            else:
+                R_tilt = np.eye(3, dtype=float)
+            R_base = R_tilt @ R0
+
+            # 3. Align horizontal yaw heading at t=0
             v_odo_opt = odo_rots[0] @ np.array([0.0, 0.0, -1.0])
-            # VIO camera optical axis in VIO world (OpenCV convention: [0, 0, 1]):
             v_vio_opt = R_wc_0 @ np.array([0.0, 0.0, 1.0])
 
-            h_odo = np.array([v_odo_opt[0], 0.0, v_odo_opt[2]])
-            h_vio = np.array([v_vio_opt[0], v_vio_opt[1], 0.0])
-            norm_odo = float(np.linalg.norm(h_odo))
+            h_odo = v_odo_opt - float(np.dot(v_odo_opt, [0.0, 1.0, 0.0])) * np.array([0.0, 1.0, 0.0])
+            h_mapped = R_base @ h_odo
+            h_vio = v_vio_opt - float(np.dot(v_vio_opt, g_vio)) * g_vio
+            norm_mapped = float(np.linalg.norm(h_mapped))
             norm_vio = float(np.linalg.norm(h_vio))
 
-            if norm_odo > 1e-4 and norm_vio > 1e-4:
-                h_mapped = R0 @ h_odo
-                yaw_mapped = np.arctan2(h_mapped[1], h_mapped[0])
-                yaw_vio = np.arctan2(h_vio[1], h_vio[0])
-                psi = yaw_vio - yaw_mapped
-                R_yaw = np.array([
-                    [np.cos(psi), -np.sin(psi), 0.0],
-                    [np.sin(psi),  np.cos(psi), 0.0],
-                    [0.0,          0.0,         1.0],
-                ], dtype=float)
-                R_vio_odo = R_yaw @ R0
+            if norm_mapped > 1e-4 and norm_vio > 1e-4:
+                u_mapped = h_mapped / norm_mapped
+                u_vio = h_vio / norm_vio
+                cross_yaw = np.dot(np.cross(u_mapped, u_vio), g_vio)
+                dot_yaw = float(np.dot(u_mapped, u_vio))
+                psi = np.arctan2(cross_yaw, dot_yaw)
+                R_yaw = so3_exp(g_vio * psi)
+                R_vio_odo = R_yaw @ R_base
             else:
-                R_vio_odo = R0
+                R_vio_odo = R_base
 
         # Frontend producer: gyro-predicted KLT initial flow (design §3.1–3.2). Frames and gyro
         # samples are taken from the very event list the loop consumes, so both sides agree.
@@ -681,12 +732,24 @@ class ServerSideVioEstimator:
                             timings["imu"] += time.perf_counter() - t_imu0
                             F_list.append(F_k.copy())
                             pred_states.append(_copy_state(eskf.state))
-                            preint.reset(eskf.state.ba, eskf.state.bg)
+                            Q_list.append(compute_process_noise_q(dt))
+                            preint.reset(eskf.state.ba, eskf.state.bg, keep_last_sample=True)
 
                             # Pre-camera stabilization and stationary ZUPT
                             if not first_camera_seen and ts < first_camera_time:
-                                eskf.state.v[:] = 0.0
-                                eskf.state.p[:] = 0.0
+                                S_P_prev = eskf.S_P.copy()
+                                S_P_dec = np.eye(StateIndex.DIM, dtype=np.float64) * 1e-6
+                                S_P_dec[StateIndex.POS, StateIndex.POS] = np.eye(3) * 1.0
+                                S_P_dec[StateIndex.VEL, StateIndex.VEL] = np.eye(3) * 1.0
+                                eskf.S_P = S_P_dec
+                                H_pv0 = np.zeros((6, StateIndex.DIM), dtype=np.float64)
+                                H_pv0[:3, StateIndex.POS] = np.eye(3)
+                                H_pv0[3:, StateIndex.VEL] = np.eye(3)
+                                y_pv0 = np.concatenate([-eskf.state.p, -eskf.state.v])
+                                eskf.update_measurement(y_pv0, H_pv0, np.eye(6) * 1e-12, chi2_mult=1e6)
+                                row_n_pv = np.linalg.norm(S_P_prev[:6, :], axis=1, keepdims=True)
+                                S_P_prev[:6, :] *= np.minimum(1.0, 10.0 / np.maximum(row_n_pv, 1e-12))
+                                eskf.S_P = S_P_prev
                                 eskf.update_zupt(sigma_vel=0.005)
                             else:
                                 # In-flight ZUPT and gravity-tilt lock during camera tracking
@@ -699,13 +762,43 @@ class ServerSideVioEstimator:
                                     eskf.update_zupt(sigma_vel=0.01)
 
                             cur_v_mag = float(np.linalg.norm(eskf.state.v))
-                            if cur_v_mag > 1.2:
-                                eskf.state.v *= (1.2 / cur_v_mag)
-                            eskf.state.v[2] = float(np.clip(eskf.state.v[2], -0.80, 0.80))
-                            eskf.state.p[2] = float(np.clip(eskf.state.p[2], -z_bound, z_bound))
+                            if cur_v_mag > 1.2 or abs(float(eskf.state.v[2])) > 0.80:
+                                v_target = eskf.state.v.copy()
+                                if cur_v_mag > 1.2:
+                                    v_target *= (1.2 / cur_v_mag)
+                                v_target[2] = float(np.clip(v_target[2], -0.80, 0.80))
+                                S_P_prev = eskf.S_P.copy()
+                                S_P_dec = np.eye(StateIndex.DIM, dtype=np.float64) * 1e-6
+                                S_P_dec[StateIndex.VEL, StateIndex.VEL] = np.eye(3) * 1.0
+                                eskf.S_P = S_P_dec
+                                H_v_env = np.zeros((3, StateIndex.DIM), dtype=np.float64)
+                                H_v_env[:, StateIndex.VEL] = np.eye(3)
+                                eskf.update_measurement(v_target - eskf.state.v, H_v_env, np.eye(3) * 1e-12, chi2_mult=1e6)
+                                row_n_v = np.linalg.norm(S_P_prev[StateIndex.VEL, :], axis=1, keepdims=True)
+                                S_P_prev[StateIndex.VEL, :] *= np.minimum(1.0, 10.0 / np.maximum(row_n_v, 1e-12))
+                                eskf.S_P = S_P_prev
+                            if abs(float(eskf.state.p[2])) > z_bound:
+                                z_target = float(np.clip(eskf.state.p[2], -z_bound, z_bound))
+                                S_P_prev = eskf.S_P.copy()
+                                S_P_dec = np.eye(StateIndex.DIM, dtype=np.float64) * 1e-6
+                                S_P_dec[2, 2] = 1.0
+                                eskf.S_P = S_P_dec
+                                H_z_env = np.zeros((1, StateIndex.DIM), dtype=np.float64)
+                                H_z_env[0, 2] = 1.0
+                                eskf.update_measurement(
+                                    np.array([z_target - float(eskf.state.p[2])], dtype=np.float64),
+                                    H_z_env,
+                                    np.array([[1e-12]], dtype=np.float64),
+                                    chi2_mult=1e6,
+                                )
+                                row_n_z = float(np.linalg.norm(S_P_prev[2, :]))
+                                if row_n_z > 10.0:
+                                    S_P_prev[2, :] *= (10.0 / row_n_z)
+                                eskf.S_P = S_P_prev
                         else:
                             F_list.append(np.eye(StateIndex.DIM))
                             pred_states.append(_copy_state(eskf.state))
+                            Q_list.append(compute_process_noise_q(1e-4))
 
                     last_phone_imu_time = ts
                     latest_phone_gyro = gyro.copy()
@@ -759,13 +852,14 @@ class ServerSideVioEstimator:
                     if not fres.skipped:
                         R_wc_now, p_wc_now = camera_pose_from_body(eskf.state, T_bc)
                         R_prev_curr = fres.R_prev_curr
-
                         matched_pts_prev = fres.matched_pts_prev
                         matched_pts_curr = fres.matched_pts_curr
                         new_uv = fres.new_pts
                         w_img, h_img = fres.image_size
-                        track_map.sync_klt(matched_pts_prev, matched_pts_curr, new_uv, image_size=(w_img, h_img))
 
+                        # 1. Propagate KLT tracks, initialize SPAD/DLT landmarks, and run visual update
+                        track_map.sync_klt(matched_pts_prev, matched_pts_curr, new_uv, image_size=(w_img, h_img))
+                        T_cam_spad_eff = None
                         if latest_spad_depth is not None:
                             depth_to_assoc = latest_spad_depth
                             status_to_assoc = latest_spad_status
@@ -778,16 +872,15 @@ class ServerSideVioEstimator:
                                     status_to_assoc = remap_lidar_zones_to_camera_frame(
                                         status_to_assoc, flip_h=flip_h, flip_v=flip_v, rot_deg=rot_deg
                                     )
+                            if T_lidar_camera is not None:
+                                if has_grid_remap:
+                                    T_cam_spad_eff = np.eye(4, dtype=np.float64)
+                                    T_cam_spad_eff[:3, 3] = T_lidar_camera[:3, 3]
+                                else:
+                                    T_cam_spad_eff = T_lidar_camera
                             candidate_tracks = [t for t in track_map.tracks_by_id.values() if t.status == STATUS_CANDIDATE]
                             if candidate_tracks:
                                 cand_uvs = np.array([t.uv for t in candidate_tracks], dtype=np.float64)
-                                T_cam_spad_eff = None
-                                if T_lidar_camera is not None:
-                                    if has_grid_remap:
-                                        T_cam_spad_eff = np.eye(4, dtype=np.float64)
-                                        T_cam_spad_eff[:3, 3] = T_lidar_camera[:3, 3]
-                                    else:
-                                        T_cam_spad_eff = T_lidar_camera
                                 depths, validity, variances = associate_spad_depth(
                                     depth_to_assoc,
                                     cand_uvs,
@@ -822,15 +915,17 @@ class ServerSideVioEstimator:
                             if d_grid.ndim == 2:
                                 hg, wg = d_grid.shape
                                 if R_C_floor is None or R_C_floor.shape != (hg * wg, 3):
-                                    c_grid = (np.arange(wg) + 0.5) / float(wg) * float(w_img)
-                                    r_grid = (np.arange(hg) + 0.5) / float(hg) * float(h_img)
-                                    CC, RR = np.meshgrid(c_grid, r_grid)
-                                    rc_x = (CC.ravel() - K[0, 2]) / K[0, 0]
-                                    rc_y = (RR.ravel() - K[1, 2]) / K[1, 1]
-                                    rc_z = np.ones(hg * wg, dtype=np.float64)
-                                    R_C_raw = np.column_stack([rc_x, rc_y, rc_z])
-                                    norms = np.linalg.norm(R_C_raw, axis=1, keepdims=True)
-                                    R_C_floor = R_C_raw / np.maximum(norms, 1e-6)
+                                    rays_l = compute_vl53l8cx_rays(grid_size=wg, fov_deg=45.0)
+                                    has_remap_floor = bool(flip_h or flip_v or (rot_deg != 0))
+                                    if not has_remap_floor and T_lidar_camera is not None:
+                                        R_cl = T_lidar_camera[:3, :3]
+                                    elif T_cam_spad_eff is not None:
+                                        R_cl = T_cam_spad_eff[:3, :3]
+                                    else:
+                                        R_cl = np.eye(3, dtype=np.float64)
+                                    rays_c = (R_cl @ rays_l.T).T
+                                    norms = np.linalg.norm(rays_c, axis=1, keepdims=True)
+                                    R_C_floor = rays_c / np.maximum(norms, 1e-6)
 
                                 rw_z = R_C_floor @ R_wc_now[2, :]
                                 d_flat = d_grid.ravel()
@@ -850,6 +945,7 @@ class ServerSideVioEstimator:
                         cur_spad_active = [t for t in cur_active if t.origin == ORIGIN_SPAD]
                         spad_active_counts.append(len(cur_spad_active))
                         all_spad_active_ids.update(t.track_id for t in cur_spad_active)
+                        o_spad = float(np.clip(len(cur_spad_active) / 8.0, 0.0, 1.0))
 
                         t_upd0 = time.perf_counter()
                         tracks = track_map.select_for_update((w_img, h_img))
@@ -865,7 +961,7 @@ class ServerSideVioEstimator:
                                 logger.debug("Visual update failed with numerical exception: %s", exc)
                         timings["eskf_update"] += time.perf_counter() - t_upd0
 
-                        # Check optical flow parallax / odometry speed for ZUPT
+                        # 2. Velocity damping / ZUPT check using derotated optical flow + odometry
                         is_stationary = False
                         du_med = None
                         w_curr = float(np.linalg.norm(latest_phone_gyro - eskf.state.bg)) if latest_phone_gyro is not None else 1.0
@@ -884,43 +980,67 @@ class ServerSideVioEstimator:
                                 if np.median(flow_res) < 1.0 and w_curr < 0.05:
                                     is_stationary = True
 
-                        o_spad = float(np.clip(len(cur_spad_active) / 8.0, 0.0, 1.0))
                         q_motion = 1.0
                         if odo_times is not None and len(odo_times) > 1:
                             idx_odo = np.clip(np.searchsorted(odo_times, ts), 1, len(odo_times) - 1)
                             dt_o = max(1e-3, odo_times[idx_odo] - odo_times[idx_odo - 1])
                             dp_odo = odo_pos[idx_odo] - odo_pos[idx_odo - 1]
-                            dp_odo_h = (R_vio_odo @ dp_odo)[:2] if R_vio_odo is not None else dp_odo
-                            s_odo = float(np.linalg.norm(dp_odo_h) / max(dt_o, 0.005))
-                            if s_odo < 0.05 and w_curr < 0.05:
+                            dp_odo_w = (R_vio_odo @ dp_odo) if R_vio_odo is not None else dp_odo
+                            s_odo = float(np.linalg.norm(dp_odo_w) / max(dt_o, 0.005))
+                            is_odo_froz = bool(
+                                odo_frozen is not None
+                                and 0 <= idx_odo < len(odo_frozen)
+                                and odo_frozen[idx_odo] != 0
+                            )
+                            if s_odo < 0.05 and w_curr < 0.05 and not is_odo_froz:
                                 is_stationary = True
-                            if s_odo > 2.5 or dt_o < 0.005 or float(np.linalg.norm(dp_odo_h)) > 0.50:
+                            if s_odo > 2.5 or dt_o < 0.005 or float(np.linalg.norm(dp_odo_w)) > 0.50:
+                                q_motion = 0.0
+                            elif is_odo_froz and s_odo < 1e-4:
                                 q_motion = 0.0
                             else:
                                 q_motion = float(np.clip(1.0 - max(0.0, s_odo - 1.2), 0.0, 1.0))
+                                if is_odo_froz:
+                                    q_motion *= 0.25
 
                         if is_stationary:
-                            eskf.state.v[:] = 0.0
+                            S_P_prev = eskf.S_P.copy()
+                            S_P_dec = np.eye(StateIndex.DIM, dtype=np.float64) * 1e-6
+                            S_P_dec[StateIndex.VEL, StateIndex.VEL] = np.eye(3) * 1.0
+                            eskf.S_P = S_P_dec
+                            H_v0 = np.zeros((3, StateIndex.DIM), dtype=np.float64)
+                            H_v0[:, StateIndex.VEL] = np.eye(3)
+                            eskf.update_measurement(-eskf.state.v, H_v0, np.eye(3) * 1e-12, chi2_mult=1e6)
+                            eskf.S_P = S_P_prev
                             eskf.update_zupt(sigma_vel=0.01)
                         elif odo_times is not None and len(odo_times) > 1 and q_motion > 0.0:
-                            alpha_v = float(np.clip(0.70 - 0.10 * o_spad, 0.45, 0.75)) * q_motion
                             if R_vio_odo is not None:
                                 v_odo_w = R_vio_odo @ (dp_odo / dt_o)
-                                v_odo_w[2] = 0.0
-                                eskf.state.v[:2] = (1.0 - alpha_v) * eskf.state.v[:2] + alpha_v * v_odo_w[:2]
-                                eskf.state.v[2] = float(np.clip(eskf.state.v[2] * (1.0 - 0.5 * alpha_v), -0.40, 0.40))
+                                # Loosely-coupled ESKF velocity update with chi2 gating
+                                y_v = v_odo_w - eskf.state.v
+                                H_v = np.zeros((3, StateIndex.DIM), dtype=np.float64)
+                                H_v[:, StateIndex.VEL] = np.eye(3)
+                                sigma_v = max(0.05, 0.10 / max(q_motion, 0.1))
+                                R_v = (sigma_v ** 2) * np.eye(3, dtype=np.float64)
+                                eskf.update_measurement(y_v, H_v, R_v, chi2_mult=1.0)
                             else:
                                 v_norm = float(np.linalg.norm(eskf.state.v))
                                 if v_norm > 1e-4 and s_odo > 1e-4:
+                                    alpha_v = 0.5 * q_motion
                                     target_speed = (1.0 - alpha_v) * v_norm + alpha_v * min(s_odo, 2.0)
-                                    eskf.state.v = (eskf.state.v / v_norm) * target_speed
-
-                            v_cur_speed = float(np.linalg.norm(eskf.state.v))
-                            max_allowed_speed = max(1.2 * s_odo, 0.10)
-                            if v_cur_speed > max_allowed_speed:
-                                eskf.state.v *= (max_allowed_speed / v_cur_speed)
+                                    v_target_odo = (eskf.state.v / v_norm) * target_speed
+                                    S_P_prev = eskf.S_P.copy()
+                                    S_P_dec = np.eye(StateIndex.DIM, dtype=np.float64) * 1e-6
+                                    S_P_dec[StateIndex.VEL, StateIndex.VEL] = np.eye(3) * 1.0
+                                    eskf.S_P = S_P_dec
+                                    H_v = np.zeros((3, StateIndex.DIM), dtype=np.float64)
+                                    H_v[:, StateIndex.VEL] = np.eye(3)
+                                    eskf.update_measurement(v_target_odo - eskf.state.v, H_v, np.eye(3) * 1e-12, chi2_mult=1e6)
+                                    row_n_v = np.linalg.norm(S_P_prev[StateIndex.VEL, :], axis=1, keepdims=True)
+                                    S_P_prev[StateIndex.VEL, :] *= np.minimum(1.0, 0.80 / np.maximum(row_n_v, 1e-12))
+                                    eskf.S_P = S_P_prev
                         elif odo_times is None and du_med is not None and len(camera_snapshots) > 0:
-                            # Anchor translational velocity directly from derotated optical flow + SPAD LiDAR depth
+                            # Anchor 3D translational velocity from derotated optical flow + SPAD LiDAR depth
                             dt_cam = max(0.015, ts - camera_snapshots[-1]["timestamp"])
                             z_med = float(spad_depth_p90) if (spad_depth_p90 is not None and spad_depth_p90 > 0.2) else 1.5
                             if latest_spad_depth is not None:
@@ -931,18 +1051,35 @@ class ServerSideVioEstimator:
                             vc_x = -float(du_med[0]) / max(float(K[0, 0]), 1.0) * z_med / dt_cam
                             vc_y = -float(du_med[1]) / max(float(K[1, 1]), 1.0) * z_med / dt_cam
                             v_flow_w = R_wc_now @ np.array([vc_x, vc_y, 0.0], dtype=np.float64)
-                            v_flow_w[2] = 0.0
-                            s_flow = float(np.linalg.norm(v_flow_w[:2]))
-                            max_flow_speed = 0.35
-                            if s_flow > max_flow_speed and s_flow > 1e-6:
-                                v_flow_w[:2] *= (max_flow_speed / s_flow)
-                            eskf.state.v[:2] = 0.35 * eskf.state.v[:2] + 0.65 * v_flow_w[:2]
-                            eskf.state.v[2] = float(np.clip(eskf.state.v[2] * 0.5, -0.25, 0.25))
-
-                        v_mag = float(np.linalg.norm(eskf.state.v))
-                        if v_mag > 1.2:
-                            eskf.state.v *= (1.2 / v_mag)
-
+                            s_flow = float(np.linalg.norm(v_flow_w))
+                            if s_flow > 0.35 and s_flow > 1e-6:
+                                v_flow_w *= (0.35 / s_flow)
+                            v_target_flow = np.array(
+                                [
+                                    0.35 * float(eskf.state.v[0]) + 0.65 * float(v_flow_w[0]),
+                                    0.35 * float(eskf.state.v[1]) + 0.65 * float(v_flow_w[1]),
+                                    float(
+                                        np.clip(
+                                            0.35 * float(eskf.state.v[2]) + 0.65 * float(v_flow_w[2]),
+                                            -0.50,
+                                            0.50,
+                                        )
+                                    ),
+                                ],
+                                dtype=np.float64,
+                            )
+                            S_P_prev = eskf.S_P.copy()
+                            S_P_dec = np.eye(StateIndex.DIM, dtype=np.float64) * 1e-6
+                            S_P_dec[StateIndex.VEL, StateIndex.VEL] = np.eye(3) * 1.0
+                            eskf.S_P = S_P_dec
+                            H_flow = np.zeros((3, StateIndex.DIM), dtype=np.float64)
+                            H_flow[:, StateIndex.VEL] = np.eye(3)
+                            eskf.update_measurement(
+                                v_target_flow - eskf.state.v, H_flow, np.eye(3) * 1e-12, chi2_mult=1e6
+                            )
+                            row_n_vf = np.linalg.norm(S_P_prev[StateIndex.VEL, :], axis=1, keepdims=True)
+                            S_P_prev[StateIndex.VEL, :] *= np.minimum(1.0, 10.0 / np.maximum(row_n_vf, 1e-12))
+                            eskf.S_P = S_P_prev
 
                         # Keyframe / PGO Node selection & Odometry / Loop Edge construction
                         snap_idx = len(camera_snapshots)
@@ -966,8 +1103,6 @@ class ServerSideVioEstimator:
                                 prev_node_id = pgo_node_ids[-1]
                                 R_rel_meas = last_node_R_wc.T @ R_wc_now
                                 t_rel_meas = last_node_R_wc.T @ (p_wc_now - last_node_p_wc)
-
-                                # Soft Scale Anchor from ARCore relative translation with motion gating
                                 o_node = o_spad
                                 if odo_times is not None and len(odo_times) > 1:
                                     t_prev = pgo_nodes_meta[-1]["timestamp"]
@@ -976,19 +1111,28 @@ class ServerSideVioEstimator:
                                     idx_c = _nearest_odo_idx(odo_times, t_curr)
                                     dt_seg = max(1e-3, t_curr - t_prev)
                                     dp_raw = odo_pos[idx_c] - odo_pos[idx_p]
-                                    dp_raw_h = (R_vio_odo @ dp_raw)[:2] if R_vio_odo is not None else dp_raw
-                                    d_raw_norm = float(np.linalg.norm(dp_raw_h))
+                                    dp_raw_w = (R_vio_odo @ dp_raw) if R_vio_odo is not None else dp_raw
+                                    d_raw_norm = float(np.linalg.norm(dp_raw_w))
                                     s_seg = float(d_raw_norm / max(dt_seg, 0.005))
+                                    seg_has_froz = bool(
+                                        odo_frozen is not None
+                                        and np.any(
+                                            odo_frozen[min(idx_p, idx_c) : max(idx_p, idx_c) + 1] != 0
+                                        )
+                                    )
                                     if s_seg > 2.5 or dt_seg < 0.005 or d_raw_norm > 0.50:
+                                        q_seg = 0.0
+                                    elif seg_has_froz and d_raw_norm < 1e-4:
                                         q_seg = 0.0
                                     else:
                                         q_seg = float(np.clip(1.0 - max(0.0, s_seg - 1.2), 0.0, 1.0))
+                                        if seg_has_froz:
+                                            q_seg *= 0.35
 
                                     w_odo = float(np.clip(0.80 - 0.20 * o_node, 0.35, 0.85)) * q_seg
                                     if w_odo > 0.0:
                                         if R_vio_odo is not None:
                                             dp_w_odo = R_vio_odo @ dp_raw
-                                            dp_w_odo[2] = 0.0
                                             t_rel_odo = last_node_R_wc.T @ dp_w_odo
                                             t_rel_meas = (1.0 - w_odo) * t_rel_meas + w_odo * t_rel_odo
                                         else:
@@ -1044,14 +1188,18 @@ class ServerSideVioEstimator:
                                 border = 16
                                 orb = orb_detector if orb_detector is not None else cv2.ORB_create()
 
-                                if len(p_c) >= 12:
+                                # Extract ORB descriptors on KLT 3D landmarks and augment with dense ORB + SPAD 3D points
+                                klt_descs = None
+                                klt_2d = np.empty((0, 2), dtype=float)
+                                klt_3d = np.empty((0, 3), dtype=float)
+                                if len(p_c) >= 8:
                                     valid_m = (
                                         (pts_2d[:, 0] >= border)
                                         & (pts_2d[:, 0] < w_g - border)
                                         & (pts_2d[:, 1] >= border)
                                         & (pts_2d[:, 1] < h_g - border)
                                     )
-                                    if np.count_nonzero(valid_m) >= 12:
+                                    if np.count_nonzero(valid_m) >= 8:
                                         sub_pts_2d = pts_2d[valid_m]
                                         sub_p_c = p_c[valid_m]
                                         try:
@@ -1060,33 +1208,44 @@ class ServerSideVioEstimator:
                                                 for pt in sub_pts_2d
                                             ]
                                             kps_out, descs_out = orb.compute(node_gray, cv_kps)
-                                            if descs_out is not None and len(descs_out) >= 12:
+                                            if descs_out is not None and len(descs_out) >= 8:
                                                 out_coords = np.array([[k.pt[0], k.pt[1]] for k in kps_out])
                                                 d = np.linalg.norm(sub_pts_2d[:, None, :] - out_coords[None, :, :], axis=2)
                                                 matched_sub = np.argmin(d, axis=0)
-                                                descriptors = descs_out
-                                                pts_2d = sub_pts_2d[matched_sub]
-                                                p_c = sub_p_c[matched_sub]
+                                                klt_descs = descs_out
+                                                klt_2d = sub_pts_2d[matched_sub]
+                                                klt_3d = sub_p_c[matched_sub]
                                                 is_real_orb = True
                                         except Exception:
-                                            descriptors = None
+                                            klt_descs = None
 
-                                # Fallback when 3D DLT landmarks are lacking (zero parallax at start/end of scan)
-                                if not is_real_orb:
-                                    try:
-                                        cv_kps, descs_out = orb.detectAndCompute(node_gray, None)
-                                        if descs_out is not None and len(descs_out) >= 12:
-                                            pts_2d = np.array([[k.pt[0], k.pt[1]] for k in cv_kps], dtype=float)
-                                            p_c = np.empty((0, 3), dtype=float)
-                                            descriptors = descs_out
-                                            is_real_orb = True
-                                    except Exception:
-                                        descriptors = None
+                                try:
+                                    cv_kps_all, descs_all = orb.detectAndCompute(node_gray, None)
+                                    if descs_all is not None and len(descs_all) >= 12:
+                                        det_2d = np.array([[k.pt[0], k.pt[1]] for k in cv_kps_all], dtype=float)
+                                        det_3d = np.zeros((len(det_2d), 3), dtype=np.float64)
+                                        if klt_descs is not None and len(klt_2d) > 0:
+                                            pts_2d = np.vstack([klt_2d, det_2d])
+                                            p_c = np.vstack([klt_3d, det_3d])
+                                            descriptors = np.vstack([klt_descs, descs_all])
+                                        else:
+                                            pts_2d = det_2d
+                                            p_c = det_3d
+                                            descriptors = descs_all
+                                        is_real_orb = True
+                                    elif klt_descs is not None:
+                                        pts_2d = klt_2d
+                                        p_c = klt_3d
+                                        descriptors = klt_descs
+                                except Exception:
+                                    if klt_descs is not None:
+                                        pts_2d = klt_2d
+                                        p_c = klt_3d
+                                        descriptors = klt_descs
                             del node_gray
 
-                            # Associate SPAD LiDAR depth for keypoint landmarks if 3D points are lacking
-                            has_pts_3d = (p_c is not None and len(p_c) >= 15 and np.count_nonzero(p_c[:, 2] > 0.05) >= 15)
-                            if is_real_orb and not has_pts_3d and latest_spad_depth is not None and len(pts_2d) >= 12:
+                            # Associate SPAD LiDAR depth for any keypoint lacking 3D depth
+                            if is_real_orb and latest_spad_depth is not None and len(pts_2d) >= 12:
                                 depth_grid = np.asarray(latest_spad_depth, dtype=np.float64)
                                 if bool(flip_h or flip_v or (rot_deg != 0)):
                                     depth_grid = remap_lidar_zones_to_camera_frame(
@@ -1097,9 +1256,11 @@ class ServerSideVioEstimator:
                                     gx = np.clip((pts_2d[:, 0] / max(w_img, 1.0) * wg_s).astype(int), 0, wg_s - 1)
                                     gy = np.clip((pts_2d[:, 1] / max(h_img, 1.0) * hg_s).astype(int), 0, hg_s - 1)
                                     depth_vals = depth_grid[gy, gx]
-                                    val_m = (depth_vals >= 0.20) & (depth_vals <= 4.0) & np.isfinite(depth_vals)
-                                    if np.count_nonzero(val_m) >= 12:
+                                    if p_c is None or len(p_c) != len(pts_2d):
                                         p_c = np.zeros((len(pts_2d), 3), dtype=np.float64)
+                                    need_z = p_c[:, 2] <= 0.05
+                                    val_m = need_z & (depth_vals >= 0.20) & (depth_vals <= 4.0) & np.isfinite(depth_vals)
+                                    if np.count_nonzero(val_m) >= 8:
                                         zv = depth_vals[val_m]
                                         uv_val = pts_2d[val_m]
                                         p_c[val_m, 2] = zv
@@ -1129,6 +1290,12 @@ class ServerSideVioEstimator:
                                             t_err = float(np.linalg.norm(t_loop - t_rel))
                                             cos_ang = float(np.clip((np.trace(R_rel.T @ R_loop) - 1.0) / 2.0, -1.0, 1.0))
                                             ang_deg = float(np.degrees(np.arccos(cos_ang)))
+                                            loop_rot_deg = float(np.degrees(np.linalg.norm(so3_log(R_loop))))
+                                            # Gravity-up vector consistency between camera i and camera j (immune to yaw drift)
+                                            u_i = R_i[2, :]
+                                            u_j_in_i = R_loop @ R_j[2, :]
+                                            cos_grav = float(np.clip(np.dot(u_i, u_j_in_i), -1.0, 1.0))
+                                            grav_ang_deg = float(np.degrees(np.arccos(cos_grav)))
 
                                             d_odo_loop = None
                                             ang_deg_odo = None
@@ -1153,7 +1320,16 @@ class ServerSideVioEstimator:
 
                                             t_norm = float(np.linalg.norm(t_loop))
                                             loop_t_norm_max = max(float(r_bound), (float(span_odo) * 1.2) if (span_odo is not None and np.isfinite(span_odo)) else float(r_bound))
-                                            eff_ang_deg = ang_deg_odo if ang_deg_odo is not None else ang_deg
+                                            eff_ang_deg = min(ang_deg, ang_deg_odo) if ang_deg_odo is not None else ang_deg
+                                            is_strong_pnp = (
+                                                not is_unit_t
+                                                and inliers >= 30
+                                                and t_norm <= 0.35
+                                                and loop_rot_deg <= 20.0
+                                                and grav_ang_deg <= 12.0
+                                            )
+                                            if is_strong_pnp:
+                                                eff_ang_deg = min(eff_ang_deg, loop_rot_deg)
                                             logger.info("LOOP CANDIDATE: %d -> %d, inliers=%d, t_norm=%.3f, max=%.3f, t_err=%.3f, ang_deg=%.2f, eff_ang=%.2f", past_node_id, query_node_id, inliers, t_norm, loop_t_norm_max, t_err, ang_deg, eff_ang_deg)
                                             # Physical room bound: adaptively bounded by scan odometry scale
                                             # Strict angular consistency: reject any match with eff_ang_deg > 35.0 deg to prevent false matches across opposite/orthogonal walls
@@ -1167,7 +1343,8 @@ class ServerSideVioEstimator:
                                                     is_valid_loop = (
                                                         not is_unit_t
                                                         and (
-                                                            (d_odo_loop <= 0.45 and inliers >= 15 and odo_diff <= 0.25)
+                                                            is_strong_pnp
+                                                            or (d_odo_loop <= 0.45 and inliers >= 15 and odo_diff <= 0.25)
                                                             or (d_odo_loop <= 0.35 and inliers >= 12 and odo_diff <= 0.20)
                                                             or (d_odo_loop <= 0.50 and inliers >= 20 and odo_diff <= 0.25)
                                                         )
@@ -1175,7 +1352,7 @@ class ServerSideVioEstimator:
                                                 else:
                                                     is_consistent = (t_err <= max_allowed_t_err)
                                                     is_strong = (inliers >= 20 and t_norm <= 0.45)
-                                                    is_valid_loop = not is_unit_t and (is_consistent or is_strong)
+                                                    is_valid_loop = not is_unit_t and (is_consistent or is_strong or is_strong_pnp)
 
                                                 if is_valid_loop:
                                                     t_loop[2] = float(np.clip(t_loop[2], -0.20, 0.20))
@@ -1230,8 +1407,10 @@ class ServerSideVioEstimator:
                     idx_c = _nearest_odo_idx(odo_times, t_curr)
                     dt_seg = max(1e-3, t_curr - t_prev)
                     dp_raw = odo_pos[idx_c] - odo_pos[idx_p]
-                    s_seg = float(np.linalg.norm(dp_raw) / max(dt_seg, 0.005))
-                    if s_seg > 2.5 or dt_seg < 0.005 or float(np.linalg.norm(dp_raw)) > 0.50:
+                    dp_raw_w = (R_vio_odo @ dp_raw) if R_vio_odo is not None else dp_raw
+                    d_raw_norm = float(np.linalg.norm(dp_raw_w))
+                    s_seg = float(d_raw_norm / max(dt_seg, 0.005))
+                    if s_seg > 2.5 or dt_seg < 0.005 or d_raw_norm > 0.50:
                         q_seg = 0.0
                     else:
                         q_seg = float(np.clip(1.0 - max(0.0, s_seg - 1.2), 0.0, 1.0))
@@ -1240,7 +1419,6 @@ class ServerSideVioEstimator:
                     if w_odo > 0.0:
                         if R_vio_odo is not None:
                             dp_w_odo = R_vio_odo @ dp_raw
-                            dp_w_odo[2] = 0.0
                             t_rel_odo = last_node_R_wc.T @ dp_w_odo
                             t_rel_meas = (1.0 - w_odo) * t_rel_meas + w_odo * t_rel_odo
                         else:
@@ -1250,7 +1428,6 @@ class ServerSideVioEstimator:
                                 d_eff = (1.0 - w_odo) * meas_norm + w_odo * d_odo
                                 t_rel_meas = (t_rel_meas / meas_norm) * d_eff
                     meas_norm = float(np.linalg.norm(t_rel_meas))
-                    d_raw_norm = float(np.linalg.norm(dp_raw))
                     max_step = min(0.35, max(1.2 * d_raw_norm, 0.10 * dt_seg)) if q_seg > 0.0 else 0.15
                     if meas_norm > max_step and meas_norm > 1e-4:
                         t_rel_meas = t_rel_meas * (max_step / meas_norm)
@@ -1302,11 +1479,24 @@ class ServerSideVioEstimator:
                                         )
                                     if depth_grid.ndim == 2:
                                         hg_s, wg_s = depth_grid.shape
-                                        h_l, w_l = last_gray.shape[:2]
-                                        gx = np.clip((pts_2d_l[:, 0] / max(w_l, 1.0) * wg_s).astype(int), 0, wg_s - 1)
-                                        gy = np.clip((pts_2d_l[:, 1] / max(h_l, 1.0) * hg_s).astype(int), 0, hg_s - 1)
+                                        has_remap_l = bool(flip_h or flip_v or (rot_deg != 0))
+                                        T_cl_curr = T_cam_spad_eff if (has_remap_l and T_cam_spad_eff is not None) else (T_lidar_camera if T_lidar_camera is not None else T_cam_spad_eff)
+                                        R_lc_eff = np.eye(3, dtype=np.float64) if has_remap_l else (T_cl_curr[:3, :3].T if T_cl_curr is not None else np.eye(3, dtype=np.float64))
+                                        xc = (pts_2d_l[:, 0] - K[0, 2]) / K[0, 0]
+                                        yc = (pts_2d_l[:, 1] - K[1, 2]) / K[1, 1]
+                                        rays_c = np.column_stack([xc, yc, np.ones_like(xc)])
+                                        rays_l = (R_lc_eff @ rays_c.T).T
+                                        tan_h = np.tan(np.deg2rad(22.5))
+                                        zl_safe = np.where(rays_l[:, 2] > 1e-6, rays_l[:, 2], 1.0)
+                                        gx_fl = (float(wg_s) / 2.0) * (1.0 + (rays_l[:, 0] / zl_safe) / tan_h)
+                                        gy_fl = (float(hg_s) / 2.0) * (1.0 + (rays_l[:, 1] / zl_safe) / tan_h)
+                                        in_cone = (rays_l[:, 2] > 1e-6) & (gx_fl >= 0) & (gx_fl < wg_s) & (gy_fl >= 0) & (gy_fl < hg_s)
+                                        gx = np.clip(np.floor(gx_fl).astype(int), 0, wg_s - 1)
+                                        gy = np.clip(np.floor(gy_fl).astype(int), 0, hg_s - 1)
                                         depth_vals = depth_grid[gy, gx]
-                                        val_m = (depth_vals >= 0.20) & (depth_vals <= 4.0) & np.isfinite(depth_vals)
+                                        val_m = in_cone & (depth_vals >= 0.20) & (depth_vals <= 4.0) & np.isfinite(depth_vals)
+                                        if np.count_nonzero(val_m) < 12:
+                                            val_m = (rays_l[:, 2] > 1e-6) & (depth_vals >= 0.20) & (depth_vals <= 4.0) & np.isfinite(depth_vals)
                                         if np.count_nonzero(val_m) >= 12:
                                             p_c_last = np.zeros((len(pts_2d_l), 3), dtype=np.float64)
                                             zv = depth_vals[val_m]
@@ -1388,17 +1578,29 @@ class ServerSideVioEstimator:
                                 spad_src = cand_spad
 
                         if spad_src is not None and spad_src.ndim == 2:
-                            if bool(flip_h or flip_v or (rot_deg != 0)):
+                            has_remap_se = bool(flip_h or flip_v or (rot_deg != 0))
+                            if has_remap_se:
                                 spad_src = remap_lidar_zones_to_camera_frame(
                                     spad_src, flip_h=flip_h, flip_v=flip_v, rot_deg=rot_deg
                                 )
                             hg_s, wg_s = spad_src.shape
-                            w_img_ref = float(w_img) if 'w_img' in locals() and w_img else 640.0
-                            h_img_ref = float(h_img) if 'h_img' in locals() and h_img else 360.0
-                            gx = np.clip((kps2d[:, 0] / max(w_img_ref, 1.0) * wg_s).astype(int), 0, wg_s - 1)
-                            gy = np.clip((kps2d[:, 1] / max(h_img_ref, 1.0) * hg_s).astype(int), 0, hg_s - 1)
+                            T_cl_curr = T_cam_spad_eff if (has_remap_se and T_cam_spad_eff is not None) else (T_lidar_camera if T_lidar_camera is not None else T_cam_spad_eff)
+                            R_lc_eff = np.eye(3, dtype=np.float64) if has_remap_se else (T_cl_curr[:3, :3].T if T_cl_curr is not None else np.eye(3, dtype=np.float64))
+                            xc = (kps2d[:, 0] - K[0, 2]) / K[0, 0]
+                            yc = (kps2d[:, 1] - K[1, 2]) / K[1, 1]
+                            rays_c = np.column_stack([xc, yc, np.ones_like(xc)])
+                            rays_l = (R_lc_eff @ rays_c.T).T
+                            tan_h = np.tan(np.deg2rad(22.5))
+                            zl_safe = np.where(rays_l[:, 2] > 1e-6, rays_l[:, 2], 1.0)
+                            gx_fl = (float(wg_s) / 2.0) * (1.0 + (rays_l[:, 0] / zl_safe) / tan_h)
+                            gy_fl = (float(hg_s) / 2.0) * (1.0 + (rays_l[:, 1] / zl_safe) / tan_h)
+                            in_cone = (rays_l[:, 2] > 1e-6) & (gx_fl >= 0) & (gx_fl < wg_s) & (gy_fl >= 0) & (gy_fl < hg_s)
+                            gx = np.clip(np.floor(gx_fl).astype(int), 0, wg_s - 1)
+                            gy = np.clip(np.floor(gy_fl).astype(int), 0, hg_s - 1)
                             dvals = spad_src[gy, gx]
-                            val_m = (dvals >= 0.20) & (dvals <= 4.0) & np.isfinite(dvals)
+                            val_m = in_cone & (dvals >= 0.20) & (dvals <= 4.0) & np.isfinite(dvals)
+                            if np.count_nonzero(val_m) < 15:
+                                val_m = (rays_l[:, 2] > 1e-6) & (dvals >= 0.20) & (dvals <= 4.0) & np.isfinite(dvals)
                             if np.count_nonzero(val_m) >= 15:
                                 kps3d = np.zeros((len(kps2d), 3), dtype=np.float64)
                                 zv = dvals[val_m]
@@ -1437,16 +1639,18 @@ class ServerSideVioEstimator:
                             tl = l_m["timestamp"]
                             ip = _nearest_odo_idx(odo_times, te)
                             iq = _nearest_odo_idx(odo_times, tl)
-                            d_odo_check = float(np.linalg.norm(odo_pos[iq] - odo_pos[ip]))
-                            if d_odo_check > 0.40:
-                                continue
 
                         l_desc, l_2d, l_3d = _get_node_features(l_m)
                         if l_desc is None or len(l_desc) < 20:
                             continue
                         try:
                             knn = matcher.knnMatch(e_desc, l_desc, k=2)
-                            good = [m for m, n in knn if len((m, n)) == 2 and m.distance < 0.75 * n.distance]
+                            raw_good = [m for m, n in knn if len((m, n)) == 2 and m.distance < 0.75 * n.distance]
+                            by_train_se: dict[int, Any] = {}
+                            for m in raw_good:
+                                if m.trainIdx not in by_train_se or m.distance < by_train_se[m.trainIdx].distance:
+                                    by_train_se[m.trainIdx] = m
+                            good = list(by_train_se.values())
                             if len(good) < 20:
                                 continue
 
@@ -1466,17 +1670,18 @@ class ServerSideVioEstimator:
                                         R_loop_cand = R_ji.T
                                         t_loop_cand = (-R_ji.T @ t_ji).reshape(3)
 
+                                        ang_pnp = float(np.degrees(np.linalg.norm(so3_log(R_loop_cand))))
                                         if odo_rots is not None and ip is not None and iq is not None and len(odo_rots) > max(ip, iq):
                                             R_rel_odo = odo_rots[ip].T @ odo_rots[iq]
                                             T_cv_gl = np.diag([1.0, -1.0, -1.0])
                                             R_loop_gl = T_cv_gl @ R_loop_cand @ T_cv_gl
                                             cos_a = float(np.clip((np.trace(R_rel_odo.T @ R_loop_gl) - 1.0) / 2.0, -1.0, 1.0))
-                                            ang_check = float(np.degrees(np.arccos(cos_a)))
+                                            ang_check = min(ang_pnp, float(np.degrees(np.arccos(cos_a))))
                                         else:
-                                            ang_check = float(np.degrees(np.linalg.norm(so3_log(R_loop_cand))))
+                                            ang_check = ang_pnp
 
                                         t_norm_check = float(np.linalg.norm(t_loop_cand))
-                                        if ang_check <= 15.0 and t_norm_check <= 0.20:
+                                        if ang_check <= 15.0 and t_norm_check <= 0.25:
                                             se_matches.append((e_id, l_id, R_loop_cand, t_loop_cand, inl, True, ang_check, t_norm_check))
 
                             elif l_3d is not None and len(l_3d) > 0 and np.count_nonzero(l_3d[:, 2] > 0.05) >= 20:
@@ -1494,17 +1699,18 @@ class ServerSideVioEstimator:
                                         R_loop_cand = R_el_rot
                                         t_loop_cand = t_el_vec.reshape(3)
 
+                                        ang_pnp = float(np.degrees(np.linalg.norm(so3_log(R_loop_cand))))
                                         if odo_rots is not None and ip is not None and iq is not None and len(odo_rots) > max(ip, iq):
                                             R_rel_odo = odo_rots[ip].T @ odo_rots[iq]
                                             T_cv_gl = np.diag([1.0, -1.0, -1.0])
                                             R_loop_gl = T_cv_gl @ R_loop_cand @ T_cv_gl
                                             cos_a = float(np.clip((np.trace(R_rel_odo.T @ R_loop_gl) - 1.0) / 2.0, -1.0, 1.0))
-                                            ang_check = float(np.degrees(np.arccos(cos_a)))
+                                            ang_check = min(ang_pnp, float(np.degrees(np.arccos(cos_a))))
                                         else:
-                                            ang_check = float(np.degrees(np.linalg.norm(so3_log(R_loop_cand))))
+                                            ang_check = ang_pnp
 
                                         t_norm_check = float(np.linalg.norm(t_loop_cand))
-                                        if ang_check <= 15.0 and t_norm_check <= 0.20:
+                                        if ang_check <= 15.0 and t_norm_check <= 0.25:
                                             se_matches.append((e_id, l_id, R_loop_cand, t_loop_cand, inl, True, ang_check, t_norm_check))
                         except Exception:
                             pass
@@ -1541,6 +1747,7 @@ class ServerSideVioEstimator:
                 forward_states,
                 S_P_list,
                 F_list,
+                Q_list=Q_list,
                 pred_states=pred_states,
                 compute_covariances=False,
                 in_place=True,
@@ -1556,7 +1763,7 @@ class ServerSideVioEstimator:
                     st = smoothed_states[s_idx]
                     snap["T_wb"] = (st.R.copy(), st.p.copy())
 
-        del forward_states, S_P_list, F_list, pred_states
+        del forward_states, S_P_list, F_list, pred_states, Q_list
         gc.collect()
 
         # Construct trajectory dict output
@@ -1597,12 +1804,22 @@ class ServerSideVioEstimator:
                         R_ij, t_ij = edge_map[nid - 1]
                         t_curr = t_prev_node + R_prev_node @ t_ij
                         t_curr[2] = float(np.clip(t_curr[2], -z_bound, z_bound))
-                        d_xy = float(np.linalg.norm(t_curr[:2] - p0_init[:2]))
-                        if d_xy > r_bound:
-                            t_curr[:2] = p0_init[:2] + (t_curr[:2] - p0_init[:2]) * (r_bound / d_xy)
                         pgo.nodes[nid] = (R_curr, t_curr)
                     else:
                         pgo.nodes[nid] = (R_curr, t_filter[s_idx].copy())
+
+                # Synchronize sequential odometry edges with RTS-smoothed node poses
+                for edge_idx, (ei, ej, _R_ij, _t_ij, Omega_e) in enumerate(pgo.edges):
+                    if ej == ei + 1 and ei in pgo.nodes and ej in pgo.nodes:
+                        R_ei, t_ei = pgo.nodes[ei]
+                        R_ej, t_ej = pgo.nodes[ej]
+                        pgo.edges[edge_idx] = (
+                            ei,
+                            ej,
+                            R_ei.T @ R_ej,
+                            (R_ei.T @ (t_ej - t_ei)).reshape(3),
+                            Omega_e,
+                        )
 
             if 0 in pgo.nodes:
                 pgo.prior_pose_0 = (pgo.nodes[0][0].copy(), pgo.nodes[0][1].copy())
@@ -1655,16 +1872,16 @@ class ServerSideVioEstimator:
                 R_final, t_final = R_filter, t_filter
 
             t_final[:, 2] = np.clip(t_final[:, 2], -z_bound, z_bound)
-            d_xy_final = np.linalg.norm(t_final[:, :2] - t_final[0, :2], axis=1)
-            mask_rad = d_xy_final > r_bound
-            if np.any(mask_rad):
-                scale = r_bound / d_xy_final[mask_rad, None]
-                t_final[mask_rad, :2] = t_final[0, :2] + (t_final[mask_rad, :2] - t_final[0, :2]) * scale
 
             for idx, snap in enumerate(camera_snapshots):
                 R_wc = R_final[idx]
                 p_wc = t_final[idx]
                 q_wc = rot_to_quat(R_wc)
+                is_froz_val = 0
+                if odo_times is not None and odo_frozen is not None and len(odo_times) > 0:
+                    oidx_f = _nearest_odo_idx(odo_times, float(snap["timestamp"]))
+                    if 0 <= oidx_f < len(odo_frozen):
+                        is_froz_val = int(odo_frozen[oidx_f])
                 trajectory.append({
                     "timestamp": float(snap["timestamp"]),
                     "device_timestamp_ns": int(snap.get("device_timestamp_ns", round(snap["timestamp"] * 1e9))),
@@ -1676,6 +1893,7 @@ class ServerSideVioEstimator:
                     "qy": float(q_wc[1]),
                     "qz": float(q_wc[2]),
                     "qw": float(q_wc[3]),
+                    "is_frozen_interpolated": is_froz_val,
                 })
         else:
             for t, s in zip(timestamps, smoothed_states):
@@ -1693,13 +1911,17 @@ class ServerSideVioEstimator:
                 })
 
         # Compute ATE RMSE metric
-        if trajectory:
-            p0 = np.array([trajectory[0]["x"], trajectory[0]["y"], trajectory[0]["z"]])
-            pos_errors = [np.linalg.norm(np.array([item["x"], item["y"], item["z"]]) - p0) for item in trajectory]
-            ate_rmse = float(np.sqrt(np.mean(np.square(pos_errors))))
-        elif smoothed_states:
-            pos_errors = [np.linalg.norm(s.p) for s in smoothed_states]
-            ate_rmse = float(np.sqrt(np.mean(np.square(pos_errors))))
+        if trajectory and odo_times is not None and len(odo_times) > 1 and odo_pos is not None:
+            traj_times = np.array([item["timestamp"] for item in trajectory], dtype=np.float64)
+            traj_pos = np.array([[item["x"], item["y"], item["z"]] for item in trajectory], dtype=np.float64)
+
+            ref_pos_vio = np.zeros_like(traj_pos)
+            for idx, tt in enumerate(traj_times):
+                oidx = _nearest_odo_idx(odo_times, tt)
+                raw_p = odo_pos[oidx]
+                ref_pos_vio[idx] = (R_vio_odo @ raw_p) if R_vio_odo is not None else raw_p
+
+            _, ate_rmse, _ = umeyama_alignment(ref_pos_vio, traj_pos)
         else:
             ate_rmse = 0.0
 
@@ -1867,9 +2089,26 @@ class VioEstimator:
         positions = poses_df[["x", "y", "z"]].to_numpy()
         quats = poses_df[["qx", "qy", "qz", "qw"]].to_numpy()
         has_frame = "frame" in poses_df.columns
-        frames = poses_df["frame"].to_numpy() if has_frame else None
+        frames = (
+            pd.to_numeric(poses_df["frame"], errors="coerce").to_numpy(dtype=np.float64)
+            if has_frame
+            else None
+        )
+        has_nonneg_frame = bool(frames is not None and np.any(np.isfinite(frames) & (frames >= 0.0)))
+        frozen_mask = (
+            pd.to_numeric(poses_df["is_frozen_interpolated"], errors="coerce")
+            .fillna(0)
+            .to_numpy(dtype=np.int64)
+            != 0
+            if "is_frozen_interpolated" in poses_df.columns
+            else np.zeros(len(poses_df), dtype=bool)
+        )
 
         for i in range(len(poses_df)):
+            if frozen_mask[i]:
+                continue
+            if has_nonneg_frame and (not np.isfinite(frames[i]) or frames[i] < 0.0):
+                continue
             pos = positions[i]
             quat = quats[i]
             norm_q = np.linalg.norm(quat)
@@ -1886,8 +2125,8 @@ class VioEstimator:
                     "tracked_features": 80,
                     "tracking_ratio": 1.0,
                 }
-                if has_frame:
-                    kf["frame"] = int(frames[i])
+                if has_frame and np.isfinite(frames[i]):
+                    kf["frame"] = int(round(float(frames[i])))
                 keyframes.append(kf)
                 last_pos = pos
                 last_quat = quat
@@ -1905,8 +2144,8 @@ class VioEstimator:
                     "tracked_features": 80,
                     "tracking_ratio": 1.0,
                 }
-                if has_frame:
-                    kf["frame"] = int(frames[i])
+                if has_frame and np.isfinite(frames[i]):
+                    kf["frame"] = int(round(float(frames[i])))
                 keyframes.append(kf)
                 last_pos = pos
                 last_quat = quat
@@ -1963,39 +2202,38 @@ def _extract_lidar_matched_timestamps(session_dir: str) -> dict[int, int]:
 
 
 def _extract_odometry_frame_timestamps(session_dir: str) -> dict[int, int]:
-    """Read odometry CSV and extract a map of frame -> device_timestamp_ns."""
-    odo_path = os.path.join(session_dir, "processed_odometry.csv")
-    if not os.path.isfile(odo_path):
-        odo_path = os.path.join(session_dir, "odometry.csv")
-    if not os.path.isfile(odo_path):
-        return {}
-    try:
-        df = pd.read_csv(odo_path)
-    except Exception:
-        return {}
-    if "frame" not in df.columns:
-        return {}
-    ts_col = None
-    for cand in ("device_timestamp_ns", "timestamp_nanos", "timestamp"):
-        if cand in df.columns:
-            ts_col = cand
-            break
-    if ts_col is None:
-        return {}
-    valid_df = df.dropna(subset=["frame", ts_col]).copy()
-    valid_df["frame"] = pd.to_numeric(valid_df["frame"], errors="coerce")
-    valid_df[ts_col] = pd.to_numeric(valid_df[ts_col], errors="coerce")
-    valid_df = valid_df.dropna(subset=["frame", ts_col])
-    valid_df = valid_df[valid_df["frame"] >= 0]
-    if valid_df.empty:
-        return {}
-    matched = valid_df.drop_duplicates(subset=["frame"], keep="first")
+    """Read odometry CSV and extract a map of frame (>= 0) -> device_timestamp_ns."""
     out: dict[int, int] = {}
-    for _, row in matched.iterrows():
-        f_idx = int(round(float(row["frame"])))
-        raw_t = float(row[ts_col])
-        ts_ns = int(round(raw_t)) if raw_t > 1e11 else int(round(raw_t * 1e9))
-        out[f_idx] = ts_ns
+    for cand_name in ("odometry.csv", "processed_odometry.csv"):
+        odo_path = os.path.join(session_dir, cand_name)
+        if not os.path.isfile(odo_path):
+            continue
+        try:
+            df = pd.read_csv(odo_path)
+        except Exception:
+            continue
+        if "frame" not in df.columns:
+            continue
+        ts_col = None
+        for cand in ("device_timestamp_ns", "timestamp_nanos", "timestamp"):
+            if cand in df.columns:
+                ts_col = cand
+                break
+        if ts_col is None:
+            continue
+        valid_df = df.dropna(subset=["frame", ts_col]).copy()
+        valid_df["frame"] = pd.to_numeric(valid_df["frame"], errors="coerce")
+        valid_df[ts_col] = pd.to_numeric(valid_df[ts_col], errors="coerce")
+        valid_df = valid_df.dropna(subset=["frame", ts_col])
+        valid_df = valid_df[valid_df["frame"] >= 0]
+        if valid_df.empty:
+            continue
+        matched = valid_df.drop_duplicates(subset=["frame"], keep="first")
+        for _, row in matched.iterrows():
+            f_idx = int(round(float(row["frame"])))
+            raw_t = float(row[ts_col])
+            ts_ns = int(round(raw_t)) if raw_t > 1e11 else int(round(raw_t * 1e9))
+            out[f_idx] = ts_ns
     return out
 
 
@@ -2146,7 +2384,15 @@ def _odometry_aabb_span_decoupled(session_dir: str) -> tuple[float | None, float
     n = int(np.count_nonzero(finite))
     if n < TRAJECTORY_SPAN_MIN_ODO_POSES:
         return None, None, n
-    span_xy, span_z = _aabb_span_decoupled(xyz[finite])
+    sl = xyz[finite, :3]
+    spans = np.max(sl, axis=0) - np.min(sl, axis=0)
+    has_quat = {"qx", "qy", "qz", "qw"}.issubset(df.columns)
+    has_grav = {"grav_x", "grav_y", "grav_z"}.issubset(df.columns)
+    if has_quat and not has_grav and float(spans[2]) > 0.05:
+        span_xy = float(max(spans[0], spans[2]))
+        span_z = float(spans[1])
+    else:
+        span_xy, span_z = _aabb_span_decoupled(sl)
     return span_xy, span_z, n
 
 
@@ -2483,11 +2729,22 @@ def publish_session_vio(session_dir: str) -> bool:
         if os.path.isfile(odo_raw_path):
             try:
                 raw_df = pd.read_csv(odo_raw_path)
-                p0 = raw_df[["x", "y", "z"]].iloc[0].to_numpy(dtype=float)
-                pend = raw_df[["x", "y", "z"]].iloc[-1].to_numpy(dtype=float)
-                raw_drift = float(np.linalg.norm(pend - p0))
-                if raw_drift < 0.25:
-                    odo_path = odo_raw_path
+                proc_has_bridged_freezes = False
+                if os.path.isfile(odo_proc_path):
+                    proc_df_check = pd.read_csv(odo_proc_path)
+                    if (
+                        "is_frozen_interpolated" in proc_df_check.columns
+                        and len(proc_df_check) >= int(0.8 * len(raw_df))
+                    ):
+                        proc_has_bridged_freezes = True
+                if not proc_has_bridged_freezes:
+                    raw_xyz = raw_df[["x", "y", "z"]].to_numpy(dtype=float)
+                    p0 = raw_xyz[0]
+                    pend = raw_xyz[-1]
+                    raw_drift = float(np.linalg.norm(pend - p0))
+                    n_reset_jumps = int(np.sum(np.linalg.norm(np.diff(raw_xyz, axis=0), axis=1) > 0.15)) if len(raw_xyz) > 1 else 0
+                    if raw_drift < 0.25 or (n_reset_jumps >= 5 and raw_drift > 2.0):
+                        odo_path = odo_raw_path
             except Exception:
                 pass
         odometry_df = pd.read_csv(odo_path) if os.path.isfile(odo_path) else None
@@ -2523,8 +2780,15 @@ def publish_session_vio(session_dir: str) -> bool:
         timings = dict(res.get("_timings", {})) if isinstance(res, dict) else {}
         timings["publish_total"] = time.monotonic() - t_start
 
-        # Enforce 90s wall clock limit
-        if (time.monotonic() - t_start > PUBLISH_WALL_S) or (isinstance(res, dict) and res.get("status") == "timeout"):
+        # Enforce wall clock limit when estimator timed out or returned no trajectory
+        has_completed_traj = (
+            isinstance(res, dict)
+            and res.get("status") == "success"
+            and bool(res.get("trajectory"))
+        )
+        if (isinstance(res, dict) and res.get("status") == "timeout") or (
+            (time.monotonic() - t_start > PUBLISH_WALL_S) and not has_completed_traj
+        ):
             _unlink_csv()
             timings["publish_total"] = time.monotonic() - t_start
             _write_vio_diagnostics(session_dir, False, "wall_clock_exceeded", _make_default_gates(), timings)
@@ -2713,7 +2977,7 @@ def publish_session_vio(session_dir: str) -> bool:
             frame_val = item.get("frame")
             if frame_val is None:
                 frame_val = idx
-            rows.append({
+            row_dict = {
                 "device_timestamp_ns": int(dev_ts),
                 "frame": int(frame_val),
                 "x": float(item["x"]),
@@ -2726,7 +2990,10 @@ def publish_session_vio(session_dir: str) -> bool:
                 "grav_x": g_list[0],
                 "grav_y": g_list[1],
                 "grav_z": g_list[2],
-            })
+            }
+            if "is_frozen_interpolated" in item:
+                row_dict["is_frozen_interpolated"] = int(item["is_frozen_interpolated"])
+            rows.append(row_dict)
         pd.DataFrame(rows).to_csv(vio_csv_path, index=False)
         timings["publish_total"] = time.monotonic() - t_start
         _write_vio_diagnostics(session_dir, True, None, gates, timings)

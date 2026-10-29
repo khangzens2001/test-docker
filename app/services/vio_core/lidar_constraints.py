@@ -3,6 +3,8 @@
 from typing import Tuple, Optional
 import numpy as np
 from app.services.vio_core.state import NominalState, StateIndex as I
+from app.services.vio_core.math_utils import skew_symmetric
+from app.services.vio_core.spad_depth_fusion import compute_vl53l8cx_rays
 
 
 def compute_adaptive_ray_noise(depth: float, alpha_deg: float = 1.0) -> float:
@@ -22,13 +24,103 @@ def compute_adaptive_ray_noise(depth: float, alpha_deg: float = 1.0) -> float:
     return float(r_noise)
 
 
+def build_point_to_point_constraint(
+    state: NominalState,
+    p_b: np.ndarray,
+    p_ref_w: np.ndarray,
+    z_meas: Optional[float] = None,
+    s_L: float = 1.0,
+    alpha_deg: float = 1.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build point-to-point LiDAR constraint against anchored reference point in World frame.
+
+    Measurement model: h(x) = ||p_w - p_ref_w|| where p_w = R_wb * (s_L * p_b) + p
+    Residual: y = z_meas - h(x) (or -||p_w - p_ref_w|| if z_meas is None)
+    Jacobians:
+        H[0, I.POS] = (p_w - p_ref_w) / z_pred
+        H[0, I.ORI] = -((p_w - p_ref_w) / z_pred).T @ (R_wb @ skew(s_L * p_b))
+        H[0, I.SL]  = ((p_w - p_ref_w) / z_pred).T @ (R_wb @ p_b)
+    """
+    p_b_arr = np.asarray(p_b, dtype=np.float64).reshape(3)
+    p_ref_arr = np.asarray(p_ref_w, dtype=np.float64).reshape(3)
+    s_L_val = float(s_L)
+
+    R_wb = np.asarray(state.R, dtype=np.float64)
+    p_w_base = np.asarray(state.p, dtype=np.float64)
+
+    p_w_meas = R_wb @ (s_L_val * p_b_arr) + p_w_base
+    diff = p_w_meas - p_ref_arr
+    z_pred = float(np.linalg.norm(diff))
+
+    target = float(z_meas) if z_meas is not None else 0.0
+    y = np.array([target - z_pred], dtype=np.float64)
+
+    H = np.zeros((1, I.DIM), dtype=np.float64)
+    if z_pred > 1e-9:
+        u_w = diff / z_pred
+        H[0, I.POS] = u_w
+        H[0, I.ORI] = -(u_w @ (R_wb @ skew_symmetric(s_L_val * p_b_arr)))
+        H[0, I.SL] = float(u_w @ (R_wb @ p_b_arr))
+    else:
+        H[0, I.POS] = np.zeros(3, dtype=np.float64)
+        H[0, I.ORI] = np.zeros(3, dtype=np.float64)
+        H[0, I.SL] = 0.0
+
+    r_var = compute_adaptive_ray_noise(max(z_pred, float(np.linalg.norm(p_b_arr))), alpha_deg)
+    R_cov = np.array([[r_var]], dtype=np.float64)
+    return y, H, R_cov
+
+
+def build_local_plane_constraint(
+    state: NominalState,
+    p_b: np.ndarray,
+    n_w: np.ndarray,
+    d_w: float,
+    s_L: float = 1.0,
+    alpha_deg: float = 1.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build point-to-plane LiDAR constraint against anchored reference plane in World frame.
+
+    Plane equation: n_w.T * p + d_w = 0, where ||n_w|| = 1.
+    Measurement model: h(x) = n_w.T * (R_wb * (s_L * p_b) + p) + d_w
+    Residual: y = 0.0 - h(x) = - (n_w.T * p_w + d_w)
+    Jacobians:
+        H[0, I.POS] = n_w
+        H[0, I.ORI] = -n_w.T @ (R_wb @ skew(s_L * p_b))
+        H[0, I.SL]  = n_w.T @ (R_wb @ p_b)
+    """
+    p_b_arr = np.asarray(p_b, dtype=np.float64).reshape(3)
+    n_w_arr = np.asarray(n_w, dtype=np.float64).reshape(3)
+    norm_n = np.linalg.norm(n_w_arr)
+    if norm_n > 1e-9:
+        n_w_arr = n_w_arr / norm_n
+
+    R_wb = np.asarray(state.R, dtype=np.float64)
+    p_w_base = np.asarray(state.p, dtype=np.float64)
+    s_L_val = float(s_L)
+
+    p_w_meas = R_wb @ (s_L_val * p_b_arr) + p_w_base
+    z_pred = float(np.dot(n_w_arr, p_w_meas) + d_w)
+
+    y = np.array([-z_pred], dtype=np.float64)
+
+    H = np.zeros((1, I.DIM), dtype=np.float64)
+    H[0, I.POS] = n_w_arr
+    H[0, I.ORI] = -(n_w_arr @ (R_wb @ skew_symmetric(s_L_val * p_b_arr)))
+    H[0, I.SL] = float(np.dot(n_w_arr, R_wb @ p_b_arr))
+
+    r_var = compute_adaptive_ray_noise(float(np.linalg.norm(p_b_arr)), alpha_deg)
+    R_cov = np.array([[r_var]], dtype=np.float64)
+    return y, H, R_cov
+
+
 def build_spad_lidar_constraint(
     p_spad: np.ndarray,
     d_spad: float,
     s_L: float = 1.0,
     alpha_deg: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build single SPAD LiDAR depth measurement constraint.
+    """Build single SPAD LiDAR depth measurement constraint (body/sensor relative).
 
     Args:
         p_spad (np.ndarray): 3D predicted position vector in body/sensor frame (3,).
@@ -173,3 +265,41 @@ class LidarConstraintBuilder:
             R_cov[i, i] = R_single[0, 0]
 
         return innovations, H, R_cov
+
+    def build_point_to_point_constraint(
+        self,
+        state: NominalState,
+        p_b: np.ndarray,
+        p_ref_w: np.ndarray,
+        z_meas: Optional[float] = None,
+        s_L: Optional[float] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Convenience method calling module-level build_point_to_point_constraint."""
+        scale = s_L if s_L is not None else state.sl
+        return build_point_to_point_constraint(
+            state=state,
+            p_b=p_b,
+            p_ref_w=p_ref_w,
+            z_meas=z_meas,
+            s_L=scale,
+            alpha_deg=self.alpha_deg,
+        )
+
+    def build_local_plane_constraint(
+        self,
+        state: NominalState,
+        p_b: np.ndarray,
+        n_w: np.ndarray,
+        d_w: float,
+        s_L: Optional[float] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Convenience method calling module-level build_local_plane_constraint."""
+        scale = s_L if s_L is not None else state.sl
+        return build_local_plane_constraint(
+            state=state,
+            p_b=p_b,
+            n_w=n_w,
+            d_w=d_w,
+            s_L=scale,
+            alpha_deg=self.alpha_deg,
+        )

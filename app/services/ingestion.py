@@ -333,39 +333,93 @@ def detect_time_unit(timestamps: pd.Series, is_mcu: bool) -> float:
             return 1.0
 
 
-def reconstruct_mcu_rollover(timestamps: list[int] | np.ndarray) -> np.ndarray:
+def reconstruct_mcu_rollover(timestamps: list[int] | list[float] | np.ndarray) -> np.ndarray:
     """Unwrap 32-bit raw timer rollovers based on 2^32 bounds BEFORE unit scaling is applied."""
     ts_arr = np.array(timestamps, dtype=np.float64)
     if len(ts_arr) < 2:
-        return np.nan_to_num(ts_arr).astype(np.int64)
+        if len(ts_arr) == 0:
+            return np.array([], dtype=np.int64)
+        val = np.nan_to_num(ts_arr)
+        if np.any(np.remainder(val, 1) != 0):
+            return val
+        return val.astype(np.int64)
 
     valid_mask = ~np.isnan(ts_arr) & np.isfinite(ts_arr)
     if not np.any(valid_mask):
         return np.zeros_like(ts_arr, dtype=np.int64)
 
     valid_idx = np.flatnonzero(valid_mask)
-    valid_ts = ts_arr[valid_mask].astype(np.int64)
+    valid_ts = ts_arr[valid_mask]
 
+    # Detect if timestamps are float seconds:
+    # 1. dt < 0.5s (high-rate seconds stream, e.g. 10Hz-400Hz)
+    # 2. Or values have fractional parts and max < 1e7 (e.g. 1Hz or low-rate seconds stream)
+    is_float_seconds = False
     if len(valid_ts) >= 2:
         diffs = np.diff(valid_ts)
-        rollovers = diffs < -2147483648
-        carry = np.cumsum(rollovers) * 4294967296
-        unwrapped_valid = np.zeros_like(valid_ts, dtype=np.int64)
-        unwrapped_valid[0] = valid_ts[0]
-        unwrapped_valid[1:] = valid_ts[1:] + carry
+        non_zero_diffs = np.abs(diffs[diffs != 0])
+        dt_median = np.median(non_zero_diffs) if len(non_zero_diffs) > 0 else 0.0
+        if dt_median < 0.5:
+            is_float_seconds = True
+
+    # Evaluate fractional check fallback for all valid_ts (including len >= 2 with dt >= 0.5)
+    if not is_float_seconds and np.any(np.remainder(valid_ts, 1) != 0) and np.nanmax(valid_ts) < 1e7:
+        is_float_seconds = True
+
+    if is_float_seconds:
+        # Microsecond counter (2^32 us) represented in seconds:
+        # Period is 2^32 * 1e-6 = 4294.967296 seconds
+        period = 4294967296 * 1e-6
+        rollover_threshold = -2147483648 * 1e-6
+        if len(valid_ts) >= 2:
+            diffs = np.diff(valid_ts)
+            rollovers = diffs < rollover_threshold
+            carry = np.cumsum(rollovers) * period
+            unwrapped_valid = np.zeros_like(valid_ts, dtype=np.float64)
+            unwrapped_valid[0] = valid_ts[0]
+            unwrapped_valid[1:] = valid_ts[1:] + carry
+        else:
+            unwrapped_valid = valid_ts
+
+        unwrapped_full = np.zeros_like(ts_arr, dtype=np.float64)
+        unwrapped_full[valid_mask] = unwrapped_valid
+
+        nan_mask = ~valid_mask
+        if np.any(nan_mask):
+            unwrapped_full[nan_mask] = np.interp(
+                np.flatnonzero(nan_mask), valid_idx, unwrapped_valid
+            )
+        return unwrapped_full
     else:
-        unwrapped_valid = valid_ts
+        valid_ts_int = np.round(valid_ts).astype(np.int64)
+        if len(valid_ts_int) >= 2:
+            diffs = np.diff(valid_ts_int)
+            rollovers = diffs < -2147483648
+            carry = np.cumsum(rollovers) * 4294967296
+            unwrapped_valid = np.zeros_like(valid_ts_int, dtype=np.int64)
+            unwrapped_valid[0] = valid_ts_int[0]
+            unwrapped_valid[1:] = valid_ts_int[1:] + carry
+        else:
+            unwrapped_valid = valid_ts_int
 
-    unwrapped_full = np.zeros_like(ts_arr, dtype=np.float64)
-    unwrapped_full[valid_mask] = unwrapped_valid.astype(np.float64)
+        unwrapped_full = np.zeros_like(ts_arr, dtype=np.float64)
+        unwrapped_full[valid_mask] = unwrapped_valid.astype(np.float64)
 
-    nan_mask = ~valid_mask
-    if np.any(nan_mask):
-        unwrapped_full[nan_mask] = np.interp(
-            np.flatnonzero(nan_mask), valid_idx, unwrapped_valid.astype(np.float64)
-        )
+        nan_mask = ~valid_mask
+        if np.any(nan_mask):
+            unwrapped_full[nan_mask] = np.interp(
+                np.flatnonzero(nan_mask), valid_idx, unwrapped_valid.astype(np.float64)
+            )
+        return unwrapped_full.astype(np.int64)
 
-    return unwrapped_full.astype(np.int64)
+
+def normalize_timestamps(timestamps: pd.Series | np.ndarray, is_mcu: bool = True) -> np.ndarray:
+    """Normalize timestamps to nanoseconds int64, handling 32-bit MCU rollover without truncation."""
+    unwrapped = reconstruct_mcu_rollover(timestamps)
+    s = pd.Series(unwrapped) if not isinstance(unwrapped, pd.Series) else unwrapped
+    scale = detect_time_unit(s, is_mcu=is_mcu)
+    return np.round(np.asarray(unwrapped, dtype=np.float64) * scale).astype(np.int64)
+
 
 
 def parse_odometry_csv(file_stream: io.BytesIO) -> pd.DataFrame:
@@ -421,7 +475,8 @@ def map_hub_android_from_lidar(
     hub_mcu_ns: np.ndarray,
     lidar_mcu_ns: np.ndarray,
     lidar_android_ns: np.ndarray,
-) -> tuple[np.ndarray, float, int, str]:
+    return_lidar_android: bool = False,
+) -> tuple:
     if len(lidar_mcu_ns) != len(lidar_android_ns):
         raise ValueError("lidar_mcu_ns and lidar_android_ns must have equal length")
     hub_mcu_ns = np.asarray(hub_mcu_ns, dtype=np.int64)
@@ -429,7 +484,10 @@ def map_hub_android_from_lidar(
     lidar_android_ns = np.asarray(lidar_android_ns, dtype=np.int64)
     valid = np.isfinite(lidar_android_ns.astype(np.float64)) & (lidar_android_ns > 0)
     if int(np.count_nonzero(valid)) < 2:
-        return np.zeros(len(hub_mcu_ns), dtype=np.int64), 1.0, 0, "insufficient_anchors"
+        zeros_hub = np.zeros(len(hub_mcu_ns), dtype=np.int64)
+        if return_lidar_android:
+            return zeros_hub, lidar_android_ns.copy(), 1.0, 0, "insufficient_anchors"
+        return zeros_hub, 1.0, 0, "insufficient_anchors"
     lm = lidar_mcu_ns[valid]
     la = lidar_android_ns[valid]
     t0_mcu = int(lm[0])
@@ -439,10 +497,16 @@ def map_hub_android_from_lidar(
     dts = np.diff(la)
     jitter = calculate_robust_jitter(dts.astype(np.float64))
     s, c_rel = fit_clock_alignment_model(and_rel, mcu_rel, jitter)
+    c_rel_i = int(round(c_rel))
     hub_rel = hub_mcu_ns.astype(np.int64) - t0_mcu
-    drift = ((s - 1.0) * hub_rel.astype(np.float64)).astype(np.int64)
-    hub_and = t0_and + int(c_rel) + hub_rel + drift
-    return hub_and.astype(np.int64), float(s), int(c_rel), "lidar_mcu_android"
+    hub_drift = np.round((s - 1.0) * hub_rel.astype(np.float64)).astype(np.int64)
+    hub_and = (t0_and + c_rel_i + hub_rel + hub_drift).astype(np.int64)
+    if return_lidar_android:
+        lidar_rel = lidar_mcu_ns.astype(np.int64) - t0_mcu
+        lidar_drift = np.round((s - 1.0) * lidar_rel.astype(np.float64)).astype(np.int64)
+        lidar_and = (t0_and + c_rel_i + lidar_rel + lidar_drift).astype(np.int64)
+        return hub_and, lidar_and, float(s), c_rel_i, "lidar_mcu_android"
+    return hub_and, float(s), c_rel_i, "lidar_mcu_android"
 
 
 def hub_gap_stats(mcu_ns: np.ndarray, max_hold_ns: int) -> dict:
@@ -509,10 +573,23 @@ def reorder_bounded_dejitter_buffer(
 
     shift = 0
     for i in range(1, n):
-        d = ts[i] - ts[i - 1]
+        cur_ts = ts[i] + shift
+        prev_ts = ts[i - 1]
+        d = cur_ts - prev_ts
         if d < -window_ns:
-            # Substantial backward clock jump -> MCU reset or unexpected rollover
-            shift += int((ts[i - 1] - ts[i]) + nominal_dt)
+            # Check if this backward jump is an out-of-order delayed packet
+            # or a genuine MCU reboot/clock reset.
+            lookahead_end = min(n, i + 50)
+            future_returns = any(
+                ts[k] >= (prev_ts - shift) - window_ns for k in range(i + 1, lookahead_end)
+            )
+
+            is_reset_near_zero = (ts[i] < 5_000_000_000) or (
+                (prev_ts - shift) > 2 * window_ns and ts[i] < 0.1 * (prev_ts - shift)
+            )
+
+            if not future_returns and is_reset_near_zero:
+                shift += int((prev_ts - cur_ts) + nominal_dt)
         if shift > 0:
             ts[i] += shift
     out[ts_col] = ts

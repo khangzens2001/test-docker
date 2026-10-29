@@ -5,7 +5,7 @@ import threading
 import numpy as np
 from scipy.stats import rankdata
 from scipy.optimize import least_squares
-from scipy.spatial import KDTree
+from scipy.spatial import KDTree, cKDTree
 from PIL import Image
 from app.core.config import settings
 from app.core.security import verify_weight_integrity
@@ -359,16 +359,46 @@ def inlier_support_mask(
         return mask
     pts[:, 0] = np.clip(pts[:, 0], 0, width - 1)
     pts[:, 1] = np.clip(pts[:, 1], 0, height - 1)
-    if cv2 is not None and len(pts) >= 3:
-        hull = cv2.convexHull(pts)
-        cv2.fillConvexPoly(mask, hull, 1)
-    else:
+    if cv2 is None or len(pts) < 3:
         mask[pts[:, 1], pts[:, 0]] = 1
-    if cv2 is None:
         return mask
-    k = 2 * int(dilate_px) + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    return cv2.dilate(mask, kernel)
+
+    # Local connected-component support mask instead of global convexHull across whole image ([S4-3])
+    # 1. Rasterize inlier points
+    pt_mask = np.zeros((height, width), dtype=np.uint8)
+    pt_mask[pts[:, 1], pts[:, 0]] = 1
+
+    # 2. Adaptive bounded cluster kernel: connects nearby points belonging to the same surface,
+    # without bridging large gaps across doorways or separate rooms
+    tree = cKDTree(pts)
+    nn_dists, _ = tree.query(pts, k=2)
+    d_med = float(np.median(nn_dists[:, 1])) if len(pts) > 1 else 10.0
+    close_rad = min(max(int(dilate_px), int(round(1.1 * d_med))), 40)
+    k_close = 2 * close_rad + 1
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close, k_close))
+    dil_cluster = cv2.dilate(pt_mask, kernel_close)
+
+    # 3. Find connected components of inlier clusters
+    nlab, labels, stats, _ = cv2.connectedComponentsWithStats(dil_cluster, connectivity=8)
+
+    # 4. Fill convex hull per connected component locally (avoids bridging doorways/corridors)
+    for lab in range(1, nlab):
+        in_comp = labels[pts[:, 1], pts[:, 0]] == lab
+        comp_pts = pts[in_comp]
+        if len(comp_pts) >= 3:
+            hull = cv2.convexHull(comp_pts)
+            cv2.fillConvexPoly(mask, hull, 1)
+        elif len(comp_pts) > 0:
+            mask[comp_pts[:, 1], comp_pts[:, 0]] = 1
+
+    # 5. Dilate final support mask by bounded dilate_px
+    eff_dilate = min(int(dilate_px), 24)
+    if eff_dilate > 0:
+        k_dil = 2 * eff_dilate + 1
+        kernel_dil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_dil, k_dil))
+        mask = cv2.dilate(mask, kernel_dil)
+
+    return mask
 
 
 def pregate_sparse_tof(
@@ -479,11 +509,10 @@ def flatten_mirror_cavity_depth(
             else:
                 anom_region = anom_pts
 
-    # Only flatten pixels that bulge BEHIND the wall plane (never flatten foreground obstacles where out < zmap)
-    cavity_mask = valid & (
-        (anom_region & (out > zmap + PLANE_INLIER_M))
-        | (out > zmap + PLANE_BEHIND_M)
-        | (anom_region & (out <= 0.0))
+    # Only flatten pixels that bulge BEHIND the wall plane and intersect the detected mirror/glass anomaly region ([S4-3])
+    # (open doorways, corridors, and alcoves deeper than the wall without mirror anomalies are NOT flattened)
+    cavity_mask = valid & anom_region & (
+        (out > zmap + PLANE_INLIER_M) | (out <= 0.0)
     )
     count = int(np.count_nonzero(cavity_mask))
     if count > 0:
@@ -631,8 +660,8 @@ def inpaint_planar_depth(
     if cv2 is None or not np.any(candidates):
         return out, 0
     nlab, labels, stats, _ = cv2.connectedComponentsWithStats(candidates.astype(np.uint8), 4)
-    sx = cv2.Sobel(pre_huber_depth.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
-    sy = cv2.Sobel(pre_huber_depth.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+    sx = cv2.Sobel(pre_huber_depth.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3) / 8.0
+    sy = cv2.Sobel(pre_huber_depth.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3) / 8.0
     mag = np.hypot(sx, sy)
     painted = 0
     k1 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -647,6 +676,13 @@ def inpaint_planar_depth(
             thr = max(CONTINUITY_SOBEL_ABS_M, CONTINUITY_SOBEL_REL * zp)
             if float(np.median(mag[border])) > thr:
                 continue
+            # Gate by pre_huber_depth consistency: border pixels must be consistent with the wall plane ([S4-3])
+            v_b = border & np.isfinite(pre_huber_depth) & (pre_huber_depth > 0.1)
+            if np.any(v_b):
+                diff_b = np.abs(pre_huber_depth[v_b] - zmap[v_b])
+                tol_b = max(PLANE_BEHIND_M, 0.08 * zp)
+                if float(np.median(diff_b)) > tol_b:
+                    continue
         out[cc] = zmap[cc].astype(np.float32)
         painted += int(np.count_nonzero(cc))
     return out, painted
@@ -655,6 +691,7 @@ def inpaint_planar_depth(
 
 class DepthorModelManager:
     _instance = None
+    _cpu_instance = None
     _lock = None
 
     @classmethod
@@ -674,9 +711,29 @@ class DepthorModelManager:
         return cls._instance
 
     @classmethod
+    def get_cpu_session(cls, model_path: str = None):
+        if model_path is None:
+            model_path = settings.MODEL_WEIGHTS_PATH
+        if cls._cpu_instance is None:
+            with cls._get_lock():
+                if cls._cpu_instance is None:
+                    if not os.path.exists(model_path):
+                        return None
+                    import onnxruntime as ort
+
+                    sess_opts = ort.SessionOptions()
+                    sess_opts.intra_op_num_threads = getattr(settings, "ONNX_INTRA_THREADS", 2)
+                    sess_opts.inter_op_num_threads = getattr(settings, "ONNX_INTER_THREADS", 2)
+                    cls._cpu_instance = ort.InferenceSession(
+                        model_path, sess_opts, providers=["CPUExecutionProvider"]
+                    )
+        return cls._cpu_instance
+
+    @classmethod
     def release(cls):
         with cls._get_lock():
             cls._instance = None
+            cls._cpu_instance = None
         import gc
         gc.collect()
 
@@ -701,9 +758,78 @@ class DepthorModelManager:
 
 
 
+def filter_tof_anomalies(
+    rel_depth: np.ndarray,
+    sparse_tof: np.ndarray,
+    mask: np.ndarray,
+    spatial_radius_px: float | None = None,
+) -> np.ndarray:
+    """Filter multipath outliers in sparse ToF depth using local rank correlation with rel_depth.
+    Runs in O(N log N) using cKDTree with no 500-point bypass ([S4-2])."""
+    filtered_mask = mask.copy()
+    rows, cols = np.where(mask)
+    if len(rows) == 0:
+        return filtered_mask
+
+    points = np.column_stack([rows, cols])
+    n_pts = len(points)
+    K = min(8, n_pts - 1)
+    if K <= 2:
+        return filtered_mask
+
+    tree = cKDTree(points)
+    dists, nearest_indices = tree.query(points, k=K + 1)
+
+    neighbor_coords = points[nearest_indices]
+    p_rel_all = rel_depth[neighbor_coords[:, :, 0], neighbor_coords[:, :, 1]]
+    p_tof_all = sparse_tof[neighbor_coords[:, :, 0], neighbor_coords[:, :, 1]]
+
+    std_rel = np.std(p_rel_all, axis=1)
+    std_tof = np.std(p_tof_all, axis=1)
+    valid_std = (std_rel >= 1e-6) & (std_tof >= 1e-6)
+
+    # Use scipy.stats.rankdata to compute exact ranks with ties handled properly
+    ranks_rel = rankdata(p_rel_all, axis=1)
+    ranks_tof = rankdata(p_tof_all, axis=1)
+
+    r_rel_mean = np.mean(ranks_rel, axis=1, keepdims=True)
+    r_tof_mean = np.mean(ranks_tof, axis=1, keepdims=True)
+    rel_diff = ranks_rel - r_rel_mean
+    tof_diff = ranks_tof - r_tof_mean
+
+    num = np.sum(rel_diff * tof_diff, axis=1)
+    den = np.sqrt(np.sum(rel_diff**2, axis=1) * np.sum(tof_diff**2, axis=1))
+    corr = np.divide(num, den, out=np.zeros_like(num), where=den > 1e-6)
+
+    anomalies = valid_std & (corr < 0.3)
+
+    # Local multipath spike outlier detection: center point deviates sharply from neighbor ratio
+    ratio = np.divide(p_tof_all, p_rel_all, out=np.ones_like(p_tof_all), where=p_rel_all > 1e-4)
+    med_ratio_neighbors = np.median(ratio[:, 1:], axis=1)
+    center_ratio = ratio[:, 0]
+    med_tof_neighbors = np.median(p_tof_all[:, 1:], axis=1)
+    tof_diff = np.abs(p_tof_all[:, 0] - med_tof_neighbors)
+    ratio_diff = np.abs(center_ratio - med_ratio_neighbors)
+    is_spike = (tof_diff > 0.40) & (ratio_diff > 0.35 * np.maximum(med_ratio_neighbors, 0.1))
+    anomalies = anomalies | is_spike
+
+    if spatial_radius_px is not None:
+        valid_neighbors = dists[:, 1:] <= float(spatial_radius_px)
+        has_local_support = np.sum(valid_neighbors, axis=1) >= min(3, K)
+        anomalies = anomalies & has_local_support
+
+    filtered_mask[rows[anomalies], cols[anomalies]] = False
+    return filtered_mask
+
+
 class DepthCompletionService:
     def __init__(self):
         self.last_fusion_info = {}
+        self._rel_depth_cache: dict[str, np.ndarray] = {}
+
+    def clear_cache(self) -> None:
+        """Clear cached relative depth predictions."""
+        self._rel_depth_cache.clear()
 
     def construct_input_tensor(
         self,
@@ -877,46 +1003,82 @@ class DepthCompletionService:
         aligned[invalid] = 0.0
         return aligned
 
+    fit_affine_depth = align_scale_shift
+
     def remove_tof_anomalies(
-        self, rel_depth: np.ndarray, sparse_tof: np.ndarray, mask: np.ndarray
+        self,
+        rel_depth: np.ndarray,
+        sparse_tof: np.ndarray,
+        mask: np.ndarray,
+        spatial_radius_px: float | None = None,
     ) -> np.ndarray:
-        filtered_mask = mask.copy()
-        rows, cols = np.where(mask)
-        if len(rows) > 500:
-            return filtered_mask
+        return filter_tof_anomalies(rel_depth, sparse_tof, mask, spatial_radius_px=spatial_radius_px)
 
-        points = np.stack([rows, cols], axis=1)
-        K = min(8, len(points) - 1)
-        if K <= 2:
-            return filtered_mask
+    filter_tof_anomalies = remove_tof_anomalies
 
-        tree = KDTree(points)
-        _, nearest_indices = tree.query(points, k=K + 1)
+    @staticmethod
+    def _apply_bilateral_dtof_scale_field(
+        dense_metric: np.ndarray,
+        rel_depth: np.ndarray,
+        sparse_tof: np.ndarray,
+        clean_mask: np.ndarray,
+        sparse_status: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Apply a smooth edge-aware bilateral log-scale correction field anchored at
+        trusted dToF SPAD points so spatially varying monocular scale drift (e.g. upper-wall
+        over-prediction vs. foreground 3D fixtures) is locally rectified without flattening objects."""
+        if (
+            dense_metric.ndim != 2
+            or rel_depth.shape != dense_metric.shape
+            or sparse_tof.shape != dense_metric.shape
+            or clean_mask.shape != dense_metric.shape
+        ):
+            return dense_metric
+        valid = clean_mask & (dense_metric > 0.10) & (sparse_tof > 0.10) & (sparse_tof < 8.0)
+        rs, cs = np.where(valid)
+        if len(rs) < 8:
+            return dense_metric
+        log_ratio = np.clip(
+            np.log(sparse_tof[rs, cs] / np.maximum(dense_metric[rs, cs], 0.10)),
+            -0.20,
+            0.20,
+        ).astype(np.float32)
+        if sparse_status is not None and sparse_status.shape == dense_metric.shape:
+            st_pts = sparse_status[rs, cs]
+            w_st = np.where(st_pts == 5, 1.0, np.where((st_pts == 6) | (st_pts == 9), 0.35, 0.25)).astype(np.float32)
+        else:
+            w_st = np.ones(len(rs), dtype=np.float32)
+        if float(np.max(np.abs(log_ratio))) < 0.015:
+            return dense_metric
 
-        neighbor_coords = points[nearest_indices]
-        p_rel_all = rel_depth[neighbor_coords[:, :, 0], neighbor_coords[:, :, 1]]
-        p_tof_all = sparse_tof[neighbor_coords[:, :, 0], neighbor_coords[:, :, 1]]
+        h, w = dense_metric.shape
+        step = 4 if (h >= 64 and w >= 64) else 1
+        ys = np.arange(0, h, step, dtype=np.float32)
+        xs = np.arange(0, w, step, dtype=np.float32)
+        yy, xx = np.meshgrid(ys, xs, indexing="ij")
+        rel_sub = rel_depth[::step, ::step]
+        log_rel_sub = np.log(np.clip(rel_sub, 0.05, 10.0)).astype(np.float32)
+        log_rel_pts = np.log(np.clip(rel_depth[rs, cs], 0.05, 10.0)).astype(np.float32)
 
-        std_rel = np.std(p_rel_all, axis=1)
-        std_tof = np.std(p_tof_all, axis=1)
-        valid_std = (std_rel >= 1e-6) & (std_tof >= 1e-6)
-
-        # Use scipy.stats.rankdata to compute exact ranks with ties handled properly
-        ranks_rel = rankdata(p_rel_all, axis=1)
-        ranks_tof = rankdata(p_tof_all, axis=1)
-
-        r_rel_mean = np.mean(ranks_rel, axis=1, keepdims=True)
-        r_tof_mean = np.mean(ranks_tof, axis=1, keepdims=True)
-        rel_diff = ranks_rel - r_rel_mean
-        tof_diff = ranks_tof - r_tof_mean
-
-        num = np.sum(rel_diff * tof_diff, axis=1)
-        den = np.sqrt(np.sum(rel_diff**2, axis=1) * np.sum(tof_diff**2, axis=1))
-        corr = np.divide(num, den, out=np.zeros_like(num), where=den > 1e-6)
-
-        anomalies = valid_std & (corr < 0.3)
-        filtered_mask[rows[anomalies], cols[anomalies]] = False
-        return filtered_mask
+        sigma_xy = 0.22 * float(max(h, w))
+        sigma_d = 0.12
+        d2_xy = (
+            (yy[:, :, None] - rs[None, None, :].astype(np.float32)) ** 2
+            + (xx[:, :, None] - cs[None, None, :].astype(np.float32)) ** 2
+        ) / (2.0 * (sigma_xy ** 2))
+        d2_d = ((log_rel_sub[:, :, None] - log_rel_pts[None, None, :]) ** 2) / (2.0 * (sigma_d ** 2))
+        weights = np.exp(-np.clip(d2_xy + d2_d, 0.0, 30.0)) * w_st[None, None, :]
+        w_sum = np.sum(weights, axis=2) + 0.20
+        corr_sub = np.sum(weights * log_ratio[None, None, :], axis=2) / w_sum
+        if step > 1:
+            corr_full = _resize_image(corr_sub.astype(np.float32), (w, h))
+        else:
+            corr_full = corr_sub
+        out = dense_metric * np.exp(np.clip(corr_full, -0.20, 0.20))
+        invalid = dense_metric <= 0.0
+        out = np.clip(out, 0.1, 8.0).astype(dense_metric.dtype)
+        out[invalid] = 0.0
+        return out
 
     def run_depthor_plus(
         self,
@@ -927,6 +1089,8 @@ class DepthCompletionService:
         g_cam: np.ndarray | None = None,
         z_max_ghost: float | None = None,
         sparse_status: np.ndarray | None = None,
+        rgb_path: str | None = None,
+        apply_bilateral_scale_field: bool = True,
     ) -> np.ndarray:
         h, w, _ = rgb.shape
         work = np.array(sparse_tof, dtype=np.float32, copy=True)
@@ -953,9 +1117,10 @@ class DepthCompletionService:
                     x = (cols - cx) / fx * z
                     y = (rows - cy) / fy * z
                     pts = np.column_stack([x, y, z])
+                    has_status = sparse_status is not None and sparse_status.shape == work.shape
+                    st_rc = sparse_status[rows, cols] if has_status else None
                     # Prefer status==5 points for primary plane fitting when abundant
-                    if sparse_status is not None and sparse_status.shape == work.shape:
-                        st_rc = sparse_status[rows, cols]
+                    if has_status:
                         s5_idx = np.flatnonzero(st_rc == 5)
                         if len(s5_idx) >= PLANE_MIN_INLIERS:
                             s5_planes = fit_multi_planes_gravity_constrained(
@@ -965,7 +1130,8 @@ class DepthCompletionService:
                                 fit_s5 = s5_planes[0]
                                 n_fit = np.asarray(fit_s5["n"], dtype=np.float64)
                                 d_fit = float(fit_s5["D"])
-                                inl_all = np.flatnonzero(np.abs(pts @ n_fit + d_fit) < PLANE_INLIER_M)
+                                inl_s5 = np.flatnonzero(np.abs(pts[s5_idx] @ n_fit + d_fit) < PLANE_INLIER_M)
+                                inl_all = s5_idx[inl_s5]
                                 trusted = {
                                     "n": n_fit,
                                     "D": d_fit,
@@ -973,7 +1139,21 @@ class DepthCompletionService:
                                     "median_z": float(np.median(pts[inl_all, 2])) if len(inl_all) > 0 else fit_s5["median_z"],
                                     "kind": fit_s5.get("kind", "wall"),
                                 }
-                    if trusted is None:
+                        elif len(s5_idx) >= HORIZ_CEIL_MIN_INLIERS:
+                            s5_planes = fit_multi_planes_gravity_constrained(
+                                pts[s5_idx], g_cam, z_max_ghost=z_max_ghost, max_planes=2
+                            )
+                            if s5_planes:
+                                p0 = dict(s5_planes[0])
+                                p0["inlier_index"] = s5_idx[p0["inlier_index"]]
+                                trusted = p0
+                                if len(s5_planes) > 1:
+                                    p1 = dict(s5_planes[1])
+                                    p1["inlier_index"] = s5_idx[p1["inlier_index"]]
+                                    secondary = p1
+                                    sec_global_idx = secondary["inlier_index"]
+                                    secondary_uv = np.column_stack([cols[sec_global_idx], rows[sec_global_idx]])
+                    if trusted is None and not has_status:
                         multi_planes = fit_multi_planes_gravity_constrained(
                             pts, g_cam, z_max_ghost=z_max_ghost, max_planes=2
                         )
@@ -985,7 +1165,10 @@ class DepthCompletionService:
                                 secondary_uv = np.column_stack([cols[sec_global_idx], rows[sec_global_idx]])
                     # Check for a secondary vertical wall or horizontal ceiling/floor plane
                     if trusted is not None and secondary is None:
-                        rem_mask = np.ones(len(pts), dtype=bool)
+                        if has_status:
+                            rem_mask = (st_rc == 5).copy()
+                        else:
+                            rem_mask = np.ones(len(pts), dtype=bool)
                         rem_mask[trusted["inlier_index"]] = False
                         rem_idx = np.flatnonzero(rem_mask)
                         if len(rem_idx) >= HORIZ_CEIL_MIN_INLIERS:
@@ -1042,38 +1225,71 @@ class DepthCompletionService:
                 return np.zeros((h, w), dtype=np.float32)
 
         mask = (work > 0.05) & (work < 8.0)
-        tensors = self.construct_input_tensor(rgb, work, mask, intrinsics, target_size=(518, 518))
         model_path = settings.MODEL_WEIGHTS_PATH
         session = DepthorModelManager.get_session(model_path)
-        if session is not None:
-            input_feed = {
-                "rgb": np.expand_dims(tensors["rgb"], axis=0),
-                "tof_depth": np.expand_dims(tensors["tof_depth"], axis=0),
-                "active_mask": np.expand_dims(tensors["active_mask"], axis=0),
-                "rays": np.expand_dims(tensors["rays"], axis=0),
-            }
-            outputs = session.run(None, input_feed)
-            out_depth = np.squeeze(outputs[0])
-            if out_depth.ndim == 3 and out_depth.shape[0] == 128:
-                bins = np.exp(np.linspace(np.log(0.1), np.log(8.0), 128)).reshape(128, 1, 1)
-                exp_logits = np.exp(out_depth - np.max(out_depth, axis=0, keepdims=True))
-                probs = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
-                rel_depth_518 = np.sum(probs * bins, axis=0)
-            else:
-                rel_depth_518 = np.asarray(out_depth, dtype=np.float32).copy()
-            if cv2 is not None and rel_depth_518.ndim == 2:
-                act_m = tensors["active_mask"][0] > 0.5
-                if np.any(act_m):
-                    med_518 = cv2.medianBlur(rel_depth_518.astype(np.float32), 3)
-                    rel_depth_518[act_m] = med_518[act_m]
-            rel_depth = _resize_image(rel_depth_518, (w, h))
+        cache_key = rgb_path if rgb_path is not None else None
+        if cache_key is not None and cache_key in self._rel_depth_cache:
+            rel_depth = self._rel_depth_cache[cache_key].copy()
         else:
-            rel_depth = np.random.uniform(0.5, 2.0, (h, w))
+            tensors = self.construct_input_tensor(rgb, work, mask, intrinsics, target_size=(518, 518))
+            if session is not None:
+                input_feed = {
+                    "rgb": np.expand_dims(tensors["rgb"], axis=0),
+                    "tof_depth": np.expand_dims(tensors["tof_depth"], axis=0),
+                    "active_mask": np.expand_dims(tensors["active_mask"], axis=0),
+                    "rays": np.expand_dims(tensors["rays"], axis=0),
+                }
+                outputs = None
+                try:
+                    outputs = session.run(None, input_feed)
+                except Exception as exc:
+                    if "AllocateRawInternal" in str(exc) or "memory" in str(exc).lower():
+                        try:
+                            import torch
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            outputs = session.run(None, input_feed)
+                        except Exception:
+                            cpu_sess = DepthorModelManager.get_cpu_session(model_path)
+                            if cpu_sess is not None:
+                                logger.info("ONNX CUDA arena allocation failed; running Depthor+ on CPUExecutionProvider.")
+                                outputs = cpu_sess.run(None, input_feed)
+                            else:
+                                logger.warning("ONNX CUDA arena allocation failed; falling back to uniform relative depth prior.")
+                                outputs = None
+                    else:
+                        raise
+                if outputs is not None:
+                    out_depth = np.squeeze(outputs[0])
+                    if out_depth.ndim == 3 and out_depth.shape[0] == 128:
+                        bins = np.exp(np.linspace(np.log(0.1), np.log(8.0), 128)).reshape(128, 1, 1)
+                        exp_logits = np.exp(out_depth - np.max(out_depth, axis=0, keepdims=True))
+                        probs = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
+                        rel_depth_518 = np.sum(probs * bins, axis=0)
+                    else:
+                        rel_depth_518 = np.asarray(out_depth, dtype=np.float32).copy()
+                    if cv2 is not None and rel_depth_518.ndim == 2:
+                        act_m = tensors["active_mask"][0] > 0.5
+                        if np.any(act_m):
+                            med_518 = cv2.medianBlur(rel_depth_518.astype(np.float32), 3)
+                            rel_depth_518[act_m] = med_518[act_m]
+                    rel_depth = _resize_image(rel_depth_518, (w, h))
+                else:
+                    rel_depth = np.random.uniform(0.5, 2.0, (h, w))
+            else:
+                rel_depth = np.random.uniform(0.5, 2.0, (h, w))
+            if cache_key is not None:
+                self._rel_depth_cache[cache_key] = rel_depth.copy()
 
         clean_mask = self.remove_tof_anomalies(rel_depth, work, mask)
         dense_metric = self.align_scale_shift(
             rel_depth, work, clean_mask, sparse_status=sparse_status, g_cam=g_cam, K=intrinsics
         )
+        if apply_bilateral_scale_field and not fusion_off:
+            dense_metric = self._apply_bilateral_dtof_scale_field(
+                dense_metric, rel_depth, work, clean_mask, sparse_status=sparse_status
+            )
+        metric_depth = dense_metric.copy()
         combined_hull = None
         if trusted is not None and session is not None:
             try:
@@ -1083,17 +1299,17 @@ class DepthCompletionService:
                 z_sec = None
                 if secondary is not None and secondary_uv is not None and uv is not None:
                     z_sec = analytical_z_plane(secondary["n"], secondary["D"], intrinsics, h, w)
-                    dil_px = max(INLIER_HULL_DILATE_PX, int(round(0.18 * max(h, w))))
+                    dil_px = INLIER_HULL_DILATE_PX
                     prim_hull = inlier_support_mask(h, w, uv, dilate_px=dil_px)
                     sec_hull = inlier_support_mask(h, w, secondary_uv, dilate_px=INLIER_HULL_DILATE_PX)
                     hull_mask = (prim_hull > 0) & (sec_hull == 0)
                     both_fin = np.isfinite(z_prim) & np.isfinite(z_sec)
                     hull_mask[both_fin & (z_sec < z_prim - PLANE_INLIER_M)] = False
                 elif uv is not None:
-                    dil_px = max(INLIER_HULL_DILATE_PX, int(round(0.18 * max(h, w))))
+                    dil_px = INLIER_HULL_DILATE_PX
                     hull_mask = inlier_support_mask(h, w, uv, dilate_px=dil_px) > 0
                 dense_metric, inpainted = inpaint_planar_depth(
-                    dense_metric, rel_depth, plane, intrinsics, inlier_hull_mask=hull_mask
+                    dense_metric, metric_depth, plane, intrinsics, inlier_hull_mask=hull_mask
                 )
                 prim_support = None
                 if uv is not None:
@@ -1111,7 +1327,7 @@ class DepthCompletionService:
                     if z_sec is None:
                         z_sec = analytical_z_plane(secondary["n"], secondary["D"], intrinsics, h, w)
                     sec_hull_full = inlier_support_mask(
-                        h, w, secondary_uv, dilate_px=max(INLIER_HULL_DILATE_PX, int(round(0.15 * max(h, w))))
+                        h, w, secondary_uv, dilate_px=INLIER_HULL_DILATE_PX
                     ) > 0
                     if uv is not None:
                         prim_core = inlier_support_mask(h, w, uv, dilate_px=INLIER_HULL_DILATE_PX) > 0
@@ -1123,7 +1339,7 @@ class DepthCompletionService:
                     else:
                         combined_hull = sec_hull_full.copy()
                     dense_metric, inpainted_sec = inpaint_planar_depth(
-                        dense_metric, rel_depth, sec_plane, intrinsics, inlier_hull_mask=sec_hull_full
+                        dense_metric, metric_depth, sec_plane, intrinsics, inlier_hull_mask=sec_hull_full
                     )
                     inpainted += int(inpainted_sec)
                     if sparse_status is not None:
@@ -1145,11 +1361,58 @@ class DepthCompletionService:
             "D": None if trusted is None else float(trusted["D"]),
             "inliers": 0 if trusted is None else int(len(trusted["inlier_index"])),
             "median_z": None if trusted is None else float(trusted["median_z"]),
+            "secondary_plane": secondary is not None,
+            "secondary_n": None if secondary is None else [float(x) for x in secondary["n"]],
+            "secondary_D": None if secondary is None else float(secondary["D"]),
+            "secondary_inliers": 0 if secondary is None else int(len(secondary["inlier_index"])),
             "pre_gate_dropped": int(dropped),
             "inpainted_pixels": int(inpainted),
             "z_max_ghost": z_max_ghost,
         }
         return dense_metric
+
+    def complete_session_depths(
+        self,
+        keyframes: list[dict],
+        intrinsics: np.ndarray,
+        *,
+        g_world: np.ndarray | None = None,
+        session_R_dc: np.ndarray | None = None,
+        z_max_ghost: float | None = None,
+        progress_callback=None,
+    ) -> list[np.ndarray]:
+        """Process all session keyframes with cached relative depth inference and fast metric alignment."""
+        results = []
+        for idx, kf in enumerate(keyframes):
+            if progress_callback:
+                progress_callback(idx, len(keyframes))
+            rgb = kf.get("rgb")
+            sparse_tof = kf.get("sparse_tof")
+            if rgb is None or sparse_tof is None:
+                continue
+            sparse_status = kf.get("sparse_status")
+            g_cam = kf.get("g_cam")
+            rgb_path = kf.get("image_path") or kf.get("rgb_path") or kf.get("filename")
+            try:
+                dense = self.run_depthor_plus(
+                    rgb,
+                    sparse_tof,
+                    intrinsics,
+                    g_cam=g_cam,
+                    z_max_ghost=z_max_ghost,
+                    sparse_status=sparse_status,
+                    rgb_path=rgb_path,
+                )
+            except TypeError:
+                dense = self.run_depthor_plus(
+                    rgb,
+                    sparse_tof,
+                    intrinsics,
+                    g_cam=g_cam,
+                    z_max_ghost=z_max_ghost,
+                )
+            results.append(dense)
+        return results
 
 
 

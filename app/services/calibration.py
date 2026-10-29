@@ -206,8 +206,23 @@ def resolve_sensor_to_vio_rotation(
     img_h: int | None = None,
     R_wc_all: np.ndarray | None = None,
     g_world: np.ndarray | None = None,
+    *,
+    camera_frame_convention: str | None = None,
+    pose_df: pd.DataFrame | None = None,
+    already_sensor_frame: bool | None = None,
+    pose_source: str | None = None,
 ) -> np.ndarray:
     """Deterministically resolve the 3x3 rotation R_dc from Camera Sensor frame to VIO Pose frame."""
+    if camera_frame_convention == "sensor_opencv" or already_sensor_frame is True:
+        return np.eye(3, dtype=np.float64)
+    if pose_source == "server_vio":
+        return np.eye(3, dtype=np.float64)
+    if pose_df is not None and isinstance(pose_df, pd.DataFrame):
+        if pose_df.attrs.get("camera_frame_convention") == "sensor_opencv":
+            return np.eye(3, dtype=np.float64)
+        if pose_df.attrs.get("pose_source") == "server_vio":
+            return np.eye(3, dtype=np.float64)
+
     r_dc_cand = _display_to_camera_sensor_rotation(rot_deg)
     if np.allclose(r_dc_cand, np.eye(3)):
         return np.eye(3, dtype=np.float64)
@@ -612,6 +627,189 @@ def remap_lidar_zones_to_camera_frame(
     return aligned.reshape(orig_shape)
 
 
+def _resolve_deskew_rotation(
+    R_deskew: np.ndarray | None = None,
+    omega_cam: np.ndarray | None = None,
+    dt_s: float | None = None,
+) -> np.ndarray | None:
+    if R_deskew is not None:
+        try:
+            Rd = np.asarray(R_deskew, dtype=np.float64)
+            if Rd.shape == (3, 3) and np.all(np.isfinite(Rd)):
+                return Rd
+        except (ValueError, TypeError):
+            pass
+    if omega_cam is not None and dt_s is not None:
+        try:
+            w_vec = np.asarray(omega_cam, dtype=np.float64).reshape(3)
+            dt_val = float(dt_s)
+            if np.all(np.isfinite(w_vec)) and np.isfinite(dt_val) and abs(dt_val) > 0.0:
+                return Rotation.from_rotvec(w_vec * dt_val).as_matrix()
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def probe_session_image_size(
+    session_dir: str | None = None,
+    rgb_path: str | None = None,
+    K: np.ndarray | None = None,
+    default_size: tuple[int, int] = (640, 480),
+) -> tuple[int, int]:
+    """Read (width, height) dynamically from RGB image header first, falling back to K (2*cx, 2*cy)."""
+    cand_paths: list[str] = []
+    if rgb_path and os.path.isfile(rgb_path):
+        cand_paths.append(rgb_path)
+    if session_dir and os.path.isdir(session_dir):
+        rgb_dir = os.path.join(session_dir, "rgb")
+        if os.path.isdir(rgb_dir):
+            try:
+                for fn in sorted(os.listdir(rgb_dir)):
+                    if fn.lower().endswith((".jpg", ".jpeg", ".png")):
+                        fp = os.path.join(rgb_dir, fn)
+                        if os.path.isfile(fp):
+                            cand_paths.append(fp)
+                            break
+            except Exception:
+                pass
+    for p in cand_paths:
+        try:
+            from PIL import Image
+
+            with Image.open(p) as im:
+                w, h = im.size
+                if w > 16 and h > 16:
+                    return int(w), int(h)
+        except Exception:
+            pass
+    if K is None and session_dir and os.path.isdir(session_dir):
+        k_csv = os.path.join(session_dir, "camera_matrix.csv")
+        if os.path.isfile(k_csv):
+            try:
+                K = load_camera_intrinsics(k_csv)
+            except Exception:
+                K = None
+    if K is not None:
+        try:
+            k_arr = np.asarray(K, dtype=np.float64)
+            if k_arr.shape == (3, 3) and k_arr[0, 2] > 16 and k_arr[1, 2] > 16:
+                return int(round(float(k_arr[0, 2]) * 2.0)), int(round(float(k_arr[1, 2]) * 2.0))
+        except Exception:
+            pass
+    return int(default_size[0]), int(default_size[1])
+
+
+def compute_lidar_rgb_deskew_rotation(
+    t_lidar_ns: int | float | None,
+    t_rgb_ns: int | float | None,
+    pose_df: pd.DataFrame | None = None,
+    session_R_dc: np.ndarray | None = None,
+    max_dt_ns: int = 100_000_000,
+    imu_df: pd.DataFrame | None = None,
+    R_bc: np.ndarray | None = None,
+) -> np.ndarray:
+    """Compute ΔR = R_WC(t_rgb)^T @ R_WC(t_lidar) mapping camera frame at t_lidar to t_rgb."""
+    if t_lidar_ns is None or t_rgb_ns is None:
+        return np.eye(3, dtype=np.float64)
+    try:
+        tl = float(t_lidar_ns)
+        tr = float(t_rgb_ns)
+        if not (np.isfinite(tl) and np.isfinite(tr)):
+            return np.eye(3, dtype=np.float64)
+        if max(abs(tl), abs(tr)) < 1e8 and max(abs(tl), abs(tr)) > 0.0 and abs(tl - tr) < 1e4:
+            tl *= 1e9
+            tr *= 1e9
+        dt_ns = abs(tl - tr)
+        if dt_ns == 0.0 or dt_ns > float(max_dt_ns):
+            return np.eye(3, dtype=np.float64)
+
+        if pose_df is not None and not pose_df.empty:
+            ts_col = (
+                "device_timestamp_ns"
+                if "device_timestamp_ns" in pose_df.columns
+                else ("timestamp" if "timestamp" in pose_df.columns else None)
+            )
+            if ts_col is not None and all(c in pose_df.columns for c in ("qx", "qy", "qz", "qw")):
+                ts = pd.to_numeric(pose_df[ts_col], errors="coerce").to_numpy(dtype=np.float64)
+                quats = (
+                    pose_df[["qx", "qy", "qz", "qw"]]
+                    .apply(pd.to_numeric, errors="coerce")
+                    .to_numpy(dtype=np.float64)
+                )
+                valid = np.isfinite(ts) & np.all(np.isfinite(quats), axis=1)
+                if int(np.count_nonzero(valid)) >= 2:
+                    ts_v = ts[valid]
+                    dt_v = float(np.median(np.abs(np.diff(ts_v)))) if len(ts_v) >= 2 else 0.0
+                    if dt_v < 1e4 and float(np.median(np.abs(ts_v))) < 1e11 and max(abs(tl), abs(tr)) >= 1e8:
+                        ts_v = ts_v * 1e9
+                    q_v = quats[valid]
+                    order = np.argsort(ts_v)
+                    ts_v = ts_v[order]
+                    q_v = q_v[order]
+                    norms = np.linalg.norm(q_v, axis=1, keepdims=True)
+                    ok_n = norms.reshape(-1) > 1e-8
+                    if int(np.count_nonzero(ok_n)) >= 2:
+                        ts_v = ts_v[ok_n]
+                        q_v = q_v[ok_n] / norms[ok_n]
+
+                        def _interp_R_wd(t_query: float) -> np.ndarray:
+                            if t_query <= ts_v[0]:
+                                return Rotation.from_quat(q_v[0]).as_matrix()
+                            if t_query >= ts_v[-1]:
+                                return Rotation.from_quat(q_v[-1]).as_matrix()
+                            idx = int(np.searchsorted(ts_v, t_query))
+                            t0, t1 = float(ts_v[idx - 1]), float(ts_v[idx])
+                            q0, q1 = q_v[idx - 1], q_v[idx].copy()
+                            if float(np.dot(q0, q1)) < 0.0:
+                                q1 = -q1
+                            if t1 > t0:
+                                slerp_pair = Slerp([0.0, t1 - t0], Rotation.from_quat([q0, q1]))
+                                return slerp_pair([t_query - t0])[0].as_matrix()
+                            return Rotation.from_quat(q0).as_matrix()
+
+                        R_wd_rgb = _interp_R_wd(tr)
+                        R_wd_lidar = _interp_R_wd(tl)
+                        R_dc = (
+                            np.asarray(session_R_dc, dtype=np.float64)
+                            if session_R_dc is not None and np.asarray(session_R_dc).shape == (3, 3)
+                            else np.eye(3, dtype=np.float64)
+                        )
+                        R_wc_rgb = R_wd_rgb @ R_dc
+                        R_wc_lidar = R_wd_lidar @ R_dc
+                        return (R_wc_rgb.T @ R_wc_lidar).astype(np.float64)
+
+        if imu_df is not None and not imu_df.empty and all(c in imu_df.columns for c in ("gx", "gy", "gz")):
+            imu_ts_col = next(
+                (c for c in ("device_timestamp_ns", "timestamp_nanos", "timestamp") if c in imu_df.columns),
+                None,
+            )
+            if imu_ts_col is not None:
+                its = pd.to_numeric(imu_df[imu_ts_col], errors="coerce").to_numpy(dtype=np.float64)
+                gyr = imu_df[["gx", "gy", "gz"]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
+                ok = np.isfinite(its) & np.all(np.isfinite(gyr), axis=1)
+                if int(np.count_nonzero(ok)) >= 1:
+                    its_v = its[ok]
+                    dt_imu = float(np.median(np.abs(np.diff(its_v)))) if len(its_v) >= 2 else 0.0
+                    if dt_imu < 1e4 and float(np.median(np.abs(its_v))) < 1e11 and max(abs(tl), abs(tr)) >= 1e8:
+                        its_v = its_v * 1e9
+                    gyr_v = gyr[ok]
+                    t_min, t_max = min(tl, tr), max(tl, tr)
+                    in_win = (its_v >= t_min - 10_000_000) & (its_v <= t_max + 10_000_000)
+                    w_body = np.mean(gyr_v[in_win], axis=0) if np.any(in_win) else gyr_v[int(np.argmin(np.abs(its_v - 0.5 * (tl + tr))))]
+                    R_b2c = (
+                        np.asarray(R_bc, dtype=np.float64).T
+                        if R_bc is not None and np.asarray(R_bc).shape == (3, 3)
+                        else np.eye(3, dtype=np.float64)
+                    )
+                    w_cam = R_b2c @ w_body
+                    dt_s = (tl - tr) * 1e-9
+                    return Rotation.from_rotvec(w_cam * dt_s).as_matrix().astype(np.float64)
+
+        return np.eye(3, dtype=np.float64)
+    except Exception:
+        return np.eye(3, dtype=np.float64)
+
+
 def project_lidar_frame_to_sparse_tof(
     distances_m: np.ndarray,
     rays: np.ndarray,
@@ -622,6 +820,9 @@ def project_lidar_frame_to_sparse_tof(
     flip_h: bool = False,
     flip_v: bool = False,
     rot_deg: int | float | str = 0,
+    R_deskew: np.ndarray | None = None,
+    omega_cam: np.ndarray | None = None,
+    dt_s: float | None = None,
 ) -> np.ndarray:
     try:
         h = int(height)
@@ -658,6 +859,9 @@ def project_lidar_frame_to_sparse_tof(
     if not np.any(valid):
         return np.zeros((h, w), dtype=np.float32)
     pts = (d[:n, None] * r[:n]) @ R.T + t
+    R_corr = _resolve_deskew_rotation(R_deskew=R_deskew, omega_cam=omega_cam, dt_s=dt_s)
+    if R_corr is not None:
+        pts = pts @ R_corr.T
     z = pts[:, 2]
     keep = valid & (z > TOF_Z_MIN_M) & (z < TOF_Z_MAX_M)
     if not np.any(keep):
@@ -687,6 +891,9 @@ def project_lidar_frame_to_sparse_tof_with_status(
     flip_h: bool = False,
     flip_v: bool = False,
     rot_deg: int | float | str = 0,
+    R_deskew: np.ndarray | None = None,
+    omega_cam: np.ndarray | None = None,
+    dt_s: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Project 64-zone VL53L8CX distances and hardware status codes (5 vs 9) to image plane."""
     try:
@@ -726,6 +933,9 @@ def project_lidar_frame_to_sparse_tof_with_status(
     if not np.any(valid):
         return np.zeros((h, w), dtype=np.float32), np.zeros((h, w), dtype=np.int32)
     pts = (d[:n, None] * r[:n]) @ R.T + t
+    R_corr = _resolve_deskew_rotation(R_deskew=R_deskew, omega_cam=omega_cam, dt_s=dt_s)
+    if R_corr is not None:
+        pts = pts @ R_corr.T
     z = pts[:, 2]
     keep = valid & (z > TOF_Z_MIN_M) & (z < TOF_Z_MAX_M)
     if not np.any(keep):
@@ -756,6 +966,8 @@ def project_lidar_frame_to_sparse_tof_with_status(
             d_ref,
         )
         pts_anom = (d_anom[anom_mask, None] * r[:n][anom_mask]) @ R.T + t
+        if R_corr is not None:
+            pts_anom = pts_anom @ R_corr.T
         z_anom = pts_anom[:, 2]
         ok_z = z_anom > TOF_Z_MIN_M
         if np.any(ok_z):
@@ -769,9 +981,125 @@ def project_lidar_frame_to_sparse_tof_with_status(
     return out, out_status
 
 
-
-
 LIDAR_RGB_MATCH_NS = 50_000_000
+
+
+def rematch_lidar_rgb_frames(
+    lidar_df: pd.DataFrame | None,
+    odo_df: pd.DataFrame | None = None,
+    session_dir: str | None = None,
+    match_ns: int = LIDAR_RGB_MATCH_NS,
+) -> pd.DataFrame | None:
+    """Re-match LiDAR rows to RGB frames (frame >= 0) using shifted device_timestamp_ns."""
+    if lidar_df is None or not isinstance(lidar_df, pd.DataFrame) or lidar_df.empty:
+        return lidar_df
+    if "device_timestamp_ns" not in lidar_df.columns:
+        return lidar_df
+
+    rgb_frames_list: list[int] = []
+    rgb_ts_list: list[float] = []
+
+    if odo_df is not None and isinstance(odo_df, pd.DataFrame) and not odo_df.empty and "frame" in odo_df.columns:
+        ts_col = "timestamp" if "timestamp" in odo_df.columns else (
+            "device_timestamp_ns" if "device_timestamp_ns" in odo_df.columns else None
+        )
+        if ts_col is not None:
+            fr_arr = pd.to_numeric(odo_df["frame"], errors="coerce").to_numpy(dtype=np.float64)
+            ts_arr = pd.to_numeric(odo_df[ts_col], errors="coerce").to_numpy(dtype=np.float64)
+            valid_mask = np.isfinite(fr_arr) & (fr_arr >= 0.0) & np.isfinite(ts_arr) & (ts_arr > 0.0)
+            seen_frames: set[int] = set()
+            for f_val, t_val in zip(fr_arr[valid_mask], ts_arr[valid_mask]):
+                fi = int(round(float(f_val)))
+                if fi not in seen_frames:
+                    seen_frames.add(fi)
+                    rgb_frames_list.append(fi)
+                    rgb_ts_list.append(float(t_val))
+
+    if not rgb_ts_list and session_dir and os.path.isdir(session_dir):
+        for cand_name in ("processed_odometry.csv", "odometry.csv"):
+            cand_path = os.path.join(session_dir, cand_name)
+            if os.path.isfile(cand_path):
+                try:
+                    cdf = pd.read_csv(cand_path)
+                    if "frame" in cdf.columns:
+                        ts_col = "timestamp" if "timestamp" in cdf.columns else (
+                            "device_timestamp_ns" if "device_timestamp_ns" in cdf.columns else None
+                        )
+                        if ts_col is not None:
+                            fr_arr = pd.to_numeric(cdf["frame"], errors="coerce").to_numpy(dtype=np.float64)
+                            ts_arr = pd.to_numeric(cdf[ts_col], errors="coerce").to_numpy(dtype=np.float64)
+                            valid_mask = np.isfinite(fr_arr) & (fr_arr >= 0.0) & np.isfinite(ts_arr) & (ts_arr > 0.0)
+                            seen_frames = set()
+                            for f_val, t_val in zip(fr_arr[valid_mask], ts_arr[valid_mask]):
+                                fi = int(round(float(f_val)))
+                                if fi not in seen_frames:
+                                    seen_frames.add(fi)
+                                    rgb_frames_list.append(fi)
+                                    rgb_ts_list.append(float(t_val))
+                    if rgb_ts_list:
+                        break
+                except Exception:
+                    pass
+
+    if not rgb_ts_list:
+        return lidar_df
+
+    rgb_ts_arr = np.asarray(rgb_ts_list, dtype=np.float64)
+    rgb_fr_arr = np.asarray(rgb_frames_list, dtype=np.int64)
+
+    if session_dir and os.path.isdir(session_dir):
+        rgb_dir = os.path.join(session_dir, "rgb")
+        if os.path.isdir(rgb_dir):
+            try:
+                disk_frames: set[int] = set()
+                for fn in os.listdir(rgb_dir):
+                    if fn.lower().endswith((".jpg", ".jpeg", ".png")):
+                        stem = os.path.splitext(fn)[0].replace("frame_", "")
+                        if stem.isdigit():
+                            val = int(stem)
+                            if val < 100_000_000_000:
+                                disk_frames.add(val)
+                if disk_frames:
+                    keep_disk = np.isin(rgb_fr_arr, list(disk_frames))
+                    if np.any(keep_disk):
+                        rgb_ts_arr = rgb_ts_arr[keep_disk]
+                        rgb_fr_arr = rgb_fr_arr[keep_disk]
+            except Exception:
+                pass
+
+    out = lidar_df.copy()
+    lts = pd.to_numeric(out["device_timestamp_ns"], errors="coerce").to_numpy(dtype=np.float64)
+    finite_lts = lts[np.isfinite(lts) & (lts > 0.0)]
+    if len(finite_lts) > 0 and len(rgb_ts_arr) > 0:
+        if float(np.median(rgb_ts_arr)) < 1e11 and float(np.median(finite_lts)) >= 1e11:
+            rgb_ts_arr = rgb_ts_arr * 1e9
+
+    order = np.argsort(rgb_ts_arr)
+    rgb_ts_arr = rgb_ts_arr[order]
+    rgb_fr_arr = rgb_fr_arr[order]
+
+    new_mf = np.full(len(out), -1, dtype=np.int64)
+    new_delta = np.zeros(len(out), dtype=np.int64)
+
+    for i, t_val in enumerate(lts):
+        if not np.isfinite(t_val) or t_val <= 0.0:
+            continue
+        j = int(np.searchsorted(rgb_ts_arr, t_val))
+        best_ci = None
+        best_dt = None
+        for ci in (j - 1, j):
+            if 0 <= ci < len(rgb_ts_arr):
+                dt = abs(float(rgb_ts_arr[ci]) - float(t_val))
+                if dt <= float(match_ns) and (best_dt is None or dt < best_dt):
+                    best_dt = dt
+                    best_ci = ci
+        if best_ci is not None and best_dt is not None:
+            new_mf[i] = int(rgb_fr_arr[best_ci])
+            new_delta[i] = int(round(best_dt))
+
+    out["matched_frame"] = new_mf
+    out["match_delta_nanos"] = new_delta
+    return out
 
 
 def should_skip_tof_keyframe(has_lidar: bool, sparse_tof: np.ndarray) -> bool:
@@ -789,11 +1117,41 @@ def lookup_lidar_row(
 ) -> pd.Series | None:
     if lidar_df is None or not isinstance(lidar_df, pd.DataFrame) or lidar_df.empty:
         return None
-    if frame is not None and frame_index is not None:
+    has_finite_ts = False
+    if timestamp_ns is not None and "device_timestamp_ns" in lidar_df.columns:
+        ts = pd.to_numeric(lidar_df["device_timestamp_ns"], errors="coerce").to_numpy(dtype=np.float64)
+        finite = np.isfinite(ts) & (ts >= 0.0)
+        if np.any(finite):
+            has_finite_ts = bool(np.any(ts[finite] > 0.0))
+            order = np.argsort(ts[finite])
+            sorted_ts = ts[finite][order]
+            sorted_pos = np.flatnonzero(finite)[order]
+            j = int(np.searchsorted(sorted_ts, float(timestamp_ns)))
+            candidates = []
+            if j < len(sorted_ts):
+                candidates.append(j)
+            if j > 0:
+                candidates.append(j - 1)
+            best = None
+            best_dt = None
+            for ci in candidates:
+                dt = abs(float(sorted_ts[ci]) - float(timestamp_ns))
+                if dt <= float(match_ns) and (best_dt is None or dt < best_dt):
+                    best_dt = dt
+                    best = int(sorted_pos[ci])
+            if best is not None:
+                return lidar_df.iloc[best]
+            if frame is None:
+                return None
+
+    if has_finite_ts and timestamp_ns is not None:
+        return None
+
+    if frame is not None and int(frame) >= 0 and frame_index is not None:
         idx = frame_index.get(int(frame))
         if idx is not None:
             return lidar_df.iloc[int(idx)]
-    if frame is not None and "matched_frame" in lidar_df.columns:
+    if frame is not None and int(frame) >= 0 and "matched_frame" in lidar_df.columns:
         mf = pd.to_numeric(lidar_df["matched_frame"], errors="coerce")
         ok = np.isfinite(mf.to_numpy(dtype=np.float64)) & (mf.to_numpy(dtype=np.float64) >= 0.0)
         keyed = mf[ok].round().astype(int)
@@ -804,31 +1162,7 @@ def lookup_lidar_row(
                 delta = pd.to_numeric(sub["match_delta_nanos"], errors="coerce").abs()
                 return sub.loc[delta.idxmin()]
             return sub.iloc[0]
-    if timestamp_ns is None or "device_timestamp_ns" not in lidar_df.columns:
-        return None
-    ts = pd.to_numeric(lidar_df["device_timestamp_ns"], errors="coerce").to_numpy(dtype=np.float64)
-    finite = np.isfinite(ts)
-    if not np.any(finite):
-        return None
-    order = np.argsort(ts[finite])
-    sorted_ts = ts[finite][order]
-    sorted_pos = np.flatnonzero(finite)[order]
-    j = int(np.searchsorted(sorted_ts, float(timestamp_ns)))
-    candidates = []
-    if j < len(sorted_ts):
-        candidates.append(j)
-    if j > 0:
-        candidates.append(j - 1)
-    best = None
-    best_dt = None
-    for ci in candidates:
-        dt = abs(float(sorted_ts[ci]) - float(timestamp_ns))
-        if dt <= float(match_ns) and (best_dt is None or dt < best_dt):
-            best_dt = dt
-            best = int(sorted_pos[ci])
-    if best is None:
-        return None
-    return lidar_df.iloc[best]
+    return None
 
 
 def load_processed_lidar_for_tof(session_dir: str) -> dict:
@@ -954,6 +1288,7 @@ def find_stationary_dwell(
     pose_df: pd.DataFrame,
     lidar_df: pd.DataFrame | None,
     frame_index: dict[int, int] | None = None,
+    imu_df: pd.DataFrame | None = None,
 ) -> dict | None:
     if pose_df is None or pose_df.empty or lidar_df is None or getattr(lidar_df, "empty", True):
         return None
@@ -963,9 +1298,71 @@ def find_stationary_dwell(
         return None
     ts = pd.to_numeric(pose_df["device_timestamp_ns"], errors="coerce").to_numpy(dtype=np.float64)
     xyz = pose_df[["x", "y", "z"]].to_numpy(dtype=np.float64)
+    n_rows = len(pose_df)
+    if "is_frozen_interpolated" in pose_df.columns:
+        frozen_mask = (
+            pd.to_numeric(pose_df["is_frozen_interpolated"], errors="coerce")
+            .fillna(0)
+            .to_numpy(dtype=np.int64)
+            != 0
+        )
+    else:
+        frozen_mask = np.zeros(n_rows, dtype=bool)
+        if n_rows >= 3:
+            step_dp = np.linalg.norm(np.diff(xyz, axis=0), axis=1)
+            has_q = all(c in pose_df.columns for c in ("qx", "qy", "qz", "qw"))
+            q_arr = (
+                pose_df[["qx", "qy", "qz", "qw"]].to_numpy(dtype=np.float64)
+                if has_q
+                else None
+            )
+            ts_imu = None
+            w_imu = None
+            if imu_df is not None and not getattr(imu_df, "empty", True):
+                t_c = (
+                    "device_timestamp_ns"
+                    if "device_timestamp_ns" in imu_df.columns
+                    else ("timestamp_nanos" if "timestamp_nanos" in imu_df.columns else "timestamp")
+                )
+                gx_c = "gx" if "gx" in imu_df.columns else ("gyro_x" if "gyro_x" in imu_df.columns else None)
+                gy_c = "gy" if "gy" in imu_df.columns else ("gyro_y" if "gyro_y" in imu_df.columns else None)
+                gz_c = "gz" if "gz" in imu_df.columns else ("gyro_z" if "gyro_z" in imu_df.columns else None)
+                if t_c in imu_df.columns and gx_c and gy_c and gz_c:
+                    r_t = pd.to_numeric(imu_df[t_c], errors="coerce").to_numpy(dtype=np.float64)
+                    ts_imu = r_t if (len(r_t) > 0 and r_t[0] > 1e12) else (r_t * 1e9)
+                    w_imu = np.sqrt(
+                        pd.to_numeric(imu_df[gx_c], errors="coerce").to_numpy(dtype=np.float64) ** 2
+                        + pd.to_numeric(imu_df[gy_c], errors="coerce").to_numpy(dtype=np.float64) ** 2
+                        + pd.to_numeric(imu_df[gz_c], errors="coerce").to_numpy(dtype=np.float64) ** 2
+                    )
+            idx_s = 1
+            while idx_s < n_rows:
+                if step_dp[idx_s - 1] >= 1e-7:
+                    idx_s += 1
+                    continue
+                f_start = idx_s - 1
+                f_end = idx_s
+                while f_end + 1 < n_rows and step_dp[f_end] < 1e-7:
+                    f_end += 1
+                has_jump_after = (f_end + 1 < n_rows) and (step_dp[f_end] > 0.05)
+                if not has_jump_after and q_arr is not None and (f_end + 1 < n_rows):
+                    q0 = q_arr[f_end] / max(1e-12, float(np.linalg.norm(q_arr[f_end])))
+                    q1 = q_arr[f_end + 1] / max(1e-12, float(np.linalg.norm(q_arr[f_end + 1])))
+                    drot = float(np.degrees(2.0 * np.arccos(np.clip(abs(float(np.dot(q0, q1))), 0.0, 1.0))))
+                    if drot > 5.0:
+                        has_jump_after = True
+                has_imu_rot = False
+                if ts_imu is not None and w_imu is not None:
+                    m_i = (ts_imu >= ts[f_start]) & (ts_imu <= ts[min(n_rows - 1, f_end + 1)])
+                    if np.any(m_i) and float(np.max(w_imu[m_i])) > 0.08:
+                        has_imu_rot = True
+                if has_jump_after or has_imu_rot:
+                    frozen_mask[f_start : f_end + 1] = True
+                idx_s = f_end + 2
+
     matched_pose = []
     lidar_iloc = []
-    for i in range(len(pose_df)):
+    for i in range(n_rows):
         if not np.isfinite(ts[i]):
             continue
         frame = None
@@ -991,6 +1388,8 @@ def find_stationary_dwell(
     for start in range(0, n - EM_DWELL_FRAMES + 1):
         sl = slice(start, start + EM_DWELL_FRAMES)
         pidx = matched_pose[sl]
+        if np.any(frozen_mask[pidx]):
+            continue
         t0 = float(ts[pidx[0]])
         t1 = float(ts[pidx[-1]])
         if (t1 - t0) / 1e9 > EM_DWELL_MAX_DURATION_S + 1e-9:
@@ -1065,6 +1464,52 @@ def gather_dwell_tof_points(
     if not xs:
         return np.zeros((0, 3)), np.zeros((0,)), np.zeros((0, 3))
     return np.vstack(xs), np.asarray(ds, dtype=np.float64), np.vstack(rs)
+
+
+def _solve_weighted_extrinsics_step(
+    A: np.ndarray | None = None,
+    b: np.ndarray | None = None,
+    w: np.ndarray | None = None,
+    *,
+    H_tt: np.ndarray | None = None,
+    g_t: np.ndarray | None = None,
+    min_sv: float = 1e-3,
+    rcond: float = 0.05,
+) -> np.ndarray:
+    """Solve translation step dt from normal equations H_tt = A^T W A with observability-aware truncated SVD.
+
+    Singular components with S_i < max(min_sv, rcond * S_max) are zeroed out so unobservable directions
+    parallel to planes do not drift.
+    """
+    if H_tt is None:
+        if A is None or b is None:
+            return np.zeros(3, dtype=np.float64)
+        A_arr = np.asarray(A, dtype=np.float64)
+        b_arr = np.asarray(b, dtype=np.float64).reshape(-1)
+        if len(A_arr) == 0 or len(b_arr) == 0:
+            return np.zeros(3, dtype=np.float64)
+        if w is None:
+            w_arr = np.ones(len(b_arr), dtype=np.float64)
+        else:
+            w_arr = np.asarray(w, dtype=np.float64).reshape(-1)
+        H_tt = A_arr.T @ (w_arr[:, None] * A_arr)
+        g_t = A_arr.T @ (w_arr * b_arr)
+    else:
+        H_tt = np.asarray(H_tt, dtype=np.float64)
+        if g_t is None:
+            return np.zeros(H_tt.shape[1], dtype=np.float64)
+        g_t = np.asarray(g_t, dtype=np.float64).reshape(-1)
+
+    U, S, Vt = np.linalg.svd(H_tt)
+    s_max = float(np.max(S)) if len(S) > 0 else 0.0
+    cutoff = max(min_sv, rcond * s_max)
+
+    S_inv = np.zeros_like(S)
+    valid = S >= cutoff
+    S_inv[valid] = 1.0 / S[valid]
+
+    dt = Vt.T @ (S_inv * (U.T @ g_t))
+    return dt
 
 
 def o3d_model_to_nd(model: np.ndarray) -> tuple[np.ndarray, float]:
@@ -1365,8 +1810,13 @@ def em_point_to_plane(X, ray_dirs, distances, planes, T0) -> dict:
         sol = least_squares(
             fun, np.zeros(6), jac=jac, loss="linear", max_nfev=40
         )
-        tau, omega = sol.x[:3], sol.x[3:]
-        R = Rotation.from_rotvec(omega).as_matrix() @ R
+        omega = sol.x[3:]
+        Rd = Rotation.from_rotvec(omega).as_matrix() @ R
+        # Linear translation solve with truncated SVD damping
+        p_rot = Xk @ Rd.T + t
+        b_vec = d_asg - np.sum(nk * p_rot, axis=1)
+        tau = _solve_weighted_extrinsics_step(nk, b_vec, wk)
+        R = Rd
         t = t + tau
         base["iterations"] = it + 1
         if np.linalg.norm(tau) < 1e-3 and np.degrees(np.linalg.norm(omega)) < 0.05:
@@ -1645,8 +2095,11 @@ class MultiKeyframePlaneCalibration:
         pose_ts_arr = np.array([item[0] for item in pose_records], dtype=np.int64) if pose_records else np.zeros(0, dtype=np.int64)
 
         R_wc_all_mkf = np.array([item[1][:3, :3] for item in pose_records], dtype=np.float64) if pose_records else None
-        w_est = int(round(2.0 * float(K[0, 2]))) if K is not None and K.shape == (3, 3) and K[0, 2] > 10 else None
-        h_est = int(round(2.0 * float(K[1, 2]))) if K is not None and K.shape == (3, 3) and K[1, 2] > 10 else None
+        first_rgb_p = next(
+            (kf.get("_rgb_path") or kf.get("rgb_path") for kf in sampled_kfs if (kf.get("_rgb_path") or kf.get("rgb_path"))),
+            None,
+        )
+        w_est, h_est = probe_session_image_size(rgb_path=first_rgb_p, K=K)
         session_R_dc = resolve_sensor_to_vio_rotation(
             self.rot_deg, img_w=w_est, img_h=h_est, R_wc_all=R_wc_all_mkf, g_world=g_world
         )
@@ -1737,8 +2190,19 @@ class MultiKeyframePlaneCalibration:
                     if g_world is not None and all(k in kf for k in ("qx", "qy", "qz", "qw")):
                         R_wc = Rotation.from_quat([kf["qx"], kf["qy"], kf["qz"], kf["qw"]]).as_matrix() @ session_R_dc
                         g_cam = R_wc.T @ np.asarray(g_world, dtype=float)
+                    kf_rgb_path = (
+                        kf.get("_rgb_path")
+                        or kf.get("rgb_path")
+                        or kf.get("image_path")
+                        or kf.get("filename")
+                    )
                     dense = depth_service.run_depthor_plus(
-                        rgb_img, sparse_tof, K, g_cam=g_cam, z_max_ghost=z_max_ghost
+                        rgb_img,
+                        sparse_tof,
+                        K,
+                        g_cam=g_cam,
+                        z_max_ghost=z_max_ghost,
+                        rgb_path=kf_rgb_path,
                     )
                     if dense is not None:
                         planes_k = extract_camera_planes_from_trihedral_depth(dense, K)
@@ -1823,25 +2287,38 @@ class MultiKeyframePlaneCalibration:
             return np.concatenate([res_data, res_prior])
 
         sol = least_squares(fun_reg, np.zeros(6), loss="linear", max_nfev=35)
-        tau, omega = sol.x[:3], sol.x[3:]
+        omega = sol.x[3:]
+        Rd = Rotation.from_rotvec(omega).as_matrix() @ R_prior
+        p_rot = X_pool @ Rd.T + t_prior
+        b_vec = d_pool - np.sum(n_pool * p_rot, axis=1)
+        tau = _solve_weighted_extrinsics_step(n_pool, b_vec, w_pool)
         dt = float(np.linalg.norm(tau))
         dr = float(np.degrees(np.linalg.norm(omega)))
-        if dt <= EM_TRUST_T_M and dr <= EM_TRUST_R_DEG:
-            R_star = _svd_so3(Rotation.from_rotvec(omega).as_matrix() @ R_prior)
-            t_star = t_prior + tau
+        trust_ok = (dt <= EM_TRUST_T_M) and (dr <= EM_TRUST_R_DEG)
+        if trust_ok:
+            R_cand = _svd_so3(Rotation.from_rotvec(omega).as_matrix() @ R_prior)
+            t_cand = t_prior + tau
+            p_cand = X_pool @ R_cand.T + t_cand
+            r_cand = np.sum(n_pool * p_cand, axis=1) - d_pool
+            rms_cand = float(np.sqrt(np.average(r_cand ** 2, weights=w_pool)))
+            improved = rms_cand < rms_prior - 1e-6
+        else:
+            improved = False
+
+        if trust_ok and improved:
+            R_star = R_cand
+            t_star = t_cand
+            rms_star = rms_cand
+            accepted = True
+            reason = None
         else:
             R_star = R_prior
             t_star = t_prior
+            rms_star = rms_prior
             dt = 0.0
             dr = 0.0
-
-        p_star = X_pool @ R_star.T + t_star
-        r_star = np.sum(n_pool * p_star, axis=1) - d_pool
-        rms_star = float(np.sqrt(np.average(r_star ** 2, weights=w_pool)))
-        if rms_star > rms_prior:
-            R_star, t_star = R_prior, t_prior
-            rms_star = rms_prior
-            dt, dr = 0.0, 0.0
+            accepted = False
+            reason = "trust_region_exceeded" if not trust_ok else "no_improvement"
 
         T_star = np.eye(4, dtype=np.float64)
         T_star[:3, :3] = R_star
@@ -1851,7 +2328,7 @@ class MultiKeyframePlaneCalibration:
         p_t0 = X_pool @ _svd_so3(self.T0[:3, :3]).T + self.T0[:3, 3]
         r_t0 = np.sum(n_pool * p_t0, axis=1) - d_pool
         rms_t0_raw = float(np.sqrt(np.average(r_t0 ** 2, weights=w_pool)))
-        rms_T0_report = max(rms_prior, min(rms_t0_raw, rms_prior * 2.5))
+        rms_T0_report = rms_t0_raw
         dt_total = float(np.linalg.norm(T_star[:3, 3] - self.T0[:3, 3]))
         dr_total = _geodesic_deg(T_star[:3, :3], self.T0[:3, :3])
         if dt_total > EM_TRUST_T_M or dr_total > EM_TRUST_R_DEG:
@@ -1867,8 +2344,8 @@ class MultiKeyframePlaneCalibration:
 
         return {
             "T_lidar_camera": T_star,
-            "accepted": True,
-            "reason": None,
+            "accepted": accepted,
+            "reason": reason,
             "plane_source": "multi_keyframe_em",
             "T0": self.T_prior,
             "dwell": {
@@ -2118,8 +2595,19 @@ def refine_lidar_camera_extrinsics_em(
                         @ R_dc_em
                     )
                     g_cam = R_dw.T @ np.asarray(g_world, dtype=float)
+                best_kf_rgb_path = (
+                    best_kf.get("_rgb_path")
+                    or best_kf.get("rgb_path")
+                    or best_kf.get("image_path")
+                    or best_kf.get("filename")
+                )
                 dense = depth_service.run_depthor_plus(
-                    rgb_img, sparse_tof, K, g_cam=g_cam, z_max_ghost=z_max_ghost
+                    rgb_img,
+                    sparse_tof,
+                    K,
+                    g_cam=g_cam,
+                    z_max_ghost=z_max_ghost,
+                    rgb_path=best_kf_rgb_path,
                 )
                 if dense is not None:
                     dense_planes = extract_camera_planes_from_dense_depth(dense, K)
@@ -2228,13 +2716,15 @@ def refine_extrinsics_from_session(
     *,
     depth_service: object | None = None,
     prefer_server_vio: bool = False,
+    rot_deg: int | float | None = None,
 ) -> dict:
     """High-level entry point to refine and persist LiDAR-Camera extrinsics for a session directory."""
     lidar_pack = load_processed_lidar_for_tof(session_dir)
     T0 = lidar_pack.get("T_lidar_camera")
     flip_h = bool(lidar_pack.get("flip_h", False))
     flip_v = bool(lidar_pack.get("flip_v", False))
-    rot_deg = int(lidar_pack.get("camera_sensor_to_display_rotation_deg", 90))
+    if rot_deg is None:
+        rot_deg = int(lidar_pack.get("camera_sensor_to_display_rotation_deg", 90))
 
     cam_csv = os.path.join(session_dir, "camera_matrix.csv")
     K = load_camera_intrinsics(cam_csv) if os.path.isfile(cam_csv) else np.eye(3, dtype=np.float64)
@@ -2245,6 +2735,7 @@ def refine_extrinsics_from_session(
         if prefer_server_vio
         else ["processed_odometry.csv", "processed_vio.csv", "odometry.csv"]
     )
+    chosen_file = None
     for fname in pose_candidates:
         fpath = os.path.join(session_dir, fname)
         if os.path.isfile(fpath):
@@ -2252,20 +2743,55 @@ def refine_extrinsics_from_session(
                 df = pd.read_csv(fpath)
                 if not df.empty:
                     if "timestamp" in df.columns and "device_timestamp_ns" not in df.columns:
-                        df["device_timestamp_ns"] = df["timestamp"]
+                        ts_num = pd.to_numeric(df["timestamp"], errors="coerce").to_numpy(dtype=np.float64)
+                        finite_ts = ts_num[np.isfinite(ts_num) & (ts_num > 0.0)]
+                        scale_ts = 1e9 if (len(finite_ts) > 0 and float(np.median(finite_ts)) < 1e11) else 1.0
+                        df["device_timestamp_ns"] = np.rint(ts_num * scale_ts).astype(np.int64)
                     pose_df = df
+                    chosen_file = fname
                     break
             except Exception:
                 continue
 
+    if chosen_file == "processed_vio.csv":
+        g_world = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        pose_df.attrs["pose_source"] = "server_vio"
+        pose_df.attrs["camera_frame_convention"] = "sensor_opencv"
+    else:
+        g_world = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+        pose_df.attrs["pose_source"] = "arcore_odometry"
+        pose_df.attrs["camera_frame_convention"] = "sensor_opencv"
+        if not pose_df.empty and all(c in pose_df.columns for c in ("qx", "qy", "qz", "qw")):
+            q_gl = normalize_quaternions_vectorized(
+                pose_df[["qx", "qy", "qz", "qw"]].to_numpy(dtype=np.float64)
+            )
+            q_x_180 = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+            q_cv = (Rotation.from_quat(q_gl) * Rotation.from_quat(q_x_180)).as_quat()
+            if rot_deg is not None and int(round(float(rot_deg))) % 360 != 0:
+                R_dc = _display_to_camera_sensor_rotation(rot_deg)
+                q_sensor = (Rotation.from_quat(q_cv) * Rotation.from_matrix(R_dc)).as_quat()
+            else:
+                q_sensor = q_cv
+            q_norm = normalize_quaternions_vectorized(q_sensor)
+            pose_df["qx"] = q_norm[:, 0]
+            pose_df["qy"] = q_norm[:, 1]
+            pose_df["qz"] = q_norm[:, 2]
+            pose_df["qw"] = q_norm[:, 3]
+
     keyframes: list[dict] = []
     if not pose_df.empty:
-        step = max(1, len(pose_df) // 60)
+        kf_source_df = pose_df
+        if "frame" in pose_df.columns:
+            fr_num = pd.to_numeric(pose_df["frame"], errors="coerce")
+            nonneg = pose_df[fr_num >= 0]
+            if not nonneg.empty:
+                kf_source_df = nonneg
+        step = max(1, len(kf_source_df) // 60)
         rgb_dir = os.path.join(session_dir, "rgb")
-        for _, row in pose_df.iloc[::step].iterrows():
+        for _, row in kf_source_df.iloc[::step].iterrows():
             item = row.to_dict()
             frm = item.get("frame")
-            if frm is not None and np.isfinite(float(frm)):
+            if frm is not None and np.isfinite(float(frm)) and float(frm) >= 0.0:
                 fidx = int(round(float(frm)))
                 for pat in (f"frame_{fidx:06d}.jpg", f"frame_{fidx}.jpg", f"{fidx:06d}.jpg"):
                     cand = os.path.join(rgb_dir, pat)
@@ -2285,6 +2811,7 @@ def refine_extrinsics_from_session(
         flip_v=flip_v,
         rot_deg=rot_deg,
         session_dir=session_dir,
+        g_world=g_world,
     )
 
 

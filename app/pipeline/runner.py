@@ -46,16 +46,19 @@ from app.services.bundle import export_session_bundle
 from app.services.calibration import (
     _display_to_camera_sensor_rotation,
     chain_wahba_to_lidar_camera_extrinsics,
+    compute_lidar_rgb_deskew_rotation,
     extract_lidar_display_metadata,
     load_camera_intrinsics,
     load_processed_lidar_for_tof,
     load_session_extrinsics,
     lookup_lidar_row,
     normalize_quaternions_vectorized,
+    probe_session_image_size,
     project_lidar_frame_to_sparse_tof,
     project_lidar_frame_to_sparse_tof_with_status,
     refine_extrinsics_from_session,
     refine_lidar_camera_extrinsics_em,
+    rematch_lidar_rgb_frames,
     resolve_sensor_to_vio_rotation,
     should_skip_tof_keyframe,
 )
@@ -151,11 +154,148 @@ ODO_FREEZE_POS_EPS_M = 1e-4
 GHOST_TRAJ_MARGIN_M = 1.00
 
 
-def _decimate_keyframes(keyframes: list[dict], max_limit: int = 150) -> list[dict]:
+def _decimate_keyframes(
+    keyframes: list[dict],
+    max_limit: int = 160,
+    session_dir: str | None = None,
+    subsample_method: str = "spherical",
+) -> list[dict]:
     if len(keyframes) <= max_limit:
         return keyframes
-    indices = np.unique(np.linspace(0, len(keyframes) - 1, max_limit, dtype=int))
-    return [keyframes[i] for i in indices]
+    if subsample_method != "spherical" or not all(
+        isinstance(k, dict) and all(f in k for f in ("qx", "qy", "qz", "qw")) for k in keyframes
+    ):
+        indices = np.unique(np.linspace(0, len(keyframes) - 1, max_limit, dtype=int))
+        return [keyframes[i] for i in indices]
+
+    try:
+        from scipy.spatial.transform import Rotation
+        try:
+            from scripts.export_vggt_keyframes import compute_spherical_fov_grid_dims
+        except ImportError:
+            compute_spherical_fov_grid_dims = None
+
+        if session_dir is None and keyframes:
+            rgb_p = keyframes[0].get("_rgb_path")
+            if isinstance(rgb_p, str) and os.path.basename(os.path.dirname(rgb_p)) == "rgb":
+                session_dir = os.path.dirname(os.path.dirname(rgb_p))
+
+        n_yaw, n_pitch, cone_deg = (
+            compute_spherical_fov_grid_dims(session_dir=session_dir)
+            if compute_spherical_fov_grid_dims is not None
+            else (12, 5, 25.0)
+        )
+        cos_cone = float(np.cos(np.radians(cone_deg)))
+        n = len(keyframes)
+        quats = np.array([[float(k["qx"]), float(k["qy"]), float(k["qz"]), float(k["qw"])] for k in keyframes], dtype=np.float64)
+        q_nrm = np.linalg.norm(quats, axis=1, keepdims=True)
+        quats = np.where(q_nrm > 1e-9, quats / np.maximum(q_nrm, 1e-9), np.array([0.0, 0.0, 0.0, 1.0]))
+        rots = Rotation.from_quat(quats)
+        rmats = rots.as_matrix()
+        fwds = rmats @ np.array([0.0, 0.0, 1.0])
+        pos = np.array([[float(k.get("x", 0.0)), float(k.get("y", 0.0)), float(k.get("z", 0.0))] for k in keyframes], dtype=np.float64)
+        ts_s = np.array(
+            [
+                float(k.get("device_timestamp_ns", i * 33_333_333)) * 1e-9
+                if float(k.get("device_timestamp_ns", 0)) > 1e6
+                else float(k.get("timestamp", i / 30.0))
+                for i, k in enumerate(keyframes)
+            ],
+            dtype=np.float64,
+        )
+        omega = np.zeros(n, dtype=np.float64)
+        vel = np.zeros(n, dtype=np.float64)
+        if n >= 2:
+            dt = np.maximum(np.diff(ts_s), 1e-3)
+            vel[:-1] = np.linalg.norm(np.diff(pos, axis=0), axis=1) / dt
+            vel[-1] = vel[-2]
+            omega[:-1] = (rots[:-1].inv() * rots[1:]).magnitude() / dt
+            omega[-1] = omega[-2]
+
+        q_scores = 0.60 * np.exp(-(omega ** 2) / (2.0 * (0.60 ** 2))) + 0.40 * np.exp(-(vel ** 2) / (2.0 * (0.35 ** 2)))
+        yaws = np.degrees(np.arctan2(fwds[:, 1], fwds[:, 0])) % 360.0
+        pitches = np.degrees(np.arctan2(fwds[:, 2], np.hypot(fwds[:, 0], fwds[:, 1])))
+        ybs = (yaws // (360.0 / n_yaw)).astype(int) % n_yaw
+        pbs = np.clip(((np.clip(pitches, -59.99, 59.99) + 60.0) // (120.0 / n_pitch)).astype(int), 0, n_pitch - 1)
+
+        bins_map: dict[tuple[int, int], list[int]] = {}
+        for i in range(n):
+            bins_map.setdefault((int(ybs[i]), int(pbs[i])), []).append(i)
+
+        selected_idx: list[int] = []
+        selected_set: set[int] = set()
+
+        # Seed with VGGT manifest keyframes (and two-tier TSDF keyframes) if present so N_VGGT ⊂ N_TSDF
+        if session_dir is not None:
+            man_p = os.path.join(session_dir, "vggt", "keyframe_manifest.json")
+            if os.path.isfile(man_p):
+                try:
+                    with open(man_p, "r", encoding="utf-8") as mf:
+                        mdata = json.load(mf)
+                    vggt_fset = {int(fr["source_frame_index"]) for fr in mdata.get("frames", []) if "source_frame_index" in fr}
+                    for i, k in enumerate(keyframes):
+                        if k.get("frame") is not None and int(k["frame"]) in vggt_fset and len(selected_idx) < max_limit:
+                            selected_idx.append(i)
+                            selected_set.add(i)
+                    tsdf_fset = {int(fid) for fid in mdata.get("tsdf_source_frame_indices", []) if fid is not None} - vggt_fset
+                    if tsdf_fset and len(selected_idx) < max_limit:
+                        for i, k in enumerate(keyframes):
+                            if i not in selected_set and k.get("frame") is not None and int(k["frame"]) in tsdf_fset and len(selected_idx) < max_limit:
+                                selected_idx.append(i)
+                                selected_set.add(i)
+                except Exception:
+                    pass
+
+        def _eff_score(idx: int) -> float:
+            if not selected_idx:
+                return float(q_scores[idx])
+            f_i = fwds[idx]
+            t_i = ts_s[idx]
+            max_dt = 0.0
+            has_nb = False
+            for j in selected_idx:
+                if abs(idx - j) < 1:
+                    return -1e9
+                if float(np.dot(f_i, fwds[j])) >= cos_cone:
+                    has_nb = True
+                    dt_ij = abs(t_i - ts_s[j])
+                    if dt_ij > max_dt:
+                        max_dt = dt_ij
+            if not has_nb:
+                return float(q_scores[idx])
+            pen = 0.35 * (1.0 - float(np.exp(-(max_dt ** 2) / (2.0 * (20.0 ** 2)))))
+            return float(q_scores[idx]) - pen
+
+        # Cover each spherical bin first (up to 2 per bin for TSDF)
+        for pass_quota in (1, 2):
+            for bkey, idxs in sorted(bins_map.items(), key=lambda kv: -len(kv[1])):
+                if len(selected_idx) >= max_limit:
+                    break
+                cur_in_bin = sum(1 for j in selected_idx if (int(ybs[j]), int(pbs[j])) == bkey)
+                if cur_in_bin >= pass_quota:
+                    continue
+                cands = [i for i in idxs if i not in selected_set]
+                if not cands:
+                    continue
+                best_i = max(cands, key=_eff_score)
+                selected_idx.append(best_i)
+                selected_set.add(best_i)
+
+        # Fill remaining up to max_limit uniformly across remaining indices weighted by score
+        if len(selected_idx) < max_limit:
+            rem = [i for i in range(n) if i not in selected_set]
+            need = max_limit - len(selected_idx)
+            if len(rem) <= need:
+                selected_idx.extend(rem)
+            else:
+                pick = np.unique(np.linspace(0, len(rem) - 1, need, dtype=int))
+                selected_idx.extend([rem[p] for p in pick])
+
+        selected_idx = sorted(selected_idx[:max_limit])
+        return [keyframes[i] for i in selected_idx]
+    except Exception:
+        indices = np.unique(np.linspace(0, len(keyframes) - 1, max_limit, dtype=int))
+        return [keyframes[i] for i in indices]
 
 
 def _geodesic_deg(q0: np.ndarray, q1: np.ndarray) -> float:
@@ -184,16 +324,37 @@ def _yaw_span_deg(yaws: np.ndarray) -> float:
 
 
 def _apply_island_attrs(out: pd.DataFrame, src: pd.DataFrame, extra: dict) -> pd.DataFrame:
-    out.attrs.clear()
-    out.attrs["pose_source"] = src.attrs.get("pose_source", "arcore_odometry")
+    # Preserve all existing attributes from src.attrs (including camera_frame_convention, pose_source)
+    for k, v in src.attrs.items():
+        out.attrs[k] = v
+    if "pose_source" not in out.attrs:
+        out.attrs["pose_source"] = src.attrs.get("pose_source", "arcore_odometry")
     for k, v in extra.items():
         if v is not None:
             out.attrs[k] = v
     return out
 
 
+def _gyro_to_camera_angular_velocity(
+    gx: np.ndarray,
+    gy: np.ndarray,
+    gz: np.ndarray,
+    rot_deg: int | float | None,
+    pose_convention: str,
+) -> np.ndarray:
+    r_deg = int(round(float(rot_deg or 0))) % 360
+    R_dc = _display_to_camera_sensor_rotation(r_deg)
+    w_disp = np.column_stack([gx, gy, gz]).astype(np.float64, copy=False)
+    if pose_convention == "opencv":
+        M_cv = np.diag([1.0, -1.0, -1.0]) @ R_dc
+        return (M_cv @ w_disp.T).T
+    return (R_dc @ w_disp.T).T
+
+
 def select_best_tracking_island(
-    pose_df: pd.DataFrame, imu_df: pd.DataFrame | None = None
+    pose_df: pd.DataFrame,
+    imu_df: pd.DataFrame | None = None,
+    pose_convention: str = "opengl",
 ) -> pd.DataFrame:
     cols = ["device_timestamp_ns", "frame", "x", "y", "z", "qx", "qy", "qz", "qw"]
     req_cols = ["device_timestamp_ns", "x", "y", "z", "qx", "qy", "qz", "qw"]
@@ -220,18 +381,25 @@ def select_best_tracking_island(
     if len(df) < 2:
         reason = "empty" if len(df) == 0 else "too_short"
         detected = 0 if len(df) == 0 else 1
+        if len(df) > 0 and "is_frozen_interpolated" not in df.columns:
+            df["is_frozen_interpolated"] = 0
         return _apply_island_attrs(
             df if len(df) else pose_df.copy(),
             pose_df,
             {"tracking_islands_detected": detected, "discarded_frames": 0, "island_fail_open_reason": reason},
         )
 
-    from scipy.spatial.transform import Rotation
+    from scipy.spatial.transform import Rotation, Slerp
 
     ts = df["device_timestamp_ns"].to_numpy(dtype=np.float64)
-    p = df[["x", "y", "z"]].to_numpy(dtype=np.float64)
-    q = df[["qx", "qy", "qz", "qw"]].to_numpy(dtype=np.float64)
+    p = df[["x", "y", "z"]].to_numpy(dtype=np.float64).copy()
+    q = normalize_quaternions_vectorized(df[["qx", "qy", "qz", "qw"]].to_numpy(dtype=np.float64))
     n = len(df)
+    is_frozen_interpolated = (
+        df["is_frozen_interpolated"].to_numpy(dtype=np.int64).copy()
+        if "is_frozen_interpolated" in df.columns
+        else np.zeros(n, dtype=np.int64)
+    )
 
     has_gyro = False
     ts_imu, gx, gy, gz = None, None, None, None
@@ -250,16 +418,233 @@ def select_best_tracking_island(
             gx = imu_df[gx_col].to_numpy(dtype=np.float64)
             gy = imu_df[gy_col].to_numpy(dtype=np.float64)
             gz = imu_df[gz_col].to_numpy(dtype=np.float64)
+            order_imu = np.argsort(ts_imu, kind="mergesort")
+            ts_imu = ts_imu[order_imu]
+            gx = gx[order_imu]
+            gy = gy[order_imu]
+            gz = gz[order_imu]
             has_gyro = True
+
+    explicit_rot_deg = pose_df.attrs.get("camera_sensor_to_display_rotation_deg")
+    resolved_rot_deg: int | None = None
+    w_cam_all: np.ndarray | None = None
+    if has_gyro:
+        if explicit_rot_deg is not None:
+            resolved_rot_deg = int(round(float(explicit_rot_deg))) % 360
+        else:
+            # Auto-detect display-to-camera rotation (90 vs 0) from active tracking steps
+            w90 = _gyro_to_camera_angular_velocity(gx, gy, gz, 90, pose_convention)
+            w0 = _gyro_to_camera_angular_velocity(gx, gy, gz, 0, pose_convention)
+            errs90: list[float] = []
+            errs0: list[float] = []
+            step_indices = np.arange(1, n, max(1, n // 300))
+            for i in step_indices:
+                dt_s = (ts[i] - ts[i - 1]) / 1e9
+                if dt_s <= 0.0 or dt_s > 0.15:
+                    continue
+                r_step = _geodesic_deg(q[i - 1], q[i])
+                if r_step < 0.5 or r_step > 15.0:
+                    continue
+                i0 = int(np.searchsorted(ts_imu, ts[i - 1], side="left"))
+                i1 = int(np.searchsorted(ts_imu, ts[i], side="right"))
+                if i1 <= i0:
+                    continue
+                dR_odo = Rotation.from_quat(q[i - 1]).inv() * Rotation.from_quat(q[i])
+                dR_90 = Rotation.from_rotvec(np.mean(w90[i0:i1], axis=0) * dt_s)
+                dR_0 = Rotation.from_rotvec(np.mean(w0[i0:i1], axis=0) * dt_s)
+                errs90.append(float(np.degrees(np.linalg.norm((dR_90.inv() * dR_odo).as_rotvec()))))
+                errs0.append(float(np.degrees(np.linalg.norm((dR_0.inv() * dR_odo).as_rotvec()))))
+            if len(errs90) >= 1 and float(np.median(errs90)) + 0.05 < float(np.median(errs0)):
+                resolved_rot_deg = 90
+            elif len(errs0) >= 1:
+                resolved_rot_deg = 0
+        w_cam_all = _gyro_to_camera_angular_velocity(
+            gx, gy, gz, resolved_rot_deg if resolved_rot_deg is not None else 0, pose_convention
+        )
+
+    def _integrate_gyro_interval(
+        t0_ns: float,
+        t1_ns: float,
+        query_ts_ns: np.ndarray | None = None,
+        override_w_cam: np.ndarray | None = None,
+    ) -> tuple[Rotation, list[Rotation]]:
+        w_src = override_w_cam if override_w_cam is not None else w_cam_all
+        if not has_gyro or w_src is None or t1_ns <= t0_ns:
+            n_q = len(query_ts_ns) if query_ts_ns is not None else 0
+            return Rotation.identity(), [Rotation.identity() for _ in range(n_q)]
+        i0 = int(np.searchsorted(ts_imu, t0_ns, side="left"))
+        i1 = int(np.searchsorted(ts_imu, t1_ns, side="right"))
+        if i1 <= i0:
+            n_q = len(query_ts_ns) if query_ts_ns is not None else 0
+            return Rotation.identity(), [Rotation.identity() for _ in range(n_q)]
+        t_sub = ts_imu[i0:i1]
+        w_sub = w_src[i0:i1]
+        k_sub = len(t_sub)
+        edges = np.empty(k_sub + 1, dtype=np.float64)
+        edges[0] = t0_ns
+        if k_sub > 1:
+            edges[1:-1] = 0.5 * (t_sub[:-1] + t_sub[1:])
+        edges[-1] = t1_ns
+        edges = np.clip(edges, t0_ns, t1_ns)
+        dts = np.maximum(0.0, (edges[1:] - edges[:-1]) / 1e9)
+        cum_R = Rotation.identity()
+        q_out: list[Rotation] = []
+        q_idx = 0
+        n_q = len(query_ts_ns) if query_ts_ns is not None else 0
+        for j in range(k_sub):
+            t_edge_start = edges[j]
+            t_edge_end = edges[j + 1]
+            while q_idx < n_q and query_ts_ns[q_idx] <= t_edge_end:
+                dt_part = max(0.0, (query_ts_ns[q_idx] - t_edge_start) / 1e9)
+                q_out.append(cum_R * Rotation.from_rotvec(w_sub[j] * dt_part))
+                q_idx += 1
+            if dts[j] > 0.0:
+                cum_R = cum_R * Rotation.from_rotvec(w_sub[j] * dts[j])
+        while q_idx < n_q:
+            q_out.append(cum_R)
+            q_idx += 1
+        return cum_R, q_out
+
+    # Step 1: Identify consecutive freeze runs [start .. end] where pose is bit-for-bit identical
+    is_step_frozen = np.zeros(n, dtype=bool)
+    for i in range(1, n):
+        if (
+            float(np.linalg.norm(p[i] - p[i - 1])) < 1e-7
+            and _geodesic_deg(q[i - 1], q[i]) < 1e-4
+        ):
+            is_step_frozen[i] = True
+
+    is_pause_resume = np.zeros(n, dtype=bool)
+    freeze_start_for_resume: dict[int, int] = {}
+    idx_scan = 1
+    while idx_scan < n:
+        if not is_step_frozen[idx_scan]:
+            idx_scan += 1
+            continue
+        start = idx_scan - 1
+        end = idx_scan
+        while end + 1 < n and is_step_frozen[end + 1]:
+            end += 1
+        if end == n - 1:
+            # Trailing freeze at end of recording: only mark if IMU had rotational motion
+            if has_gyro and ts_imu is not None and w_cam_all is not None:
+                i0_t = int(np.searchsorted(ts_imu, ts[start], side="left"))
+                i1_t = int(np.searchsorted(ts_imu, ts[end], side="right"))
+                max_w_t = (
+                    float(np.max(np.linalg.norm(w_cam_all[i0_t:i1_t], axis=1)))
+                    if i1_t > i0_t
+                    else 0.0
+                )
+                if max_w_t > 0.08:
+                    is_frozen_interpolated[start + 1 : end + 1] = 1
+            break
+
+        resume = end + 1
+        dur_freeze = max(1e-6, (ts[resume] - ts[start]) / 1e9)
+        dp_freeze = float(np.linalg.norm(p[resume] - p[start]))
+        rot_freeze_deg = _geodesic_deg(q[start], q[resume])
+        query_ts = ts[start + 1 : end + 1]
+
+        if has_gyro:
+            i0_f = int(np.searchsorted(ts_imu, ts[start], side="left"))
+            i1_f = int(np.searchsorted(ts_imu, ts[end], side="right"))
+            max_w_freeze = (
+                float(np.max(np.linalg.norm(w_cam_all[i0_f:i1_f], axis=1)))
+                if (w_cam_all is not None and i1_f > i0_f)
+                else 0.0
+            )
+            if max_w_freeze <= 0.08 and dp_freeze <= 0.05 and rot_freeze_deg <= 3.0:
+                # Genuinely stationary segment (no IMU rotation during [start..end] and no jump at resume)
+                idx_scan = resume + 1
+                continue
+
+            dR_total, dR_steps = _integrate_gyro_interval(ts[start], ts[resume], query_ts)
+            R_start = Rotation.from_quat(q[start])
+            R_resume = Rotation.from_quat(q[resume])
+            R_pred = R_start * dR_total
+            pred_err_deg = float(np.degrees(np.linalg.norm((R_pred.inv() * R_resume).as_rotvec())))
+
+            if resolved_rot_deg is None:
+                # No active steps outside freeze; also check rot_deg=90 candidate
+                w90_cand = _gyro_to_camera_angular_velocity(gx, gy, gz, 90, pose_convention)
+                dR_90, dR_steps_90 = _integrate_gyro_interval(
+                    ts[start], ts[resume], query_ts, override_w_cam=w90_cand
+                )
+                R_pred_90 = R_start * dR_90
+                err_90 = float(np.degrees(np.linalg.norm((R_pred_90.inv() * R_resume).as_rotvec())))
+                if err_90 + 1.0 < pred_err_deg:
+                    pred_err_deg = err_90
+                    R_pred = R_pred_90
+                    dR_total = dR_90
+                    dR_steps = dR_steps_90
+                    resolved_rot_deg = 90
+                    w_cam_all = w90_cand
+
+            e_grav = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            g_pred_cam = R_pred.inv().apply(e_grav)
+            g_res_cam = R_resume.inv().apply(e_grav)
+            grav_err_deg = float(
+                np.degrees(np.arccos(np.clip(float(np.dot(g_pred_cam, g_res_cam)), -1.0, 1.0)))
+            )
+            max_pause_dp = max(0.55, 0.35 * dur_freeze)
+            if pred_err_deg <= 36.0 and grav_err_deg <= 25.0 and dp_freeze <= max_pause_dp:
+                is_pause_resume[resume] = True
+                rotvec_err = (R_pred.inv() * R_resume).as_rotvec()
+                denom_t = max(1.0, ts[resume] - ts[start])
+                for k_idx, k in enumerate(range(start + 1, end + 1)):
+                    alpha = float(np.clip((ts[k] - ts[start]) / denom_t, 0.0, 1.0))
+                    p[k] = (1.0 - alpha) * p[start] + alpha * p[resume]
+                    R_k = R_start * dR_steps[k_idx] * Rotation.from_rotvec(alpha * rotvec_err)
+                    q[k] = R_k.as_quat()
+                is_frozen_interpolated[start + 1 : end + 1] = 1
+            else:
+                freeze_start_for_resume[resume] = start
+        else:
+            if dp_freeze <= 0.05 and rot_freeze_deg <= 3.0 and (end - start >= 3 or dp_freeze < 1e-3):
+                # Genuinely stationary segment without jump at resume
+                idx_scan = resume + 1
+                continue
+            if (
+                dp_freeze <= ODO_JUMP_DIST_M
+                and rot_freeze_deg <= ODO_JUMP_ROT_DEG
+                and (dp_freeze / dur_freeze) <= ODO_JUMP_SPEED_MPS
+            ):
+                is_pause_resume[resume] = True
+                slerp = Slerp([0.0, 1.0], Rotation.from_quat([q[start], q[resume]]))
+                denom_t = max(1.0, ts[resume] - ts[start])
+                for k in range(start + 1, end + 1):
+                    alpha = float(np.clip((ts[k] - ts[start]) / denom_t, 0.0, 1.0))
+                    p[k] = (1.0 - alpha) * p[start] + alpha * p[resume]
+                    q[k] = slerp([alpha])[0].as_quat()
+                is_frozen_interpolated[start + 1 : end + 1] = 1
+            else:
+                freeze_start_for_resume[resume] = start
+
+        idx_scan = resume + 1
+
+    df["x"] = p[:, 0]
+    df["y"] = p[:, 1]
+    df["z"] = p[:, 2]
+    df["qx"] = q[:, 0]
+    df["qy"] = q[:, 1]
+    df["qz"] = q[:, 2]
+    df["qw"] = q[:, 3]
+    df["is_frozen_interpolated"] = is_frozen_interpolated
 
     split_before = np.zeros(n, dtype=bool)
     freeze_run = 1
     for i in range(1, n):
-        dt = (ts[i] - ts[i - 1]) / 1e9
-        dist = float(np.linalg.norm(p[i] - p[i - 1]))
-        rot_deg = _geodesic_deg(q[i - 1], q[i])
+        if is_frozen_interpolated[i] == 1 or is_pause_resume[i]:
+            freeze_run = 1
+            continue
 
         if has_gyro:
+            if i in freeze_start_for_resume:
+                split_before[i] = True
+                continue
+            dt = (ts[i] - ts[i - 1]) / 1e9
+            dist = float(np.linalg.norm(p[i] - p[i - 1]))
+            rot_deg_step = _geodesic_deg(q[i - 1], q[i])
             m = (ts_imu >= ts[i - 1]) & (ts_imu <= ts[i])
             if np.any(m):
                 w_norm = np.sqrt(gx[m] ** 2 + gy[m] ** 2 + gz[m] ** 2)
@@ -267,15 +652,18 @@ def select_best_tracking_island(
             else:
                 gyro_rot_deg = 0.0
 
-            rot_diff = abs(rot_deg - gyro_rot_deg)
-            is_true_jump = (rot_diff > 20.0 and rot_deg > 25.0) or (dist > 0.80 and dt <= 0.15)
+            rot_diff = abs(rot_deg_step - gyro_rot_deg)
+            is_true_jump = (rot_diff > 20.0 and rot_deg_step > 25.0) or (dist > 0.80 and dt <= 0.15)
             if is_true_jump:
                 split_before[i] = True
         else:
+            dt = (ts[i] - ts[i - 1]) / 1e9
+            dist = float(np.linalg.norm(p[i] - p[i - 1]))
+            rot_deg_step = _geodesic_deg(q[i - 1], q[i])
             speed_hit = dt > 0.0 and (dist / dt) > ODO_JUMP_SPEED_MPS
             dist_hit = dist > ODO_JUMP_DIST_M and dt <= ODO_JUMP_DT_S
-            rot_hit = rot_deg > ODO_JUMP_ROT_DEG
-            if float(np.linalg.norm(p[i] - p[i - 1])) < ODO_FREEZE_POS_EPS_M:
+            rot_hit = rot_deg_step > ODO_JUMP_ROT_DEG
+            if dist < ODO_FREEZE_POS_EPS_M:
                 freeze_run += 1
             else:
                 freeze_hit = freeze_run >= ODO_FREEZE_FRAMES and (speed_hit or dist_hit or rot_hit)
@@ -303,30 +691,39 @@ def select_best_tracking_island(
                 prev_s, prev_e = valid_islands[k - 1]
                 next_s, next_e = valid_islands[k]
 
-                t_prev = ts[prev_e]
+                freeze_s = freeze_start_for_resume.get(next_s)
+                t_prev = ts[freeze_s] if freeze_s is not None else ts[prev_e]
                 t_next = ts[next_s]
-                dt_gap = (t_next - t_prev) / 1e9
+                if freeze_s is not None:
+                    is_frozen_interpolated[freeze_s + 1 : next_s] = 1
 
-                m = (ts_imu >= t_prev) & (ts_imu <= t_next)
-                if np.any(m):
-                    omega = np.array([gx[m].mean(), gy[m].mean(), gz[m].mean()]) * dt_gap
-                    delta_R = Rotation.from_rotvec(omega)
-                else:
-                    delta_R = Rotation.identity()
+                delta_R, _ = _integrate_gyro_interval(t_prev, t_next)
 
                 R_target = stitched_q[-1] * delta_R
                 R_jump = Rotation.from_quat(q[next_s])
                 R_corr = R_target * R_jump.inv()
+
+                # Extract ONLY 1-DoF Yaw rotation around gravity axis to preserve gravity alignment
+                # In both OpenGL (+Y UP) and OpenCV (-Y UP), the vertical/gravity axis is the Y axis.
+                q_corr = R_corr.as_quat()
+                q_twist_unnorm = np.array([0.0, q_corr[1], 0.0, q_corr[3]], dtype=np.float64)
+                twist_norm = np.linalg.norm(q_twist_unnorm)
+                if twist_norm > 1e-12:
+                    q_twist = q_twist_unnorm / twist_norm
+                    R_yaw_corr = Rotation.from_quat(q_twist)
+                else:
+                    R_yaw_corr = Rotation.identity()
 
                 p_anchor = stitched_p[-1]
                 p_jump = p[next_s]
 
                 for i in range(next_s, next_e + 1):
                     p_rel = p[i] - p_jump
-                    stitched_p.append(p_anchor + R_corr.apply(p_rel))
-                    stitched_q.append(R_corr * Rotation.from_quat(q[i]))
+                    stitched_p.append(p_anchor + R_yaw_corr.apply(p_rel))
+                    stitched_q.append(R_yaw_corr * Rotation.from_quat(q[i]))
                     stitched_indices.append(i)
 
+            df["is_frozen_interpolated"] = is_frozen_interpolated
             stitched_df = df.iloc[stitched_indices].copy().reset_index(drop=True)
             stitched_p_arr = np.array(stitched_p)
             stitched_q_arr = np.array([q_obj.as_quat() for q_obj in stitched_q])
@@ -345,17 +742,24 @@ def select_best_tracking_island(
             span = _yaw_span_deg(yaws)
             ratio = span / 360.0
             fr = (
-                stitched_df["frame"].to_numpy()
+                pd.to_numeric(stitched_df["frame"], errors="coerce").to_numpy(dtype=np.float64)
                 if "frame" in stitched_df.columns
-                else np.array([0, len(stitched_df) - 1])
+                else np.array([0.0, float(len(stitched_df) - 1)])
+            )
+            valid_fr = fr[np.isfinite(fr) & (fr >= 0.0)]
+            sel_frames = (
+                (int(valid_fr[0]), int(valid_fr[-1]))
+                if len(valid_fr) > 0
+                else (int(fr[0]), int(fr[-1]))
             )
             extra = {
                 "tracking_islands_detected": len(islands),
-                "selected_island_frames": (int(fr[0]), int(fr[-1])),
+                "selected_island_frames": sel_frames,
                 "discarded_frames": int(n - len(stitched_df)),
                 "selected_island_score": float(len(stitched_df) * ratio),
                 "selected_island_yaw_coverage": float(ratio),
                 "stitched_islands": True,
+                "frozen_interpolated_frames": int(np.sum(stitched_df["is_frozen_interpolated"].to_numpy() != 0)),
             }
             return _apply_island_attrs(stitched_df, pose_df, extra)
 
@@ -384,13 +788,24 @@ def select_best_tracking_island(
             },
         )
     out = df.iloc[s : e + 1].copy()
-    fr = out["frame"].to_numpy() if "frame" in out.columns else np.array([s, e])
+    fr = (
+        pd.to_numeric(out["frame"], errors="coerce").to_numpy(dtype=np.float64)
+        if "frame" in out.columns
+        else np.array([float(s), float(e)])
+    )
+    valid_fr = fr[np.isfinite(fr) & (fr >= 0.0)]
+    sel_frames = (
+        (int(valid_fr[0]), int(valid_fr[-1]))
+        if len(valid_fr) > 0
+        else (int(fr[0]), int(fr[-1]))
+    )
     extra = {
         "tracking_islands_detected": n_islands,
-        "selected_island_frames": (int(fr[0]), int(fr[-1])),
+        "selected_island_frames": sel_frames,
         "discarded_frames": int(n - (e - s + 1)),
         "selected_island_score": float(_score),
         "selected_island_yaw_coverage": float(ratio),
+        "frozen_interpolated_frames": int(np.sum(out["is_frozen_interpolated"].to_numpy() != 0)),
     }
     return _apply_island_attrs(out, pose_df, extra)
 
@@ -401,7 +816,12 @@ def resolve_keyframe_rgb_path(session_dir: str, kf: dict) -> str | None:
     if ts is not None:
         candidates.append(os.path.join(session_dir, "rgb", f"frame_{ts}.jpg"))
     if kf.get("frame") is not None:
-        candidates.append(os.path.join(session_dir, "rgb", f"{int(kf['frame']):06d}.jpg"))
+        try:
+            f_val = int(kf["frame"])
+            if f_val >= 0:
+                candidates.append(os.path.join(session_dir, "rgb", f"{f_val:06d}.jpg"))
+        except (ValueError, TypeError):
+            pass
     for path in candidates:
         if os.path.isfile(path):
             return path
@@ -422,52 +842,9 @@ def load_pose_table_for_tsdf(
         if not vio_df.empty and vio_required.issubset(set(vio_df.columns)):
             vio_cols = list(vio_required)
             if np.all(np.isfinite(vio_df[vio_cols].to_numpy(dtype=np.float64))):
-                use_vio = True
-                if os.path.isfile(odo_path) and os.path.getsize(odo_path) > 0:
-                    try:
-                        odo_raw = pd.read_csv(odo_path)
-                        if (
-                            not odo_raw.empty
-                            and {"x", "y", "z", "qx", "qy", "qz", "qw"}.issubset(set(odo_raw.columns))
-                            and len(odo_raw) > 1
-                            and len(vio_df) > 1
-                        ):
-                            from scipy.spatial.transform import Rotation
-
-                            p_v0 = vio_df[["x", "y", "z"]].iloc[0].to_numpy(dtype=np.float64)
-                            p_v1 = vio_df[["x", "y", "z"]].iloc[-1].to_numpy(dtype=np.float64)
-                            vio_drift_m = float(np.linalg.norm(p_v1 - p_v0))
-
-                            q_v0 = vio_df[["qx", "qy", "qz", "qw"]].iloc[0].to_numpy(dtype=np.float64)
-                            q_v1 = vio_df[["qx", "qy", "qz", "qw"]].iloc[-1].to_numpy(dtype=np.float64)
-                            r_v_rel = Rotation.from_quat(q_v0).inv() * Rotation.from_quat(q_v1)
-                            vio_yaw_deg = float(abs(np.degrees(r_v_rel.as_euler("zyx")[0])))
-
-                            p_o0 = odo_raw[["x", "y", "z"]].iloc[0].to_numpy(dtype=np.float64)
-                            p_o1 = odo_raw[["x", "y", "z"]].iloc[-1].to_numpy(dtype=np.float64)
-                            odo_drift_m = float(np.linalg.norm(p_o1 - p_o0))
-
-                            odo_xyz = odo_raw[["x", "y", "z"]].to_numpy(dtype=np.float64)
-                            diffs = np.linalg.norm(np.diff(odo_xyz, axis=0), axis=1)
-                            max_odo_jump = float(np.max(diffs)) if len(diffs) > 0 else 0.0
-                            if max_odo_jump > 0.50:
-                                odo_drift_m = 999.0
-
-                            if (vio_drift_m > 0.30 or vio_yaw_deg > 15.0) and odo_drift_m < 0.15:
-                                logger.warning(
-                                    "VIO sanity gate triggered: vio_drift=%.3fm, vio_yaw_drift=%.1fdeg vs odo_drift=%.3fm. Fallback to ARCore odometry for TSDF.",
-                                    vio_drift_m,
-                                    vio_yaw_deg,
-                                    odo_drift_m,
-                                )
-                                use_vio = False
-                                apply_island_filter = False
-                    except Exception as gate_err:
-                        logger.warning("Error evaluating VIO sanity gate: %s", gate_err)
-
-                if use_vio:
-                    vio_df.attrs["pose_source"] = "server_vio"
-                    return vio_df
+                vio_df.attrs["pose_source"] = "server_vio"
+                vio_df.attrs["camera_frame_convention"] = "sensor_opencv"
+                return vio_df
     if not os.path.isfile(odo_path) or os.path.getsize(odo_path) == 0:
         return pd.DataFrame()
     odo_df = pd.read_csv(odo_path)
@@ -476,13 +853,46 @@ def load_pose_table_for_tsdf(
         return pd.DataFrame()
     from scipy.spatial.transform import Rotation
 
-    ts_ns = np.rint(odo_df["timestamp"].to_numpy(dtype=np.float64) * 1e9).astype(np.int64)
+    ts_raw_odo = odo_df["timestamp"].to_numpy(dtype=np.float64)
+    dt_odo = float(np.nanmedian(np.abs(np.diff(ts_raw_odo)))) if len(ts_raw_odo) >= 2 else 0.0
+    scale = 1.0 if (dt_odo >= 1e5 or float(np.nanmedian(np.abs(ts_raw_odo))) >= 1e11) else 1e9
+    ts_ns = np.rint(ts_raw_odo * scale).astype(np.int64)
     q_gl = normalize_quaternions_vectorized(
         odo_df[["qx", "qy", "qz", "qw"]].to_numpy(dtype=np.float64)
     )
     q_x_180 = np.array([1.0, 0.0, 0.0, 0.0])
     q_cv = (Rotation.from_quat(q_gl) * Rotation.from_quat(q_x_180)).as_quat()
-    q_cv = normalize_quaternions_vectorized(q_cv)
+
+    # Determine rot_deg to normalize to sensor_opencv if rot_deg != 0
+    rot_deg = 0
+    manifest_path = os.path.join(session_dir, "manifest.json")
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as mf:
+                mdata = json.load(mf)
+            _, _, r_deg = extract_lidar_display_metadata(mdata)
+            if r_deg is not None:
+                rot_deg = r_deg
+        except Exception:
+            pass
+
+    if rot_deg and int(round(float(rot_deg))) % 360 != 0:
+        w_probe, h_probe = probe_session_image_size(session_dir=session_dir)
+        R_dc = resolve_sensor_to_vio_rotation(
+            rot_deg,
+            img_w=w_probe,
+            img_h=h_probe,
+            R_wc_all=Rotation.from_quat(q_cv).as_matrix(),
+            g_world=np.array([0.0, -1.0, 0.0], dtype=np.float64),
+        )
+        if not np.allclose(R_dc, np.eye(3)):
+            q_sensor = (Rotation.from_quat(q_cv) * Rotation.from_matrix(R_dc)).as_quat()
+        else:
+            q_sensor = q_cv
+    else:
+        q_sensor = q_cv
+
+    q_sensor = normalize_quaternions_vectorized(q_sensor)
     out = pd.DataFrame(
         {
             "device_timestamp_ns": ts_ns,
@@ -490,13 +900,15 @@ def load_pose_table_for_tsdf(
             "x": odo_df["x"].to_numpy(dtype=np.float64),
             "y": odo_df["y"].to_numpy(dtype=np.float64),
             "z": odo_df["z"].to_numpy(dtype=np.float64),
-            "qx": q_cv[:, 0],
-            "qy": q_cv[:, 1],
-            "qz": q_cv[:, 2],
-            "qw": q_cv[:, 3],
+            "qx": q_sensor[:, 0],
+            "qy": q_sensor[:, 1],
+            "qz": q_sensor[:, 2],
+            "qw": q_sensor[:, 3],
         }
     )
     out.attrs["pose_source"] = "arcore_odometry"
+    out.attrs["camera_frame_convention"] = "sensor_opencv"
+    out.attrs["camera_sensor_to_display_rotation_deg"] = int(round(float(rot_deg or 0)))
     if apply_island_filter:
         imu_df = None
         for cand in ["phone_imu.csv", "processed_phone_imu.csv"]:
@@ -507,7 +919,8 @@ def load_pose_table_for_tsdf(
                     break
                 except Exception:
                     pass
-        out = select_best_tracking_island(out, imu_df=imu_df)
+        out = select_best_tracking_island(out, imu_df=imu_df, pose_convention="opencv")
+    out.attrs["camera_frame_convention"] = "sensor_opencv"
     return out
 
 
@@ -519,10 +932,15 @@ def _attach_odometry_frame_indices(keyframes: list[dict], session_dir: str) -> N
     if odo.empty or "timestamp" not in odo.columns or "frame" not in odo.columns:
         return
     odo = odo.dropna(subset=["timestamp", "frame"])
+    odo_fr_num = pd.to_numeric(odo["frame"], errors="coerce")
+    odo = odo[odo_fr_num >= 0]
     if odo.empty:
         return
-    odo_ns = np.rint(odo["timestamp"].to_numpy(dtype=np.float64) * 1e9)
-    odo_frames = odo["frame"].to_numpy()
+    ts_raw = odo["timestamp"].to_numpy(dtype=np.float64)
+    dt_odo = float(np.nanmedian(np.abs(np.diff(ts_raw)))) if len(ts_raw) >= 2 else 0.0
+    scale = 1.0 if (dt_odo >= 1e5 or float(np.nanmedian(np.abs(ts_raw))) >= 1e11) else 1e9
+    odo_ns = np.rint(ts_raw * float(scale))
+    odo_frames = pd.to_numeric(odo["frame"], errors="coerce").to_numpy(dtype=np.int64)
     for kf in keyframes:
         ts = kf.get("device_timestamp_ns")
         if ts is None:
@@ -673,7 +1091,7 @@ def run_sensor_ingestion(session_dir: str) -> dict[str, Any]:
         if len(imu_data) > 0 and "mcu_timestamp_ns" in imu_data.columns:
             imu_data["mcu_timestamp_ns"] = reconstruct_mcu_rollover(imu_data["mcu_timestamp_ns"])
             imu_scale_mcu = detect_time_unit(imu_data["mcu_timestamp_ns"], is_mcu=True)
-            imu_data["mcu_timestamp_ns"] = imu_data["mcu_timestamp_ns"].astype(np.int64) * int(imu_scale_mcu)
+            imu_data["mcu_timestamp_ns"] = np.round(imu_data["mcu_timestamp_ns"].to_numpy(dtype=np.float64) * imu_scale_mcu).astype(np.int64)
             imu_data = reorder_bounded_dejitter_buffer(imu_data, ts_col="mcu_timestamp_ns", window_ns=100_000_000)
     else:
         imu_data = pd.DataFrame()
@@ -692,10 +1110,10 @@ def run_sensor_ingestion(session_dir: str) -> dict[str, Any]:
         if len(lidar_data) > 0 and "mcu_timestamp_ns" in lidar_data.columns:
             lidar_data["mcu_timestamp_ns"] = reconstruct_mcu_rollover(lidar_data["mcu_timestamp_ns"])
             lidar_scale_mcu = detect_time_unit(lidar_data["mcu_timestamp_ns"], is_mcu=True)
-            lidar_data["mcu_timestamp_ns"] = lidar_data["mcu_timestamp_ns"].astype(np.int64) * int(lidar_scale_mcu)
+            lidar_data["mcu_timestamp_ns"] = np.round(lidar_data["mcu_timestamp_ns"].to_numpy(dtype=np.float64) * lidar_scale_mcu).astype(np.int64)
         if len(lidar_data) > 0 and "device_timestamp_ns" in lidar_data.columns:
             lidar_scale_dev = detect_time_unit(lidar_data["device_timestamp_ns"], is_mcu=False)
-            lidar_data["device_timestamp_ns"] = lidar_data["device_timestamp_ns"].astype(np.int64) * int(lidar_scale_dev)
+            lidar_data["device_timestamp_ns"] = np.round(lidar_data["device_timestamp_ns"].to_numpy(dtype=np.float64) * lidar_scale_dev).astype(np.int64)
         if len(lidar_data) > 0 and "mcu_timestamp_ns" in lidar_data.columns:
             lidar_data["_orig_idx"] = np.arange(len(lidar_data), dtype=np.int64)
             lidar_data = lidar_data.sort_values(by=["mcu_timestamp_ns", "_orig_idx"], kind="mergesort").reset_index(drop=True)
@@ -765,13 +1183,15 @@ def run_sensor_ingestion(session_dir: str) -> dict[str, Any]:
     clock_slope_s = 1.0
     clock_offset_ns = 0
     if "device_timestamp_ns" in lidar_data.columns and len(imu_data) > 0 and "mcu_timestamp_ns" in imu_data.columns:
-        hub_and, s, c_rel, bridge = map_hub_android_from_lidar(
+        hub_and, lidar_and, s, c_rel, bridge = map_hub_android_from_lidar(
             imu_data["mcu_timestamp_ns"].to_numpy(),
             lidar_data["mcu_timestamp_ns"].to_numpy(),
             lidar_data["device_timestamp_ns"].to_numpy(),
+            return_lidar_android=True,
         )
         if bridge == "lidar_mcu_android":
             imu_data["device_timestamp_ns"] = hub_and
+            lidar_data["device_timestamp_ns"] = lidar_and
             clock_bridge = "lidar_mcu_android"
             clock_slope_s = float(s)
             clock_offset_ns = int(c_rel)
@@ -895,20 +1315,22 @@ def run_sensor_ingestion(session_dir: str) -> dict[str, Any]:
             if phone_median_dt > 0 and phone_jitter > 0.05 * phone_median_dt:
                 t0 = t_phone[0]
                 t1 = t_phone[-1]
-                target_uniform = np.arange(t0, t1, 10_000_000, dtype=np.int64)
+                target_dt_ns = int(np.clip(round(phone_median_dt), 2_000_000, 10_000_000))
+                target_uniform = np.arange(t0, t1, target_dt_ns, dtype=np.int64)
                 timeline_rel = (t_phone - t0).astype(np.float64)
                 target_rel = (target_uniform - t0).astype(np.float64)
 
-                fs = 1e9 / phone_median_dt
                 accel_cols = ["ax", "ay", "az"]
                 gyro_cols = ["gx", "gy", "gz"]
                 accel_data = phone_data[accel_cols].to_numpy(dtype=np.float64)
                 gyro_data = phone_data[gyro_cols].to_numpy(dtype=np.float64)
-                if fs > 100.0:
-                    accel_data = apply_butterworth_lowpass(accel_data, fs, timeline_rel)
-                    gyro_data = apply_butterworth_lowpass(gyro_data, fs, timeline_rel)
+
                 resampled_accel = pchip_resample(timeline_rel, accel_data, target_rel)
                 resampled_gyro = pchip_resample(timeline_rel, gyro_data, target_rel)
+
+                fs = 1e9 / target_dt_ns
+                resampled_accel = apply_butterworth_lowpass(resampled_accel, fs, target_rel)
+                resampled_gyro = apply_butterworth_lowpass(resampled_gyro, fs, target_rel)
 
                 processed_phone = pd.DataFrame({
                     "device_timestamp_ns": target_uniform,
@@ -960,20 +1382,42 @@ def run_sensor_ingestion(session_dir: str) -> dict[str, Any]:
                 hub_R_diag["hub_gyro_lag_ms"] = float(wahba["lag_ms"])
             if wahba["accepted"] and wahba["R"] is not None:
                 hub_R_accepted_matrix = np.asarray(wahba["R"], dtype=np.float64)
-                lag_ns = int(wahba.get("lag_ns", 0))
-                if lag_ns != 0 and "device_timestamp_ns" in processed_imu.columns:
-                    processed_imu["device_timestamp_ns"] = (
-                        processed_imu["device_timestamp_ns"].to_numpy(dtype=np.int64) - lag_ns
-                    )
-                    processed_imu.to_csv(os.path.join(session_dir, "processed_imu.csv"), index=False)
+            lag_ns = int(wahba.get("lag_ns", 0))
+            if lag_ns != 0 and "device_timestamp_ns" in processed_imu.columns:
+                imu_pre_shift_median = float(
+                    np.median(processed_imu["device_timestamp_ns"].to_numpy(dtype=np.float64))
+                )
+                processed_imu["device_timestamp_ns"] = (
+                    processed_imu["device_timestamp_ns"].to_numpy(dtype=np.int64) - lag_ns
+                )
+                processed_imu.to_csv(os.path.join(session_dir, "processed_imu.csv"), index=False)
+                if (
+                    lidar_data is not None
+                    and len(lidar_data) > 0
+                    and "device_timestamp_ns" in lidar_data.columns
+                ):
+                    lidar_dev_ts = lidar_data["device_timestamp_ns"].to_numpy(dtype=np.float64)
+                    if len(lidar_dev_ts) > 0 and abs(float(np.median(lidar_dev_ts)) - imu_pre_shift_median) < 60e9:
+                        lidar_data["device_timestamp_ns"] = (
+                            lidar_data["device_timestamp_ns"].to_numpy(dtype=np.int64) - lag_ns
+                        )
         except Exception as exc:
             logger.warning("Hub IMU Wahba estimation failed with %s: %s", type(exc).__name__, exc)
 
     if len(odo_data) > 0:
-        odo_stitched = select_best_tracking_island(odo_data, imu_df=processed_phone)
+        if rot_deg is not None:
+            odo_data.attrs["camera_sensor_to_display_rotation_deg"] = int(round(float(rot_deg)))
+        odo_stitched = select_best_tracking_island(odo_data, imu_df=processed_phone, pose_convention="opengl")
         odo_stitched.to_csv(os.path.join(session_dir, "processed_odometry.csv"), index=False)
     else:
         odo_stitched = None
+
+    if lidar_data is not None and len(lidar_data) > 0:
+        lidar_data = rematch_lidar_rgb_frames(
+            lidar_data,
+            odo_df=odo_stitched if odo_stitched is not None else odo_data,
+            session_dir=session_dir,
+        )
 
     lidar_cols = ["device_timestamp_ns", "mcu_timestamp_ns"]
     lidar_cols += [f"distance_{i}" for i in range(64)]
@@ -1091,13 +1535,6 @@ def run_3d_reconstruction(
 
     recon_timings: dict[str, float] = {}
 
-    t_pre_cal = time.time()
-    try:
-        refine_extrinsics_from_session(session_dir, prefer_server_vio=False)
-    except Exception:
-        logger.debug("Pre-VIO extrinsic refinement skipped", exc_info=True)
-    recon_timings["pre_vio_cal_sec"] = round(time.time() - t_pre_cal, 3)
-
     t_vio = time.time()
     if enable_server_vio and not (
         os.getenv("SKIP_EXISTING_VIO", "0") == "1"
@@ -1152,7 +1589,24 @@ def run_3d_reconstruction(
             item["_rgb_path"] = path
             resolved.append(item)
 
-    keyframes = _decimate_keyframes(resolved, max_limit=150)
+    if is_vggt_enabled():
+        man_p = os.path.join(session_dir, "vggt", "keyframe_manifest.json")
+        if not os.path.isfile(man_p) or os.getenv("FORCE_VGGT", "0") == "1":
+            try:
+                from scripts.export_vggt_keyframes import export_vggt_keyframes
+
+                export_vggt_keyframes(
+                    session_dir,
+                    subsample_method="spherical",
+                    prefer_server_vio=enable_server_vio,
+                    max_n=72,
+                )
+            except Exception:
+                pass
+
+    keyframes = _decimate_keyframes(
+        resolved, max_limit=150, session_dir=session_dir, subsample_method="uniform"
+    )
     recon_timings["keyframe_selection_sec"] = round(time.time() - t_kf, 3)
 
     manifest_data = None
@@ -1264,14 +1718,19 @@ def run_3d_reconstruction(
                         )
                     except Exception:
                         pass
-            w_probe = int(round(2.0 * float(k[0, 2]))) if k is not None and k.shape == (3, 3) and k[0, 2] > 10 else None
-            h_probe = int(round(2.0 * float(k[1, 2]))) if k is not None and k.shape == (3, 3) and k[1, 2] > 10 else None
+            w_probe, h_probe = probe_session_image_size(
+                session_dir=session_dir,
+                rgb_path=keyframes[0].get("_rgb_path") if len(keyframes) else None,
+                K=k,
+            )
             r_dc_resolved = resolve_sensor_to_vio_rotation(
                 rot_deg,
                 img_w=w_probe,
                 img_h=h_probe,
                 R_wc_all=np.asarray(R_wc_list) if len(R_wc_list) else None,
                 g_world=g_world,
+                pose_df=pose_df,
+                camera_frame_convention=pose_df.attrs.get("camera_frame_convention"),
             )
             if not np.allclose(r_dc_resolved, np.eye(3)):
                 session_R_dc = r_dc_resolved
@@ -1292,6 +1751,12 @@ def run_3d_reconstruction(
                 dist_cols = [f"distance_{i}" for i in range(64)]
                 dists = row[dist_cols].to_numpy(dtype=np.float64)
                 h, w = rgb.shape[:2]
+                R_deskew = compute_lidar_rgb_deskew_rotation(
+                    row.get("device_timestamp_ns"),
+                    kf.get("device_timestamp_ns"),
+                    pose_df=pose_df,
+                    session_R_dc=session_R_dc,
+                )
                 sparse_tof = project_lidar_frame_to_sparse_tof(
                     dists,
                     lidar_pack["rays"],
@@ -1302,6 +1767,7 @@ def run_3d_reconstruction(
                     flip_h=flip_h,
                     flip_v=flip_v,
                     rot_deg=rot_deg,
+                    R_deskew=R_deskew,
                 )
                 stat_cols = [f"status_{i}" for i in range(64)]
                 if all(c in row.index for c in stat_cols):
@@ -1317,6 +1783,7 @@ def run_3d_reconstruction(
                         flip_h=flip_h,
                         flip_v=flip_v,
                         rot_deg=rot_deg,
+                        R_deskew=R_deskew,
                     )
             if should_skip_tof_keyframe(has_lidar, sparse_tof):
                 return None
@@ -1335,6 +1802,12 @@ def run_3d_reconstruction(
                 if item is None:
                     continue
                 kf, rgb, sparse_tof, sparse_status, R_wc, g_cam = item
+                kf_rgb_path = (
+                    kf.get("_rgb_path")
+                    or kf.get("rgb_path")
+                    or kf.get("image_path")
+                    or kf.get("filename")
+                )
                 try:
                     dense_depth = depth_service.run_depthor_plus(
                         rgb,
@@ -1343,10 +1816,17 @@ def run_3d_reconstruction(
                         g_cam=g_cam,
                         z_max_ghost=z_max_ghost,
                         sparse_status=sparse_status,
+                        rgb_path=kf_rgb_path,
+                        apply_bilateral_scale_field=False,
                     )
                 except TypeError:
                     dense_depth = depth_service.run_depthor_plus(
-                        rgb, sparse_tof, k, g_cam=g_cam, z_max_ghost=z_max_ghost
+                        rgb,
+                        sparse_tof,
+                        k,
+                        g_cam=g_cam,
+                        z_max_ghost=z_max_ghost,
+                        rgb_path=kf_rgb_path,
                     )
                 if np.count_nonzero(dense_depth > 0) == 0:
                     continue
@@ -1398,16 +1878,6 @@ def run_3d_reconstruction(
             raise ValueError("TSDF produced empty mesh.")
 
         reconstruction_service.export_mesh_artifacts(mesh, session_dir)
-        glb_disk_path = os.path.join(session_dir, "reconstructed.glb")
-        if os.path.isfile(glb_disk_path):
-            try:
-                import open3d as o3d
-
-                glb_mesh = o3d.io.read_triangle_mesh(glb_disk_path)
-                if len(glb_mesh.vertices) > 0 and len(glb_mesh.triangles) > 0:
-                    mesh = glb_mesh
-            except Exception:
-                pass
         recon_timings["tsdf_integration_sec"] = round(time.time() - t_tsdf, 3)
 
         vggt_prior = None
@@ -1424,14 +1894,23 @@ def run_3d_reconstruction(
                 )
             else:
                 err_msg = vggt_res.get("error", "unknown error")
-                logger.warning(
-                    "Parallel VGGT inference failed (%s); falling back to reconstruction without VGGT prior",
-                    err_msg,
-                )
-                from app.services.vggt_prior import VggtPriorResult
+                disk_result = load_vggt_prior(session_dir)
+                if disk_result.prior is not None:
+                    vggt_result = disk_result
+                    vggt_prior = disk_result.prior
+                    logger.info(
+                        "Parallel VGGT worker reported (%s), but valid VGGT artifacts were already on disk; using disk VGGT prior.",
+                        err_msg,
+                    )
+                else:
+                    logger.warning(
+                        "Parallel VGGT inference failed (%s); falling back to reconstruction without VGGT prior",
+                        err_msg,
+                    )
+                    from app.services.vggt_prior import VggtPriorResult
 
-                vggt_result = VggtPriorResult(prior=None, skip_reason=f"parallel_vggt_failed: {err_msg}")
-                vggt_prior = None
+                    vggt_result = VggtPriorResult(prior=None, skip_reason=f"parallel_vggt_failed: {err_msg}")
+                    vggt_prior = None
         elif enable_vggt:
             t_vseq = time.time()
             try:
@@ -1473,9 +1952,21 @@ def run_3d_reconstruction(
 
     t_exp = time.time()
     attach_vggt_diagnostics(layout, vggt_result)
+    if keyframes:
+        try:
+            from app.services.portals_detector import detect_portals_from_session, merge_layout_portals
+            detected_3d = detect_portals_from_session(
+                session_dir, layout=layout, keyframes=keyframes, camera_k=k
+            )
+            if detected_3d:
+                layout["portals"] = merge_layout_portals(
+                    layout.get("portals", []), detected_3d, walls=layout.get("walls", [])
+                )
+        except Exception as exc:
+            logger.warning("Portals detection failed in runner: %s", exc)
     export_artifacts(layout, session_dir)
     reconstruction_service.export_whiteflat_ply(whiteflat_pcd, session_dir)
-    reconstruction_service.export_visual_artifacts(
+    reconstruction_service.export_canonical_visual_cloud(
         mesh, layout, gravity_vector, session_dir, vggt_prior=vggt_result.prior
     )
 

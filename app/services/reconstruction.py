@@ -9,7 +9,7 @@ from app.services.glb_export import write_triangle_mesh_glb
 
 logger = logging.getLogger(__name__)
 
-VOXEL_LENGTH = 0.04
+VOXEL_LENGTH = 0.02
 SDF_TRUNC = 0.12
 DEPTH_TRUNC = 8.01
 RADIAL_GAMMA = 1.0
@@ -46,6 +46,92 @@ def _decimate_if_needed(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.Triangl
     return mesh
 
 
+def create_tsdf_grid(
+    poses: list[np.ndarray],
+    depths: list[np.ndarray] | None = None,
+    intrinsics: np.ndarray | None = None,
+    bounds_min: np.ndarray | None = None,
+    bounds_max: np.ndarray | None = None,
+    padding: float = 0.4,
+    voxel_length: float = VOXEL_LENGTH,
+    sdf_trunc: float = SDF_TRUNC,
+    max_grid_res: int = 384,
+) -> o3d.pipelines.integration.UniformTSDFVolume:
+    """Create a tight UniformTSDFVolume bounded by observed depth / trajectory,
+    preserving ~1.5-2.5cm voxel resolution without arbitrary 5m inflation."""
+    if bounds_min is not None and bounds_max is not None:
+        p_min = np.asarray(bounds_min, dtype=float) - padding
+        p_max = np.asarray(bounds_max, dtype=float) + padding
+    else:
+        sample_pts = []
+        if (
+            depths is not None
+            and intrinsics is not None
+            and len(depths) > 0
+            and len(poses) == len(depths)
+        ):
+            fx = float(intrinsics[0, 0])
+            fy = float(intrinsics[1, 1])
+            cx = float(intrinsics[0, 2])
+            cy = float(intrinsics[1, 2])
+            n_frames = len(depths)
+            stride_f = max(1, n_frames // 20)
+            for f_idx in range(0, n_frames, stride_f):
+                d_img = depths[f_idx]
+                if d_img is None or d_img.size == 0:
+                    continue
+                pose = poses[f_idx]
+                R = pose[0:3, 0:3]
+                t = pose[0:3, 3]
+                h_d, w_d = d_img.shape
+                step = max(8, min(h_d, w_d) // 16)
+                rv, cv = np.mgrid[step // 2 : h_d : step, step // 2 : w_d : step]
+                rv_f = rv.ravel()
+                cv_f = cv.ravel()
+                z_vals = d_img[rv_f, cv_f]
+                valid = (z_vals > 0.2) & (z_vals < DEPTH_TRUNC) & np.isfinite(z_vals)
+                if np.any(valid):
+                    z_v = z_vals[valid]
+                    x_c = (cv_f[valid] - cx) * z_v / fx
+                    y_c = (rv_f[valid] - cy) * z_v / fy
+                    p_cam = np.column_stack([x_c, y_c, z_v])
+                    p_world = (R @ p_cam.T).T + t
+                    sample_pts.append(p_world)
+
+        all_t = np.array([p[0:3, 3] for p in poses], dtype=float) if poses else np.zeros((0, 3))
+        if sample_pts:
+            pts_cat = np.vstack(sample_pts)
+            p_min = np.percentile(pts_cat, 0.5, axis=0) - padding
+            p_max = np.percentile(pts_cat, 99.5, axis=0) + padding
+            if len(all_t) > 0:
+                p_min = np.minimum(p_min, all_t.min(axis=0) - padding)
+                p_max = np.maximum(p_max, all_t.max(axis=0) + padding)
+        elif len(all_t) > 0:
+            all_fwd = np.array(
+                [p[0:3, 3] + p[0:3, :3] @ np.array([0.0, 0.0, 1.8]) for p in poses],
+                dtype=float,
+            )
+            pts_box = np.vstack([all_t, all_fwd])
+            p_min = pts_box.min(axis=0) - padding
+            p_max = pts_box.max(axis=0) + padding
+        else:
+            p_min = np.array([-1.5, -1.5, -1.5])
+            p_max = np.array([1.5, 1.5, 1.5])
+
+    span = float(np.max(p_max - p_min))
+    length = max(span, 1.0)
+    center = 0.5 * (p_min + p_max)
+    origin = center - 0.5 * length
+    res = int(np.clip(round(length / voxel_length), 64, max_grid_res))
+    return o3d.pipelines.integration.UniformTSDFVolume(
+        length,
+        res,
+        sdf_trunc,
+        o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+        origin,
+    )
+
+
 class ReconstructionService:
     def integrate_tsdf(
         self,
@@ -53,6 +139,9 @@ class ReconstructionService:
         poses: list[np.ndarray],
         intrinsics: np.ndarray,
         colors: list[np.ndarray],
+        bounds_min: np.ndarray | None = None,
+        bounds_max: np.ndarray | None = None,
+        max_grid_res: int = 384,
     ) -> o3d.geometry.TriangleMesh:
         if len(colors) != len(depths) or len(poses) != len(depths):
             raise ValueError("TSDF input lengths do not match.")
@@ -71,25 +160,6 @@ class ReconstructionService:
         o3d_intrinsic = o3d.camera.PinholeCameraIntrinsic(
             width, height, fx, fy, cx, cy
         )
-        def _make_uniform_volume(poses_list):
-            all_t = np.array([p[0:3, 3] for p in poses_list], dtype=float)
-            all_fwd = np.array([p[0:3, 3] + p[0:3, :3] @ np.array([0.0, 0.0, 2.5]) for p in poses_list], dtype=float)
-            all_back = np.array([p[0:3, 3] + p[0:3, :3] @ np.array([0.0, 0.0, -2.5]) for p in poses_list], dtype=float)
-            pts_box = np.vstack([all_t, all_fwd, all_back])
-            p_min = pts_box.min(axis=0) - 1.5
-            p_max = pts_box.max(axis=0) + 1.5
-            span = float(np.max(p_max - p_min))
-            length = max(span, 6.4)
-            center = 0.5 * (p_min + p_max)
-            origin = center - 0.5 * length
-            res = int(np.clip(round(length / VOXEL_LENGTH), 64, 256))
-            return o3d.pipelines.integration.UniformTSDFVolume(
-                length,
-                res,
-                SDF_TRUNC,
-                o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
-                origin,
-            )
 
         def _run_integrate(vol):
             for i, (depth, pose, color) in enumerate(zip(depths, poses, colors)):
@@ -122,7 +192,14 @@ class ReconstructionService:
             vol.reset()
             return m
 
-        volume = _make_uniform_volume(poses)
+        volume = create_tsdf_grid(
+            poses,
+            depths=depths,
+            intrinsics=intrinsics,
+            bounds_min=bounds_min,
+            bounds_max=bounds_max,
+            max_grid_res=max_grid_res,
+        )
         mesh = _run_integrate(volume)
 
         for i in range(len(depths)):
@@ -311,18 +388,18 @@ class ReconstructionService:
                     vggt_prior, layout, gravity, reference_points=ref_pts
                 )
                 if len(pcd_room.points) > 0:
-                    # 1. Export dense point clouds (VGGT dense cloud only, keep TSDF reconstructed.ply intact)
-                    write_visual_ply(pcd_room, session_dir, "reconstructed_vggt_dense.ply")
-
                     visual, dollhouse = build_visual_clouds(
                         mesh, layout, gravity, number_of_points=number_of_points, vggt_prior=vggt_prior
                     )
+                    canonical_cloud = visual if len(visual.points) >= 100 else pcd_room
+                    # 1. Export dense point clouds (keep TSDF reconstructed.ply intact)
+                    write_visual_ply(canonical_cloud, session_dir, "reconstructed_vggt_dense.ply")
                     write_visual_ply(visual, session_dir, "reconstructed_visual.ply")
                     write_visual_ply(dollhouse, session_dir, "reconstructed_dollhouse.ply")
+                    write_visual_ply(canonical_cloud, session_dir, "reconstructed_canonical.ply")
 
                     # 2. Build Poisson surface reconstruction mesh (saved as reconstructed_poisson.glb, keep TSDF reconstructed.glb intact)
-                    cloud_for_mesh = pcd_room if (pcd_room is not None and len(pcd_room.points) >= 100) else visual
-                    poisson_mesh = build_poisson_mesh_from_cloud(cloud_for_mesh, layout=layout, depth=8)
+                    poisson_mesh = build_poisson_mesh_from_cloud(canonical_cloud, layout=layout, depth=8)
                     if len(poisson_mesh.vertices) > 0 and len(poisson_mesh.triangles) > 0:
                         glb_poisson = os.path.join(session_dir, "reconstructed_poisson.glb")
                         write_triangle_mesh_glb(poisson_mesh, glb_poisson)
@@ -333,47 +410,13 @@ class ReconstructionService:
                         glb_final = os.path.join(session_dir, "reconstructed.glb")
                         if not os.path.isfile(glb_final):
                             write_triangle_mesh_glb(poisson_mesh, glb_final)
-                        ply_final = os.path.join(session_dir, "reconstructed.ply")
-                        if not os.path.isfile(ply_final):
-                            write_visual_ply(
-                                pcd_room if len(pcd_room.points) > 0 else visual,
-                                session_dir,
-                                "reconstructed.ply",
-                            )
-                        elif ref_pts is not None and len(ref_pts) >= 1000 and len(xy_poly) == 4:
-                            tsdf_vis, _ = build_visual_clouds(
-                                mesh,
-                                layout,
-                                gravity,
-                                number_of_points=number_of_points or POINT_CLOUD_SAMPLE_POINTS,
-                                vggt_prior=None,
-                            )
-                            if len(tsdf_vis.points) >= 1000:
-                                if len(visual.points) >= 20_000 and visual.has_colors() and tsdf_vis.has_colors():
-                                    v_pts = np.asarray(visual.points, dtype=float)
-                                    v_cols = np.asarray(visual.colors, dtype=float)
-                                    t_pts = np.asarray(tsdf_vis.points, dtype=float)
-                                    t_cols = np.asarray(tsdf_vis.colors, dtype=float)
-                                    w_lim = float(np.max(t_pts[:, 0]))
-                                    d_lim = float(np.max(t_pts[:, 1]))
-                                    d_w_v = np.minimum(
-                                        np.minimum(np.abs(v_pts[:, 0]), np.abs(v_pts[:, 0] - w_lim)),
-                                        np.minimum(np.abs(v_pts[:, 1]), np.abs(v_pts[:, 1] - d_lim)),
-                                    )
-                                    hi_fix = (d_w_v > 0.015) & (d_w_v <= 0.36) & (v_pts[:, 2] >= 0.44)
-                                    v_y0_green = (np.abs(v_pts[:, 1]) <= 0.015) & ((v_cols[:, 1] - v_cols[:, 0]) >= 0.025)
-                                    if int(np.count_nonzero(v_y0_green)) >= 200:
-                                        v_y0 = np.abs(v_pts[:, 1]) <= 0.015
-                                        t_not_y0 = np.abs(t_pts[:, 1]) > 0.015
-                                        t_pts = np.vstack([t_pts[t_not_y0], v_pts[v_y0]])
-                                        t_cols = np.vstack([t_cols[t_not_y0], v_cols[v_y0]])
-                                    if np.any(hi_fix):
-                                        t_pts = np.vstack([t_pts, v_pts[hi_fix]])
-                                        t_cols = np.vstack([t_cols, v_cols[hi_fix]])
-                                    tsdf_vis = o3d.geometry.PointCloud()
-                                    tsdf_vis.points = o3d.utility.Vector3dVector(t_pts)
-                                    tsdf_vis.colors = o3d.utility.Vector3dVector(t_cols)
-                                write_visual_ply(tsdf_vis, session_dir, "reconstructed.ply")
+                    ply_final = os.path.join(session_dir, "reconstructed.ply")
+                    if not os.path.isfile(ply_final):
+                        write_visual_ply(
+                            canonical_cloud,
+                            session_dir,
+                            "reconstructed.ply",
+                        )
                     return
 
             visual, dollhouse = build_visual_clouds(
@@ -381,9 +424,12 @@ class ReconstructionService:
             )
             write_visual_ply(visual, session_dir, "reconstructed_visual.ply")
             write_visual_ply(dollhouse, session_dir, "reconstructed_dollhouse.ply")
+            write_visual_ply(visual, session_dir, "reconstructed_canonical.ply")
             ply_final = os.path.join(session_dir, "reconstructed.ply")
-            if os.path.isfile(ply_final) and len(visual.points) >= 1000 and len(xy_poly) == 4:
+            if not os.path.isfile(ply_final):
                 write_visual_ply(visual, session_dir, "reconstructed.ply")
         except Exception:
             logger.exception("export_visual_artifacts failed")
+
+    export_canonical_visual_cloud = export_visual_artifacts
 

@@ -98,7 +98,13 @@ def fit_clock_alignment_model(t_device_rel: np.ndarray, t_mcu_rel: np.ndarray, r
         c_fallback = float(np.percentile(y - x, 10))
         return s_fallback, c_fallback
 
-def apply_butterworth_lowpass(data: np.ndarray, fs: float, timeline: np.ndarray, cutoff_ratio: float = 0.4) -> np.ndarray:
+def apply_butterworth_lowpass(
+    data: np.ndarray,
+    fs: float,
+    timeline: np.ndarray,
+    cutoff_ratio: float = 0.4,
+    target_nyq: float | None = None,
+) -> np.ndarray:
     """Apply 2nd-order zero-phase Butterworth low-pass filter forward-backward.
     
     Supports 1D and 2D arrays. Safe copy is returned to avoid side effects on original arrays.
@@ -126,8 +132,8 @@ def apply_butterworth_lowpass(data: np.ndarray, fs: float, timeline: np.ndarray,
             return filtered_data.squeeze(axis=1)
         return filtered_data
         
-    target_nyq = 50.0  # Resampling target grid is 100 Hz, so Nyquist limit is 50 Hz
-    cutoff = min(cutoff_ratio * fs, 0.8 * target_nyq)  # Anti-aliasing cutoff capped relative to target Nyquist
+    effective_target_nyq = 0.5 * fs if target_nyq is None else target_nyq
+    cutoff = min(cutoff_ratio * fs, 0.8 * effective_target_nyq)
     nyq = 0.5 * fs
     # SRE: Enforce 5% safety margin relative to Nyquist frequency to avoid scipy filter design crashes
     if nyq <= 0.0 or cutoff <= 0.0 or cutoff >= 0.95 * nyq:
@@ -219,9 +225,11 @@ def align_gyroscope_signals(t_phone: np.ndarray, w_phone: np.ndarray, t_hub: np.
     w_phone_filt = apply_butterworth_lowpass(w_phone, fs=fs_phone, timeline=t_phone_sec, cutoff_ratio=0.1)
     w_hub_filt = apply_butterworth_lowpass(w_hub, fs=fs_hub, timeline=t_hub_sec, cutoff_ratio=0.1)
     
-    # Compute derivative magnitudes using central gradient to prevent initial sample diff artifacts
-    diff_w_phone = np.gradient(w_phone_filt, axis=0)
-    diff_w_hub = np.gradient(w_hub_filt, axis=0)
+    # Compute derivative magnitudes using central gradient with true time step (rad/s^2)
+    dt_phone = 1.0 / fs_phone if fs_phone > 0 else 0.01
+    dt_hub = 1.0 / fs_hub if fs_hub > 0 else 0.01
+    diff_w_phone = np.gradient(w_phone_filt, dt_phone, axis=0)
+    diff_w_hub = np.gradient(w_hub_filt, dt_hub, axis=0)
     mag_phone = np.linalg.norm(diff_w_phone, axis=1)
     mag_hub = np.linalg.norm(diff_w_hub, axis=1)
     
@@ -606,6 +614,7 @@ def estimate_R_phone_hub(
             h_g_filt = h_g_bc
 
         lag_ns = find_temporal_offset_subms(phone_ts, p_g_filt, hub_ts, h_g_filt)
+        best_lag_ns = int(lag_ns)
         hub_ts_shifted = hub_ts - lag_ns
         w_p_opt, w_h_opt = _match_gyro_pairs(phone_ts, p_g_filt, hub_ts_shifted, h_g_filt)
         if w_p_opt.shape[0] >= WAHBA_MIN_PAIRS:
@@ -619,7 +628,13 @@ def estimate_R_phone_hub(
             ):
                 R_best, rms_best, sv_best = R_opt, rms_opt, sv_opt
                 n_pairs = int(w_p_opt.shape[0])
-                best_lag_ns = int(lag_ns)
+            elif (
+                R_best is None
+                and sv_opt is not None
+                and (sv_best is None or sv_opt > sv_best)
+            ):
+                sv_best = float(sv_opt)
+                n_pairs = int(w_p_opt.shape[0])
     except Exception:
         pass
 

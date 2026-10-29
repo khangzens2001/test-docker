@@ -243,7 +243,8 @@ class ParallelVGGTWorker:
             remaining_timeout = timeout
         else:
             elapsed = time.time() - self._start_time if self._start_time else 0.0
-            remaining_timeout = max(0.5, self.timeout_s - elapsed)
+            min_barrier_wait = min(float(self.timeout_s), 120.0)
+            remaining_timeout = max(min_barrier_wait, self.timeout_s - elapsed)
 
         logger.info(
             "Waiting for VGGT worker (pid=%s) at barrier with remaining timeout=%.1fs...",

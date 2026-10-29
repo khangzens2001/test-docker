@@ -6,16 +6,12 @@ architectural ground snapping, multi-view 1D IoU spatial fusion, and protocol in
 
 from __future__ import annotations
 
-import builtins
 import copy
 import logging
 import math
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
-
-# Export copy to builtins as a safeguard for test suites or callers that use copy without importing it
-builtins.copy = copy
 
 logger = logging.getLogger(__name__)
 
@@ -201,8 +197,8 @@ def project_2d_box_to_3d_wall(
 
     for u, v in corners_2d:
         d_cam = k_inv @ np.array([u, v, 1.0], dtype=float)
-        # Transform ray direction to world frame using rot.T
-        d_world = rot.T @ d_cam
+        # Transform ray direction to world frame using Camera-to-World rot (R_wc)
+        d_world = rot @ d_cam
         res = _ray_wall_intersection(cam_pos, d_world, wall_info)
         if res is None:
             return None
@@ -384,7 +380,7 @@ def detect_portals_from_keyframes(
             uc = (u0 + u1) / 2.0
             vc = (v0 + v1) / 2.0
             d_center_cam = k_inv @ np.array([uc, vc, 1.0], dtype=float)
-            d_center_world = rot.T @ d_center_cam
+            d_center_world = rot @ d_center_cam
 
             # Find best target wall via center ray
             best_wall_idx = None
@@ -462,3 +458,150 @@ def detect_portals_from_keyframes(
         fused_portals.append(fused)
 
     return fused_portals
+
+
+def merge_layout_portals(
+    existing_portals: list[dict[str, Any]] | None,
+    detected_3d_portals: list[dict[str, Any]] | None,
+    walls: list[dict[str, Any]] | dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Merge detected 3D doors/windows with 2D openings from emit_portals,
+    deduplicating overlapping portals on the same wall segment.
+    """
+    existing = list(existing_portals or [])
+    detected = list(detected_3d_portals or [])
+    if not detected:
+        return existing
+    if not existing:
+        return detected
+
+    merged: list[dict[str, Any]] = list(detected)
+
+    for p2d in existing:
+        p2d_s = p2d.get("start_xy")
+        p2d_e = p2d.get("end_xy")
+        if p2d_s and p2d_e and len(p2d_s) >= 2 and len(p2d_e) >= 2:
+            p2d_mid = np.array([(p2d_s[0] + p2d_e[0]) / 2.0, (p2d_s[1] + p2d_e[1]) / 2.0])
+        else:
+            p2d_mid = None
+
+        overlaps = False
+        for p3d in detected:
+            p3d_s = p3d.get("start_xy")
+            p3d_e = p3d.get("end_xy")
+            if p2d_mid is not None and p3d_s and p3d_e and len(p3d_s) >= 2 and len(p3d_e) >= 2:
+                p3d_mid = np.array([(p3d_s[0] + p3d_e[0]) / 2.0, (p3d_s[1] + p3d_e[1]) / 2.0])
+                dist = float(np.linalg.norm(p2d_mid - p3d_mid))
+                if dist < 0.8:
+                    overlaps = True
+                    break
+            elif "wall_index" in p2d and "wall_index" in p3d:
+                if p2d["wall_index"] == p3d["wall_index"]:
+                    iou = compute_1d_iou(p2d, p3d)
+                    if iou > 0.2:
+                        overlaps = True
+                        break
+
+        if not overlaps:
+            p2d_copy = dict(p2d)
+            if "type" not in p2d_copy:
+                p2d_copy["type"] = "door"
+            if "height_m" not in p2d_copy:
+                p2d_copy["height_m"] = 2.0
+            if "sill_height_m" not in p2d_copy:
+                p2d_copy["sill_height_m"] = 0.0
+            merged.append(p2d_copy)
+
+    for idx, p in enumerate(merged):
+        p["id"] = f"P{idx}"
+
+    return merged
+
+
+def detect_portals_from_session(
+    session_dir: str | Any,
+    layout: dict[str, Any] | None = None,
+    keyframes: list[dict[str, Any]] | None = None,
+    camera_k: np.ndarray | None = None,
+    detector: BasePortalDetector2D | None = None,
+) -> list[dict[str, Any]]:
+    """Detect 3D portals (doors/windows) from session keyframes and room layout.
+    
+    When keyframes or camera_k are omitted, reads them from session directory.
+    """
+    from pathlib import Path
+    import json
+
+    s_path = Path(session_dir)
+    if layout is None:
+        fp_path = s_path / "floorplan.json"
+        if fp_path.is_file():
+            with open(fp_path, "r", encoding="utf-8") as f:
+                layout = json.load(f)
+        else:
+            return []
+
+    if camera_k is None:
+        manifest_path = s_path / "manifest.json"
+        if manifest_path.is_file():
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    mf = json.load(f)
+                cam = mf.get("camera", {})
+                intr = cam.get("intrinsics")
+                if intr and len(intr) == 9:
+                    camera_k = np.array(intr, dtype=float).reshape(3, 3)
+                elif "fx" in cam and "fy" in cam and "cx" in cam and "cy" in cam:
+                    camera_k = np.array([
+                        [float(cam["fx"]), 0.0, float(cam["cx"])],
+                        [0.0, float(cam["fy"]), float(cam["cy"])],
+                        [0.0, 0.0, 1.0],
+                    ], dtype=float)
+            except Exception:
+                pass
+        if camera_k is None:
+            camera_k = np.array([
+                [1000.0, 0.0, 960.0],
+                [0.0, 1000.0, 540.0],
+                [0.0, 0.0, 1.0],
+            ], dtype=float)
+
+    if keyframes is None:
+        kf_json = s_path / "keyframes.json"
+        if kf_json.is_file():
+            try:
+                with open(kf_json, "r", encoding="utf-8") as f:
+                    keyframes = json.load(f)
+            except Exception:
+                keyframes = []
+        else:
+            keyframes = []
+
+    from scipy.spatial.transform import Rotation
+    processed_kfs: list[dict[str, Any]] = []
+    for kf in keyframes:
+        item = dict(kf)
+        if "camera_pose" not in item:
+            pos = [float(kf.get("x", 0.0)), float(kf.get("y", 0.0)), float(kf.get("z", 1.4))]
+            if all(k in kf for k in ("qx", "qy", "qz", "qw")):
+                try:
+                    rot = Rotation.from_quat([kf["qx"], kf["qy"], kf["qz"], kf["qw"]]).as_matrix().tolist()
+                except Exception:
+                    rot = np.eye(3).tolist()
+            else:
+                rot = np.eye(3).tolist()
+            item["camera_pose"] = {"position": pos, "rotation_3x3": rot}
+        if "image_path" not in item and "_rgb_path" in item:
+            item["image_path"] = item["_rgb_path"]
+        processed_kfs.append(item)
+
+    if not processed_kfs:
+        return []
+
+    return detect_portals_from_keyframes(
+        keyframes=processed_kfs,
+        walls=layout,
+        camera_k=camera_k,
+        detector=detector,
+    )
+
