@@ -1,0 +1,18 @@
+# CPU-only Temporal worker: workflows + CPU activities + RunPod bridge. No torch/onnx/open3d.
+FROM python:3.11-slim
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app MPLBACKEND=Agg \
+    OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libgomp1 fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements-worker-cpu.txt .
+RUN pip install --no-cache-dir -r requirements-worker-cpu.txt
+COPY app /app/app
+COPY icon /app/icon
+COPY temporal_app /app/temporal_app
+# Fail the build if the CPU image cannot import what render_materials needs.
+RUN python -c "import temporal_app.worker, app.services.bundle, app.services.estimation, app.services.artifact_upload, app.services.r2_storage; print('cpu import smoke ok')"
+RUN useradd -m worker && mkdir -p /app/data /tmp/lidar_temporal && chown -R worker /app/data /tmp/lidar_temporal
+USER worker
+EXPOSE 9464
+CMD ["python", "-m", "temporal_app.worker"]
