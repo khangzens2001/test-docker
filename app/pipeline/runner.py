@@ -1026,6 +1026,9 @@ class PipelineResult:
     floorplan: dict[str, Any] = field(default_factory=dict)
     diagnostics: dict[str, Any] = field(default_factory=dict)
     error_message: str | None = None
+    error_type: str | None = None
+    retryable: bool | None = None
+    warnings: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -1535,6 +1538,20 @@ def run_3d_reconstruction(
 
     recon_timings: dict[str, float] = {}
 
+    recon_warnings: list[dict[str, str]] = []
+
+    def _warn(stage: str, message: str) -> None:
+        recon_warnings.append({"stage": stage, "message": message})
+
+    def _emit_stage(idx: int, name: str, pct: int) -> None:
+        if stage_callback is None:
+            return
+        try:
+            stage_callback(idx, name, pct)
+        except Exception:
+            logger.exception("stage_callback failed for stage %s", name)
+
+    _emit_stage(2, "vio", 10)
     t_vio = time.time()
     if enable_server_vio and not (
         os.getenv("SKIP_EXISTING_VIO", "0") == "1"
@@ -1549,6 +1566,7 @@ def run_3d_reconstruction(
             pass
     recon_timings["vio_sec"] = round(time.time() - t_vio, 3)
 
+    _emit_stage(3, "keyframe_selection", 20)
     t_kf = time.time()
     estimator = VioEstimator()
     pose_df = load_pose_table_for_tsdf(session_dir, prefer_server_vio=enable_server_vio)
@@ -1676,6 +1694,7 @@ def run_3d_reconstruction(
     try:
         depth_service = DepthCompletionService()
 
+        _emit_stage(4, "em_refinement", 28)
         t_em = time.time()
         try:
             em = refine_lidar_camera_extrinsics_em(
@@ -1696,6 +1715,7 @@ def run_3d_reconstruction(
                 lidar_pack["T_lidar_camera"] = em["T_lidar_camera"]
         except Exception:
             logger.exception("EM extrinsic refinement failed for session; keeping T0")
+            _warn("em_refinement", "EM extrinsic refinement failed; kept initial extrinsics")
         recon_timings["em_refinement_sec"] = round(time.time() - t_em, 3)
 
         from concurrent.futures import ThreadPoolExecutor
@@ -1794,6 +1814,7 @@ def run_3d_reconstruction(
             g_cam = None if g_world is None else (R_wc.T @ np.asarray(g_world, dtype=float))
             return (kf, rgb, sparse_tof, sparse_status, R_wc, g_cam)
 
+        _emit_stage(5, "depth_completion", 35)
         t_depth = time.time()
         with ThreadPoolExecutor(max_workers=2) as executor:
             for idx, item in enumerate(executor.map(_prep_keyframe, keyframes)):
@@ -1853,6 +1874,7 @@ def run_3d_reconstruction(
             )
         )
 
+        _emit_stage(6, "tsdf_integration", 60)
         t_tsdf = time.time()
         reconstruction_service = ReconstructionService()
         mesh = reconstruction_service.integrate_tsdf(depths, poses, k, colors)
@@ -1880,6 +1902,7 @@ def run_3d_reconstruction(
         reconstruction_service.export_mesh_artifacts(mesh, session_dir)
         recon_timings["tsdf_integration_sec"] = round(time.time() - t_tsdf, 3)
 
+        _emit_stage(7, "vggt_prior", 72)
         vggt_prior = None
         if vggt_worker is not None:
             logger.info("Depthor+ and TSDF integration completed. Waiting for parallel VGGT barrier...")
@@ -1907,6 +1930,7 @@ def run_3d_reconstruction(
                         "Parallel VGGT inference failed (%s); falling back to reconstruction without VGGT prior",
                         err_msg,
                     )
+                    _warn("vggt_prior", f"Parallel VGGT failed: {err_msg}")
                     from app.services.vggt_prior import VggtPriorResult
 
                     vggt_result = VggtPriorResult(prior=None, skip_reason=f"parallel_vggt_failed: {err_msg}")
@@ -1919,6 +1943,7 @@ def run_3d_reconstruction(
                 run_vggt_inference(session_dir, force_recompute=force_vggt)
             except Exception:
                 logger.exception("VGGT inference attempt failed; falling back to standard reconstruction")
+                _warn("vggt_prior", "VGGT inference failed; continuing without VGGT prior")
             recon_timings["vggt_sec"] = round(time.time() - t_vseq, 3)
 
             vggt_result = load_vggt_prior(session_dir)
@@ -1934,6 +1959,7 @@ def run_3d_reconstruction(
             logger.warning("Terminating background VGGT worker due to unhandled pipeline interruption")
             vggt_worker.terminate()
 
+    _emit_stage(8, "plane_segmentation", 82)
     t_seg = time.time()
     try:
         layout, whiteflat_pcd = reconstruction_service.segment_planes(
@@ -1950,6 +1976,7 @@ def run_3d_reconstruction(
             raise
     recon_timings["plane_segmentation_sec"] = round(time.time() - t_seg, 3)
 
+    _emit_stage(9, "export_artifacts", 90)
     t_exp = time.time()
     attach_vggt_diagnostics(layout, vggt_result)
     if keyframes:
@@ -1964,6 +1991,7 @@ def run_3d_reconstruction(
                 )
         except Exception as exc:
             logger.warning("Portals detection failed in runner: %s", exc)
+            _warn("portals", f"Portals detection failed: {exc}")
     export_artifacts(layout, session_dir)
     reconstruction_service.export_whiteflat_ply(whiteflat_pcd, session_dir)
     reconstruction_service.export_canonical_visual_cloud(
@@ -1975,6 +2003,7 @@ def run_3d_reconstruction(
         export_room_model_texture_glb(session_dir, layout=layout)
     except Exception:
         logger.exception("Failed to export room_model_texture.glb")
+        _warn("export_artifacts", "room_model_texture.glb export failed")
     recon_timings["export_artifacts_sec"] = round(time.time() - t_exp, 3)
 
     return {
@@ -1984,6 +2013,7 @@ def run_3d_reconstruction(
         "pose_df": pose_df,
         "keyframes_count": len(keyframes),
         "timings": recon_timings,
+        "warnings": recon_warnings,
     }
 
 
@@ -2158,6 +2188,7 @@ class PipelineRunner:
         progress_callback: Optional[Callable[[int, int], None]] = None,
         stage_callback: Optional[Callable[[int, str, int], None]] = None,
         force_ingest: bool = False,
+        skip_materials: bool = False,
     ):
         self.enable_server_vio = enable_server_vio
         self.enable_tof_pipeline = enable_tof_pipeline
@@ -2166,6 +2197,8 @@ class PipelineRunner:
         self.progress_callback = progress_callback
         self.stage_callback = stage_callback
         self.force_ingest = force_ingest
+        # When True, stop after reconstruction/export so materials can run on a CPU-only worker.
+        self.skip_materials = skip_materials
 
     def run_timesync(self, session_dir: str) -> dict[str, Any]:
         return run_sensor_ingestion(session_dir)
@@ -2205,11 +2238,17 @@ class PipelineRunner:
 
         try:
             # 1. TimeSync / Sensor Ingestion (if raw imu/lidar exists and not already processed)
+            if self.stage_callback:
+                try:
+                    self.stage_callback(1, "ingestion", 2)
+                except Exception:
+                    logger.exception("stage_callback failed for stage ingestion")
             t0 = time.time()
             already_ingested = os.path.isfile(os.path.join(session_dir, "processed_lidar.csv"))
             has_raw_lidar = os.path.isfile(os.path.join(session_dir, "lidar.csv"))
             needs_ingest = self.force_ingest or (has_raw_lidar and not already_ingested)
             diag: dict[str, Any] = {}
+            warnings_out: list[dict[str, str]] = []
             if needs_ingest:
                 logger.info("PipelineRunner: Executing TimeSync & Ingestion for %s", session_dir)
                 diag = self.run_timesync(session_dir)
@@ -2232,17 +2271,25 @@ class PipelineRunner:
             timings["reconstruction_sec"] = round(time.time() - t1, 3)
             if isinstance(recon_res, dict) and "timings" in recon_res:
                 timings.update(recon_res["timings"])
+            if isinstance(recon_res, dict):
+                warnings_out.extend(recon_res.get("warnings") or [])
 
             # 3. Material Estimation & Bundle Export
+            if self.stage_callback and not self.skip_materials:
+                try:
+                    self.stage_callback(10, "materials", 95)
+                except Exception:
+                    logger.exception("stage_callback failed for stage materials")
             t2 = time.time()
             logger.info("PipelineRunner: Executing Material & Tatami Estimation for %s", session_dir)
             mat_res: dict[str, Any] = {}
-            if os.path.isfile(os.path.join(session_dir, "floorplan.json")):
+            if not self.skip_materials and os.path.isfile(os.path.join(session_dir, "floorplan.json")):
                 try:
                     mat_res = self.run_materials(session_dir)
                 except Exception as exc:
                     logger.warning("PipelineRunner: Material estimation warning for %s: %s", session_dir, exc)
                     diag["material_estimation_warning"] = str(exc)
+                    warnings_out.append({"stage": "materials", "message": str(exc)})
             timings["materials_sec"] = round(time.time() - t2, 3)
             timings["total_sec"] = round(time.time() - t_start, 3)
 
@@ -2271,12 +2318,18 @@ class PipelineRunner:
                 floorplan=floorplan_data,
                 diagnostics=diag,
                 error_message=None,
+                warnings=warnings_out,
             )
         except Exception as exc:
             logger.exception("PipelineRunner execution failed for %s: %s", session_dir, exc)
             timings["total_sec"] = round(time.time() - t_start, 3)
+            from app.core.exceptions import classify_pipeline_error
+
+            err_type, retryable = classify_pipeline_error(exc)
             return PipelineResult(
                 success=False,
+                error_type=err_type,
+                retryable=retryable,
                 session_dir=session_dir,
                 metrics=PipelineMetrics(timings=timings),
                 artifacts=collect_pipeline_artifacts(session_dir),

@@ -1,0 +1,80 @@
+# Temporal stack (Temporal + Postgres + UI + CPU worker). Lean: no Prometheus/Grafana. Image tags below were NOT pull-verified in the authoring environment; pin/verify before use.
+# Usage: docker compose -f docker-compose.temporal.yml --env-file .env.temporal up -d
+services:
+  temporal-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: ${TEMPORAL_DB_PASSWORD:?set TEMPORAL_DB_PASSWORD}
+    volumes: [temporal-db:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    depends_on:
+      temporal-db: {condition: service_healthy}
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: ${TEMPORAL_DB_PASSWORD}
+      POSTGRES_SEEDS: temporal-db
+      DEFAULT_NAMESPACE: default
+    ports: ["127.0.0.1:7233:7233"]   # local only; worker reaches it over the compose network
+    restart: unless-stopped
+    mem_limit: 1g
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    depends_on: [temporal]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports: ["127.0.0.1:8080:8080"]   # UI has no auth: reach it via SSH tunnel / reverse proxy with auth
+    restart: unless-stopped
+
+  # One-shot: registers the custom search attributes used by RoomScanWorkflow.
+  temporal-init:
+    image: temporalio/admin-tools:1.25.2-tctl-1.18.1-cli-1.1.1
+    depends_on: [temporal]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until temporal operator cluster health >/dev/null 2>&1; do sleep 2; done
+        until temporal operator namespace describe default >/dev/null 2>&1; do sleep 2; done
+        for a in TaskId BatchId UserId CurrentStage ScanMode; do
+          temporal operator search-attribute create --namespace default --name $$a --type Keyword || true
+        done
+    restart: "no"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker-cpu
+    depends_on:
+      temporal-init: {condition: service_completed_successfully}
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      WORKER_ROLES: cpu,gpu
+      RUNPOD_API_KEY: ${RUNPOD_API_KEY:?set RUNPOD_API_KEY}
+      RUNPOD_ENDPOINT_ID: ${RUNPOD_ENDPOINT_ID:?set RUNPOD_ENDPOINT_ID}
+      RUNPOD_BASE_URL: ${RUNPOD_BASE_URL:-https://api.runpod.ai/v2}
+      RUNPOD_POLL_INTERVAL_S: ${RUNPOD_POLL_INTERVAL_S:-3}
+      R2_BUCKET: ${R2_BUCKET:-3d-ply}
+      R2_ENDPOINT_URL: ${R2_ENDPOINT_URL:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      BACKEND_CALLBACK_URL: ${BACKEND_CALLBACK_URL:-}
+      BACKEND_CALLBACK_SECRET: ${BACKEND_CALLBACK_SECRET:-}
+      GPU_MAX_CONCURRENT_ACTIVITIES: ${GPU_MAX_CONCURRENT_ACTIVITIES:-3}
+    mem_limit: 3g
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    restart: unless-stopped
+
+volumes:
+  temporal-db:

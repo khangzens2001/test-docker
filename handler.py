@@ -20,6 +20,13 @@ MODEL_ID = os.getenv("VGGT_MODEL_ID", "facebook/VGGT-1B")
 BASE_DIR = os.getenv("BASE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "vggt_room3d_jobs"))
 DEFAULT_HARD_MAX_POINTS = 300_000_000
 
+class PipelineFailure(RuntimeError):
+    def __init__(self, message, error_type=None, retryable=None):
+        super().__init__(f"Multi-sensor pipeline execution failed: {message}")
+        self.error_type = error_type
+        self.retryable = retryable
+
+
 def find_multisensor_session_dir(root_dir: str) -> Optional[str]:
     """Detect if directory contains multi-sensor LiDAR/odometry scan files."""
     indicators = ("manifest.json", "camera_matrix.csv", "odometry.csv", "lidar.csv")
@@ -55,7 +62,12 @@ def handler(job):
     clean_stat_std = float(job_input.get("clean_stat_std", backend_api_extended_manhattan.DEFAULT_CLEAN_STAT_STD))
 
     # Generate job IDs and paths
-    job_id = str(uuid.uuid4())[:8]
+    # Caller-supplied job_id (e.g. Temporal workflow id) makes retries idempotent.
+    requested_job_id = job_input.get("job_id")
+    if requested_job_id:
+        job_id = backend_api_extended_manhattan.safe_object_part(str(requested_job_id))[:64]
+    else:
+        job_id = str(uuid.uuid4())[:8]
     job_dir = os.path.join(BASE_DIR, job_id)
     img_dir = os.path.join(job_dir, "images")
     out_dir = os.path.join(job_dir, "output")
@@ -80,73 +92,29 @@ def handler(job):
             from app.pipeline.runner import run_pipeline
             from app.services.cad.contract import layout_to_metrics_mm
 
-            result = run_pipeline(session_dir)
+            def _on_stage(idx: int, name: str, pct: int) -> None:
+                try:
+                    runpod.serverless.progress_update(
+                        job, json.dumps({"stage": name, "stage_index": idx, "pct": pct})
+                    )
+                except Exception:
+                    pass
+
+            mode = job_input.get("mode", "legacy_full")
+            result = run_pipeline(
+                session_dir,
+                stage_callback=_on_stage,
+                skip_materials=(mode == "reconstruct_only"),
+                enable_parallel=job_input.get("enable_parallel"),
+            )
             if not result.success:
-                raise RuntimeError(f"Multi-sensor pipeline execution failed: {result.error_message}")
+                raise PipelineFailure(result.error_message, result.error_type, result.retryable)
 
-            # 1. Clean PLY upload
-            clean_ply_candidates = [
-                os.path.join(session_dir, "reconstructed_visual.ply"),
-                os.path.join(session_dir, "reconstructed_whiteflat.ply"),
-                os.path.join(session_dir, "whiteflat.ply"),
-                os.path.join(session_dir, "reconstructed.ply"),
-            ]
-            clean_ply_path = next((p for p in clean_ply_candidates if os.path.isfile(p)), None)
-            clean_ply_r2 = {}
-            floorplan_files = {}
-            file_candidates = [
-                ("floorplan_png", ["FloorPlan_A3.png", "FloorPlan_A4.png", "floorplan.png", "ISO_A3_Floorplan.png", "ISO_A4_Floorplan.png"]),
-                ("floorplan_pdf", ["FloorPlan_A3.pdf", "FloorPlan_A4.pdf", "floorplan.pdf", "ISO_A3_Floorplan.pdf", "ISO_A4_Floorplan.pdf"]),
-                ("floorplan_a4_png", ["FloorPlan_A4.png", "ISO_A4_Floorplan.png"]),
-                ("floorplan_a4_pdf", ["FloorPlan_A4.pdf", "ISO_A4_Floorplan.pdf"]),
-                ("floorplan_json", ["floorplan.json"]),
-                ("wall_elevation_png", ["Walls.png", "walls.png", "input_Walls.png"]),
-                ("debug_topdown_png", ["debug_topdown.png"]),
-                ("room_model_glb", ["room_model_texture.glb", "room_model.glb", "reconstructed.glb"]),
-                ("reconstructed_poisson_glb", ["reconstructed_poisson.glb"]),
-                ("dollhouse_ply", ["reconstructed_dollhouse.ply"]),
-                ("whiteflat_ply", ["reconstructed_whiteflat.ply", "whiteflat.ply"]),
-                ("metrics_json", ["metrics.json"]),
-                ("quality_report_json", ["quality_report.json"]),
-                ("cf_png", ["CF.png"]),
-                ("cf_pdf", ["CF.pdf"]),
-                ("cf_chart_png", ["CF_chart.png"]),
-                ("neda_png", ["Neda.png"]),
-                ("neda_pdf", ["Neda.pdf"]),
-                ("neda_chart_png", ["Neda_chart.png"]),
-                ("plywood_png", ["Plywood.png"]),
-                ("plywood_pdf", ["Plywood.pdf"]),
-                ("plywood_chart_png", ["Plywood_chart.png"]),
-                ("tiling_png", ["Tiling.png"]),
-                ("tiling_pdf", ["Tiling.pdf"]),
-                ("tiling_chart_png", ["Tiling_chart.png"]),
-                ("combined_png", ["Combined.png"]),
-            ]
+            from app.services.artifact_upload import upload_session_artifacts
 
-            upload_tasks = []
-            if clean_ply_path:
-                upload_tasks.append(("__clean_ply__", clean_ply_path, f"ply_clean/{object_prefix}/project_point_cloud_clean.ply"))
-
-            for file_key, cands in file_candidates:
-                for c in cands:
-                    p = os.path.join(session_dir, c)
-                    if os.path.isfile(p):
-                        target_name = "walls.png" if "wall" in file_key else c
-                        upload_tasks.append((file_key, p, f"ply_clean/{object_prefix}/{target_name}"))
-                        break
-
-            if upload_tasks:
-                from concurrent.futures import ThreadPoolExecutor
-                with ThreadPoolExecutor(max_workers=min(6, len(upload_tasks))) as pool:
-                    futures = [
-                        (k, pool.submit(backend_api_extended_manhattan.upload_to_r2, p, r2_k))
-                        for k, p, r2_k in upload_tasks
-                    ]
-                    for k, fut in futures:
-                        if k == "__clean_ply__":
-                            clean_ply_r2 = fut.result()
-                        else:
-                            floorplan_files[k] = fut.result()
+            clean_ply_r2, floorplan_files = upload_session_artifacts(
+                session_dir, object_prefix, backend_api_extended_manhattan.upload_to_r2
+            )
 
             # 3. Room metrics extraction (contract matching new_update.md Section 5)
             room_metrics = None
@@ -167,6 +135,8 @@ def handler(job):
                 "status": "success",
                 "job_id": job_id,
                 "mode": "multisensor_lidar",
+                "pipeline_mode": mode,
+                "session_prefix": object_prefix,
                 "download_url": presigned_url,
                 "clean_ply": {
                     "presigned_url": presigned_url,
@@ -175,11 +145,12 @@ def handler(job):
                 "room_metrics": room_metrics,
                 "floorplan_files": floorplan_files,
                 "timings": result.metrics.timings if hasattr(result.metrics, "timings") else {},
+                "warnings": result.warnings,
             }
 
         # ── Branch B: Pure Photo Reconstruction (VGGT-1B) ──
         if not image_paths:
-            return {"status": "error", "error": "No valid images or sensor data found in the zip file"}
+            return {"status": "error", "job_id": job_id, "error": "No valid images or sensor data found in the zip file", "error_type": "invalid_input", "retryable": False}
 
         print(f"--> [Job {job_id}] Running VGGT-1B inference on {len(image_paths)} images...", flush=True)
         meta = backend_api_extended_manhattan.run_inference_pipeline(
@@ -223,7 +194,20 @@ def handler(job):
         error_text = traceback.format_exc()
         with open(os.path.join(out_dir, "error.txt"), "w", encoding="utf-8") as f:
             f.write(error_text)
-        return {"status": "error", "job_id": job_id, "error": str(e)}
+        from app.core.exceptions import classify_pipeline_error
+
+        err_type = getattr(e, "error_type", None)
+        retryable = getattr(e, "retryable", None)
+        if err_type is None or retryable is None:
+            err_type, retryable = classify_pipeline_error(e)
+        return {
+            "status": "error",
+            "job_id": job_id,
+            # RunPod only surfaces the `error` string of a failed job, so append the traceback tail.
+            "error": f"{e}\n--- traceback (tail) ---\n{error_text[-1800:]}",
+            "error_type": err_type,
+            "retryable": retryable,
+        }
     finally:
         r2_configured = bool(
             getattr(backend_api_extended_manhattan, "R2_ENDPOINT_URL", "")
@@ -231,6 +215,8 @@ def handler(job):
             and os.getenv("R2_SECRET_ACCESS_KEY")
         )
         should_cleanup = os.getenv("CLEANUP_JOB_DIR", "1" if r2_configured else "0").strip() != "0"
+        if job_input.get("keep_session"):
+            should_cleanup = False
         if should_cleanup and os.path.isdir(job_dir):
             shutil.rmtree(job_dir, ignore_errors=True)
 

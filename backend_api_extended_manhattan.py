@@ -39,7 +39,14 @@ app = FastAPI(title=APP_NAME)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if device == "cuda":
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    # VGGT_DTYPE=float16|bfloat16|float32 overrides the auto choice (bfloat16 on Ampere+, else float16).
+    _dtype_override = os.getenv("VGGT_DTYPE", "").strip().lower()
+    _dtype_map = {"float16": torch.float16, "fp16": torch.float16, "bfloat16": torch.bfloat16,
+                  "bf16": torch.bfloat16, "float32": torch.float32, "fp32": torch.float32}
+    if _dtype_override in _dtype_map:
+        dtype = _dtype_map[_dtype_override]
+    else:
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 else:
     dtype = torch.float32
 
@@ -577,67 +584,9 @@ def run_multisensor_pipeline(session_dir: str, batch_id: str, job_id: str, out_d
 
     object_prefix = f"{safe_object_part(batch_id)}/{job_id}"
 
-    clean_ply_candidates = [
-        os.path.join(session_dir, "reconstructed_visual.ply"),
-        os.path.join(session_dir, "reconstructed_whiteflat.ply"),
-        os.path.join(session_dir, "whiteflat.ply"),
-        os.path.join(session_dir, "reconstructed.ply"),
-    ]
-    clean_ply_path = next((p for p in clean_ply_candidates if os.path.isfile(p)), None)
-    clean_ply_r2 = {}
-    floorplan_files = {}
-    file_candidates = [
-        ("floorplan_png", ["FloorPlan_A3.png", "FloorPlan_A4.png", "floorplan.png", "ISO_A3_Floorplan.png", "ISO_A4_Floorplan.png"]),
-        ("floorplan_pdf", ["FloorPlan_A3.pdf", "FloorPlan_A4.pdf", "floorplan.pdf", "ISO_A3_Floorplan.pdf", "ISO_A4_Floorplan.pdf"]),
-        ("floorplan_a4_png", ["FloorPlan_A4.png", "ISO_A4_Floorplan.png"]),
-        ("floorplan_a4_pdf", ["FloorPlan_A4.pdf", "ISO_A4_Floorplan.pdf"]),
-        ("floorplan_json", ["floorplan.json"]),
-        ("wall_elevation_png", ["Walls.png", "walls.png", "input_Walls.png"]),
-        ("debug_topdown_png", ["debug_topdown.png"]),
-        ("room_model_glb", ["room_model_texture.glb", "room_model.glb", "reconstructed.glb"]),
-        ("reconstructed_poisson_glb", ["reconstructed_poisson.glb"]),
-        ("dollhouse_ply", ["reconstructed_dollhouse.ply"]),
-        ("whiteflat_ply", ["reconstructed_whiteflat.ply", "whiteflat.ply"]),
-        ("metrics_json", ["metrics.json"]),
-        ("quality_report_json", ["quality_report.json"]),
-        ("cf_png", ["CF.png"]),
-        ("cf_pdf", ["CF.pdf"]),
-        ("cf_chart_png", ["CF_chart.png"]),
-        ("neda_png", ["Neda.png"]),
-        ("neda_pdf", ["Neda.pdf"]),
-        ("neda_chart_png", ["Neda_chart.png"]),
-        ("plywood_png", ["Plywood.png"]),
-        ("plywood_pdf", ["Plywood.pdf"]),
-        ("plywood_chart_png", ["Plywood_chart.png"]),
-        ("tiling_png", ["Tiling.png"]),
-        ("tiling_pdf", ["Tiling.pdf"]),
-        ("tiling_chart_png", ["Tiling_chart.png"]),
-        ("combined_png", ["Combined.png"]),
-    ]
+    from app.services.artifact_upload import upload_session_artifacts
 
-    upload_tasks = []
-    if clean_ply_path:
-        upload_tasks.append(("__clean_ply__", clean_ply_path, f"ply_clean/{object_prefix}/project_point_cloud_clean.ply"))
-
-    for file_key, cands in file_candidates:
-        for c in cands:
-            p = os.path.join(session_dir, c)
-            if os.path.isfile(p):
-                target_name = "walls.png" if "wall" in file_key else c
-                upload_tasks.append((file_key, p, f"ply_clean/{object_prefix}/{target_name}"))
-                break
-
-    if upload_tasks:
-        with ThreadPoolExecutor(max_workers=min(6, len(upload_tasks))) as pool:
-            futures = [
-                (k, pool.submit(upload_to_r2, p, r2_k))
-                for k, p, r2_k in upload_tasks
-            ]
-            for k, fut in futures:
-                if k == "__clean_ply__":
-                    clean_ply_r2 = fut.result()
-                else:
-                    floorplan_files[k] = fut.result()
+    clean_ply_r2, floorplan_files = upload_session_artifacts(session_dir, object_prefix, upload_to_r2)
 
     room_metrics = None
     metrics_json_path = os.path.join(session_dir, "metrics.json")

@@ -140,3 +140,19 @@ class TatamiSkewAngleExceededError(MaterialEstimationError):
             invalid_params=invalid_params,
         )
 
+
+
+def classify_pipeline_error(exc: BaseException) -> tuple[str, bool]:
+    """Map an exception to (error_type, retryable) for orchestrators such as Temporal.
+
+    Bad-input / domain errors are permanent; resource and transient errors may succeed on retry.
+    """
+    if isinstance(exc, (MemoryError,)) or "out of memory" in str(exc).lower():
+        return "oom", True
+    if isinstance(exc, BaseDomainException):
+        return type(exc).__name__, False
+    if isinstance(exc, (ValueError, FileNotFoundError, KeyError)):
+        return "invalid_input", False
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return "transient_io", True
+    return "internal_error", True
