@@ -63,6 +63,11 @@ def build_activities(calls: Calls):
         calls.names.append("render_materials")
         return {"floorplan_files": {"cf_png": {"presigned_url": "y"}}, "room_metrics": {"area_m2": 15.1}, "warnings": []}
 
+    @activity.defn(name="record_stage_timings")
+    async def record_stage_timings(wf_id: str, timings: dict) -> list:
+        calls.names.append("record_stage_timings")
+        return [{"stage": "vio", "seconds": 1.0, "pct_of_total": 100.0}]
+
     @activity.defn(name="build_result")
     async def build_result(gpu: dict, mat: dict) -> dict:
         calls.names.append("build_result")
@@ -78,7 +83,7 @@ def build_activities(calls: Calls):
     async def cleanup(wf_id: str) -> None:
         calls.names.append("cleanup")
 
-    return [resolve_input, render_materials, build_result, notify_backend, cleanup], [runpod_submit, runpod_poll]
+    return [resolve_input, render_materials, record_stage_timings, build_result, notify_backend, cleanup], [runpod_submit, runpod_poll]
 
 
 async def run_env(calls: Calls, coro_factory):
@@ -110,7 +115,7 @@ async def test_happy_path():
     res, st = await run_env(calls, go)
     assert res["status"] == "success"
     assert set(res["floorplan_files"]) == {"floorplan_json", "cf_png"}
-    assert calls.names == ["resolve_input", "runpod_submit", "runpod_poll", "render_materials", "build_result",
+    assert calls.names == ["resolve_input", "runpod_submit", "runpod_poll", "record_stage_timings", "render_materials", "build_result",
                            "notify_backend", "cleanup"]
     assert st.state == "succeeded" and st.warnings[0]["stage"] == "portals"
 

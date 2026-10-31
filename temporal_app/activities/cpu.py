@@ -157,6 +157,30 @@ async def render_materials(workflow_id: str, gpu_result: dict[str, Any], params:
     return res
 
 
+STAGE_ORDER = [
+    ("ingestion_sec", "ingestion"), ("vio_sec", "vio"), ("keyframe_selection_sec", "keyframe_selection"),
+    ("em_refinement_sec", "em_refinement"), ("depth_completion_sec", "depth_completion"),
+    ("tsdf_integration_sec", "tsdf_integration"), ("vggt_sec", "vggt_prior"),
+    ("plane_segmentation_sec", "plane_segmentation"), ("export_artifacts_sec", "export_artifacts"),
+    ("materials_sec", "materials"),
+]
+
+
+@activity.defn
+async def record_stage_timings(workflow_id: str, timings: dict[str, Any]) -> list[dict[str, Any]]:
+    """Make per-stage wall time visible as a single Event History entry and as Prometheus metrics."""
+    total = float(timings.get("total_sec") or sum(float(timings.get(k) or 0) for k, _ in STAGE_ORDER)) or 1.0
+    rows = []
+    for key, name in STAGE_ORDER:
+        if key in timings:
+            sec = float(timings[key])
+            rows.append({"stage": name, "seconds": round(sec, 2), "pct_of_total": round(100 * sec / total, 1)})
+            _stage_metric(name, sec)
+    rows.sort(key=lambda r: -r["seconds"])
+    activity.logger.info("stage timings for %s: %s", workflow_id, rows)
+    return rows
+
+
 @activity.defn
 async def build_result(gpu_result: dict[str, Any], materials: dict[str, Any] | None) -> dict[str, Any]:
     """Merge GPU + CPU outputs into the contract of new_update.md section 5."""
@@ -206,4 +230,4 @@ async def cleanup(workflow_id: str) -> None:
     shutil.rmtree(workdir_for(workflow_id), ignore_errors=True)
 
 
-CPU_ACTIVITIES = [resolve_input, render_materials, build_result, notify_backend, cleanup]
+CPU_ACTIVITIES = [resolve_input, render_materials, record_stage_timings, build_result, notify_backend, cleanup]
