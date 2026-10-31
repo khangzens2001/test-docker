@@ -54,6 +54,7 @@ class RoomScanWorkflow:
         self._handle: Optional[workflow.ActivityHandle] = None
         self._use_sa = True
         self._params_override: dict[str, Any] = {}
+        self._stage_rows: list[dict[str, Any]] = []
 
     # ---- signals / queries -------------------------------------------------
     @workflow.signal
@@ -75,6 +76,30 @@ class RoomScanWorkflow:
     def get_status(self) -> ScanStatus:
         return self._status
 
+    def _refresh_details(self) -> None:
+        """Markdown shown in the Temporal UI workflow summary (no extra activities, replay-safe)."""
+        st = self._status
+        lines = [f"### {st.workflow_id} - {st.state.upper()}",
+                 f"**Stage:** `{st.current_stage}` ({st.pct}%)"]
+        if st.runpod_job_id:
+            lines.append(f"**RunPod job:** `{st.runpod_job_id}`")
+        if self._stage_rows:
+            lines += ["", "| Stage | Seconds | % total |", "|---|---:|---:|"]
+            lines += [f"| {r['stage']} | {r['seconds']} | {r['pct_of_total']} |" for r in self._stage_rows]
+        if st.stage_log:
+            lines += ["", "**Timeline:** " + " > ".join(e["stage"] for e in st.stage_log[-12:])]
+        if st.warnings:
+            lines += ["", "**Warnings:**"] + [f"- {w.get('stage')}: {w.get('message')}" for w in st.warnings[-5:]]
+        if st.error:
+            lines += ["", f"**Error:** {st.error[:300]}"]
+        workflow.set_current_details("\n".join(lines))
+        # Memo is rendered by the Metadata tab of every Temporal UI version (current details are not).
+        workflow.upsert_memo({
+            "state": st.state, "current_stage": st.current_stage, "pct": st.pct,
+            "runpod_job_id": st.runpod_job_id, "stage_timings": self._stage_rows,
+            "warnings": st.warnings[-5:],
+        })
+
     # ---- helpers -----------------------------------------------------------
     def _set_stage(self, stage: str, pct: int, source: str = "workflow") -> None:
         s = self._status
@@ -84,6 +109,7 @@ class RoomScanWorkflow:
         s.stage_log = s.stage_log[-60:]
         if self._use_sa:
             workflow.upsert_search_attributes([SA_STAGE.value_set(stage)])
+        self._refresh_details()
 
     async def _act(self, name: str, args: list, result_type: type, *, queue: Optional[str] = None,
                    start_to_close: timedelta, retry: RetryPolicy,
@@ -146,6 +172,10 @@ class RoomScanWorkflow:
             self._set_stage("gpu_submitted", 2)
             gpu: dict[str, Any] = await self._gpu_phase(inp, resolved)
             self._status.timings.update(gpu.get("timings") or {})
+            self._stage_rows = await self._act(
+                "record_stage_timings", [wf_id, gpu.get("timings") or {}], list,
+                start_to_close=timedelta(seconds=30), retry=CPU_RETRY)
+            self._refresh_details()
             self._status.warnings.extend(gpu.get("warnings") or [])
             if self._use_sa:
                 workflow.upsert_search_attributes([SA_MODE.value_set(str(gpu.get("mode")))])
@@ -176,6 +206,7 @@ class RoomScanWorkflow:
 
             self._set_stage("done", 100)
             self._status.state = "succeeded"
+            self._refresh_details()
             result["warnings"] = self._status.warnings
             return result
         except _Cancelled:
@@ -187,6 +218,7 @@ class RoomScanWorkflow:
         except BaseException as exc:
             self._status.state = "failed"
             self._status.error = str(getattr(exc, "cause", exc))
+            self._refresh_details()
             raise
         finally:
             # runs for success, failure and external cancellation

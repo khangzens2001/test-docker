@@ -93,6 +93,10 @@ async def test_full_flow_real_cad_render(stack):
     # search attributes searchable
     found = [w.id async for w in client.list_workflows(f"TaskId = '{tid}'")]
     assert found == [f"scan-{tid}"]
+    # stage timings are visible on the Metadata tab (memo) and in Event History (record_stage_timings)
+    desc = await h.describe()
+    memo = await desc.memo()
+    assert memo["state"] == "succeeded" and [r["stage"] for r in memo["stage_timings"]] == ["vio"]
     # production start policy: a succeeded scan id cannot be started again (no duplicate GPU spend)
     from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
     from temporalio.exceptions import WorkflowAlreadyStartedError
