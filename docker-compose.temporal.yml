@@ -47,6 +47,7 @@ services:
       - |
         until temporal operator cluster health >/dev/null 2>&1; do sleep 2; done
         until temporal operator namespace describe default >/dev/null 2>&1; do sleep 2; done
+        temporal operator namespace update --namespace default --retention 720h   # keep workflow history 30 days
         for a in TaskId BatchId UserId CurrentStage ScanMode; do
           temporal operator search-attribute create --namespace default --name $$a --type Keyword || true
         done
